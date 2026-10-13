@@ -27,6 +27,12 @@
     "default": true,
     "hint": "常量段进 system_prompt 尾部、每轮变的那一行挂在用户消息之后（都对缓存友好）。关掉则只靠 wish_check 按需查。"
   },
+  "usage_log": {
+    "description": "记 LLM 用量流水（usage.jsonl）",
+    "type": "bool",
+    "default": true,
+    "hint": "口径与框架的请求计数一致（t/u/s/p/m/miss/hit/out），另加 src 标明来源；不是重复记账，对账时选一份看。"
+  },
   "db_path": {
     "description": "数据文件路径（留空 = 插件数据目录下的 ledger.db）",
     "type": "text",

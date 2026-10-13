@@ -11,6 +11,7 @@
 """
 import asyncio
 import importlib.util
+import json
 import os
 import sqlite3
 import sys
@@ -965,6 +966,116 @@ def t35_audit_detail(mod, plugin):
     return ("欠条 1 张" in out or "欠条 0 张" in out)
 
 
+class _Usage:
+    def __init__(self, other, cached, out):
+        self.input_other = other
+        self.input_cached = cached
+        self.output = out
+        self.input = other + cached
+        self.total = other + cached + out
+
+
+class _Resp:
+    def __init__(self):
+        self.usage = _Usage(100, 200, 30)
+        self.completion_text = "好"
+
+
+class _EvWithSession(Ev):
+    def get_session_id(self):
+        return "test:GroupMessage:1"
+
+
+def t36_usage_record(mod, plugin):
+    """用量记账：口径与框架那份一致 + 多一个 src；不写库 ✓"""
+    path = mod.resolve_usage_path()
+    if os.path.exists(path):
+        os.remove(path)
+    ev = _EvWithSession(sender=ALICE)
+    asyncio.run(plugin.record_usage(ev, _Resp()))
+    if not os.path.exists(path):
+        print("      没写出用量流水:", path)
+        return False
+    with open(path, encoding="utf-8") as handle:
+        row = json.loads(handle.readline())
+    want = {"t", "u", "s", "p", "m", "miss", "hit", "out", "src"}
+    if set(row) != want:
+        print("      字段与框架口径不一致:", sorted(row))
+        return False
+    if (row["miss"], row["hit"], row["out"], row["src"]) != (100, 200, 30, "wishonomy"):
+        print("      数值/来源不对:", row)
+        return False
+    # 身份闸门照旧管着记账
+    for bad, why in ((Ev(self_id=OTHER_BOT), "别的 bot"), (Ev(cron=True), "定时轮"),
+                     (Ev(sender=BOT), "自己给自己")):
+        asyncio.run(plugin.record_usage(bad, _Resp()))
+    with open(path, encoding="utf-8") as handle:
+        lines = [l for l in handle if l.strip()]
+    if len(lines) != 1:
+        print("      闸门没管住记账，行数 =", len(lines))
+        return False
+    conn = mod._connect()
+    try:
+        before = {t: conn.execute("SELECT COUNT(*) AS c FROM %s" % t).fetchone()["c"]
+                  for t in ("account", "ledger", "iou", "credit_event")}
+    finally:
+        conn.close()
+    asyncio.run(plugin.record_usage(ev, _Resp()))
+    conn = mod._connect()
+    try:
+        after = {t: conn.execute("SELECT COUNT(*) AS c FROM %s" % t).fetchone()["c"]
+                 for t in ("account", "ledger", "iou", "credit_event")}
+    finally:
+        conn.close()
+    return before == after
+
+
+def t37_usage_summary(mod, plugin):
+    """用量汇总：按天聚合、按 src 过滤（别人的行不能混进来）✓"""
+    path = mod.resolve_usage_path()
+    if os.path.exists(path):
+        os.remove(path)
+    ev = _EvWithSession(sender=ALICE)
+    asyncio.run(plugin.record_usage(ev, _Resp()))
+    with open(path, encoding="utf-8") as handle:
+        row = json.loads(handle.readline())
+    other = json.loads(json.dumps(row))
+    other["src"] = "别的插件"
+    other["out"] = 9999
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(json.dumps(other, ensure_ascii=False) + "\n")
+    data = mod.usage_summary(days=7)
+    empty = mod.usage_summary(days=7, src="根本不存在的来源")
+    if not data["exists"] or data["rows"] != 1 or data["total"]["out"] != 30:
+        print("      汇总不对:", data)
+        return False
+    if empty["rows"] != 0:
+        print("      src 过滤没生效:", empty["rows"])
+        return False
+    out = call(mod.wish_usage, plugin, Ev(), days=7)
+    return isinstance(out, str) and out.strip() != ""
+
+
+def t38_panel_not_shipped(mod, _plugin):
+    """面板不进容器：`panel.py` 里那句 `import main` 在线上会导到框架的 main ✗ ✓"""
+    here = os.path.dirname(PLUGIN)
+    panel = os.path.join(here, "panel.py")
+    if not os.path.exists(panel):
+        return True
+    with open(panel, encoding="utf-8") as handle:
+        src = handle.read()
+    if "import main as plugin" not in src:
+        return True
+    deploy_dir = os.path.join(here, "dist")
+    if not os.path.isdir(deploy_dir):
+        return True                                  # 还没有部署产物目录 ⇒ 无需断言
+    shipped = [fn for fn in os.listdir(deploy_dir) if fn == "panel.py"]
+    if shipped:
+        print("      面板被放进部署产物了 ✗:", shipped)
+        return False
+    return True
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1001,6 +1112,9 @@ TESTS = [
     ("R33 信誉分：加/减/上限/理由/不许自写", t33_credit_tool),
     ("R34 排行：两种口径 + n 限制", t34_leaderboard),
     ("R35 对账细化：欠条 / 信誉分 / 按人合计", t35_audit_detail),
+    ("R36 用量记账：同口径 + src + 不写库", t36_usage_record),
+    ("R37 用量汇总：按天 + 按来源过滤", t37_usage_summary),
+    ("R38 面板不进部署产物", t38_panel_not_shipped),
 ]
 
 

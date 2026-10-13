@@ -231,6 +231,113 @@ def data_paths(config=None):
     return [base, base + "-wal", base + "-shm"]
 
 
+def resolve_usage_path(config=None):
+    """LLM 用量流水（`usage.jsonl`）的位置 —— 跟数据文件同目录 ✓"""
+    return os.path.join(os.path.dirname(resolve_db_path(config)) or ".", "usage.jsonl")
+
+
+def usage_record(event, response, now=None):
+    """把**这一轮**的 LLM 用量记一行（JSONL）—— 口径与框架那份请求计数**完全一致** ✓
+
+    为什么要有它（主人 2026-10-13 要求「把对 LLM 的调用也做进记账」✓）：
+      * 框架那份计数护栏（`mindscape_requests.jsonl`）在**框架补丁层**，字段是
+        `t/u/s/p/m/miss/hit/out` —— 它只回答"花了多少"，不回答"**谁花的**" ✗
+      * 这份由**插件自己**写，多一个 `src` 字段标明来源 ⇒ 能按插件归因 ✓
+      * ⚠️ **不是重复记账**：两处各写一行、字段同口径、来源不同；
+        量的时候按需选一份看，别把两份相加 ✗
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    now = int(now if now is not None else time.time())
+    stamp = datetime.fromtimestamp(now, CN_TZ)
+    record = {
+        "t": stamp.strftime("%Y-%m-%d %H:%M:%S"),                 # 本地（北京时间）
+        "u": stamp.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+        "s": str(event.get_session_id() or "-"),
+        "p": str(_cfg_provider(response, "provider_id")),
+        "m": str(_cfg_provider(response, "model")),
+        "miss": int(getattr(usage, "input_other", 0) or 0),
+        "hit": int(getattr(usage, "input_cached", 0) or 0),
+        "out": int(getattr(usage, "output", 0) or 0),
+        "src": "wishonomy",
+    }
+    path = resolve_usage_path()
+    try:
+        directory = os.path.dirname(path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as exc:
+        logger.warning("[wishonomy] 用量记账写不进去: %s", str(exc)[:120])
+        return None
+    return record
+
+
+def _cfg_provider(response, key):
+    """从 response 里尽量抠出 provider / model（抠不到就写 `-`，不猜 ✓）"""
+    provider = getattr(response, "provider", None)
+    if provider is not None:
+        if key == "model":
+            getter = getattr(provider, "get_model", None)
+            if callable(getter):
+                try:
+                    return getter()
+                except Exception:
+                    pass
+        config = getattr(provider, "provider_config", None)
+        if isinstance(config, dict) and config.get("id"):
+            return config["id"]
+    raw = str(getattr(response, "raw_completion", "") or "")
+    _ = raw
+    return "-"
+
+
+def usage_summary(days=7, src="wishonomy", now=None):
+    """按天汇总用量流水（给主人对账用；读不动就如实说 ✓）。
+
+    ⚠️ 只统计 `src` 匹配的行 —— 这样即便将来别的插件也写这个文件，也不会混在一起 ✓
+    """
+    now = int(now if now is not None else time.time())
+    path = resolve_usage_path()
+    out = {"path": path, "exists": os.path.exists(path), "src": src,
+           "days": days, "rows": 0, "by_day": {}, "total": {"miss": 0, "hit": 0, "out": 0}}
+    if not out["exists"]:
+        return out
+    floor = now - max(1, int(days)) * 86400
+    try:
+        with open(path, encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if src and str(row.get("src") or "") != src:
+                    continue
+                stamp = str(row.get("t") or "")[:10]
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", stamp):
+                    continue
+                when = int(datetime.strptime(stamp, "%Y-%m-%d")
+                           .replace(tzinfo=CN_TZ).timestamp())
+                if when < floor - 86400:
+                    continue
+                slot = out["by_day"].setdefault(stamp, {"calls": 0, "miss": 0, "hit": 0,
+                                                        "out": 0})
+                slot["calls"] += 1
+                for key in ("miss", "hit", "out"):
+                    value = int(row.get(key) or 0)
+                    slot[key] += value
+                    out["total"][key] += value
+                out["rows"] += 1
+    except OSError as exc:
+        out["error"] = str(exc)[:120]
+    return out
+
+
 def set_db_path(path):
     """给自检用：换一个数据文件（同时作废线程池，下次访问重开）。"""
     global _DB_PATH
@@ -1005,6 +1112,24 @@ class Main(star.Star):
         except Exception as exc:      # noqa: BLE001 —— 注入失败绝不能影响它正常回话
             logger.warning("[wishonomy] 注入失败: %s", str(exc)[:120])
 
+    # ── LLM 用量记账（主人 2026-10-13 要求 ✓）──
+    # 口径与框架那份请求计数**完全一致**（t/u/s/p/m/miss/hit/out），只多一个 `src` 标明来源 ✓
+    # ⚠️ **不重复记账**：两处各写一行、来源不同；对账时选一份看，别相加 ✗
+    @filter.on_llm_response()
+    async def record_usage(self, event, response):
+        try:
+            if not bool(_cfg(self.config, "usage_log", True)):
+                return
+            if self.identity(event, allow_self_mood=True) is None:
+                return
+            record = usage_record(event, response)
+            if record is None:
+                return
+            logger.info("[wishonomy] usage | sess=%s miss=%s hit=%s out=%s",
+                        record["s"], record["miss"], record["hit"], record["out"])
+        except Exception as exc:      # noqa: BLE001 —— 记账失败绝不能影响它回话
+            logger.warning("[wishonomy] 用量记账异常: %s", str(exc)[:120])
+
 
 # ── 工具：全部返回字符串（**绝不 None**） ──
 
@@ -1485,6 +1610,46 @@ async def wish_leaderboard(*args, **kwargs):
     return title + "\n" + "\n".join(lines)
 
 
+@llm_tool(name="wish_usage")
+@tool_guard
+async def wish_usage(*args, **kwargs):
+    """看这几天的 LLM 用量 —— 花在哪儿了。
+
+    这是给**运营**对账用的（不是给群里念的）：每天的调用次数、未命中 / 命中缓存 / 输出 token。
+    你自己的愿力跟这个没关系 —— 这是"跟她说话本身要花多少"的账。
+
+    Args:
+        days(integer): 看最近几天（默认 7）。
+    """
+    plugin = _find_plugin(args)
+    event = _find_event(args)
+    if plugin is None or event is None:
+        return "愿力中心这会儿连不上。"
+    if plugin.identity(event, allow_self_mood=True) is None:
+        return "这本账现在不归我管。"
+    days = normalize_amount(kwargs.get("days")) or 7
+    days = min(int(days), 90)
+    data = await run_db(_usage_summary_in_thread, days)
+    if not data.get("exists"):
+        return "还没有用量流水（这个文件还没被写过）：%s" % data["path"]
+    if data.get("error"):
+        return "用量流水读不动：%s" % data["error"]
+    if not data["rows"]:
+        return "最近 %d 天没有记到用量。" % days
+    lines = ["最近 %d 天（%d 次调用）：未命中 %d ｜ 命中缓存 %d ｜ 输出 %d"
+             % (days, data["rows"], data["total"]["miss"], data["total"]["hit"],
+                data["total"]["out"])]
+    for day in sorted(data["by_day"])[-7:]:
+        slot = data["by_day"][day]
+        lines.append("%s：%d 次 ｜ 未命中 %d / 命中 %d / 输出 %d"
+                     % (day, slot["calls"], slot["miss"], slot["hit"], slot["out"]))
+    return "\n".join(lines)
+
+
+def _usage_summary_in_thread(days):
+    return usage_summary(days=days)
+
+
 @llm_tool(name="wish_audit")
 @tool_guard
 async def wish_audit(*args, **kwargs):
@@ -1600,10 +1765,11 @@ def _mood_failure(result, daily):
 
 __all__ = [
     "Main", "wish_check", "wish_mood", "wish_gift", "wish_grant", "wish_iou_settle",
-    "wish_ious", "wish_credit", "wish_leaderboard", "wish_audit",
+    "wish_ious", "wish_credit", "wish_leaderboard", "wish_usage", "wish_audit",
     "target_ids", "day_start", "normalize_amount", "parse_due", "split_names",
     "resolve_tiers", "tier_by_cost", "learn_name", "lookup_names", "forget_names",
     "resolve_db_path", "set_db_path", "data_paths", "run_db", "with_conn",
+    "resolve_usage_path", "usage_record", "usage_summary",
     "db_snapshot", "db_history", "db_mood", "db_gift", "db_audit_totals",
     "db_audit_detail", "db_credit_event", "db_top",
     "db_iou_grant", "db_iou_list", "db_iou_all_open", "db_iou_by_id",
