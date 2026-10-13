@@ -1,0 +1,85 @@
+# -*- coding: utf-8 -*-
+"""一键拉取：把容器里的**只读副本**取到本机（管理台那个「刷新」按钮调它）。
+
+为什么不把这段塞进 `panel.py`：面板要能**离线**看一份副本，
+而"去服务器取新的"是一次**外部动作**（会碰 ssh / docker）——
+分成两个模块，出问题时一眼知道是哪一半 ✓
+
+安全底线：
+  * 只 **读** 远端（`docker cp` 出来，不动容器里的文件）✓
+  * 不打印任何凭据；ssh 走本机 `~/.ssh/config` 里的别名 ✓
+  * 拉回来的目录固定在本机用户目录下，不写系统目录 ✓
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+CONTAINER = os.environ.get("WISHONOMY_CONTAINER", "qqbot-astrbot")
+SSH_TARGET = os.environ.get("WISHONOMY_SSH", "srv")
+REMOTE_DATA = "/opt/astrbot/data/plugin_data/astrbot_plugin_wishonomy"
+STAGE = "/tmp/wishonomy-copy"
+
+SSH = shutil.which("ssh") or r"C:\Windows\System32\OpenSSH\ssh.exe"
+SCP = shutil.which("scp") or r"C:\Windows\System32\OpenSSH\scp.exe"
+
+
+def copy_dir():
+    return os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                        "wishonomy-ledger-copy")
+
+
+def _run(args, timeout=180):
+    out = subprocess.run(args, capture_output=True, text=True, encoding="utf-8",
+                         errors="replace", timeout=timeout)
+    return out.returncode, (out.stdout or ""), (out.stderr or "")
+
+
+def pull(dest_dir=None, ssh_target=None):
+    """拉一份新的只读副本。返回 {ok, dir, db, usage, files, error, at}"""
+    import time
+    dest = dest_dir or copy_dir()
+    target = ssh_target or SSH_TARGET
+    os.makedirs(dest, exist_ok=True)
+    info = {"ok": False, "dir": dest, "db": "", "usage": "", "files": [],
+            "error": "", "at": int(time.time())}
+    # ① 容器 → 宿主机临时目录（用 `docker cp`，**不走容器 shell**）
+    #    ⚠️ 别写 `docker exec sh -c 'for f in $f …'`：ssh→docker→sh 三层下来
+    #       变量会被吃掉（真机实测 `[: missing ]`、一个文件都没拷出来 ✗）
+    cmd = ("rm -rf {stage} && mkdir -p {stage} && docker cp {box}:{data}/. {stage}/ "
+           "&& ls -l {stage}").format(stage=STAGE, box=CONTAINER, data=REMOTE_DATA)
+    code, out, err = _run([SSH, target, cmd])
+    if code != 0:
+        info["error"] = "从容器里拷不出来：%s" % (err or out).strip()[:200]
+        return info
+    # ② 宿主机 → 本机
+    for name in ("ledger.db", "ledger.db-wal", "ledger.db-shm", "usage.jsonl"):
+        _run([SCP, "%s:%s/%s" % (target, STAGE, name), os.path.join(dest, name)])
+    for name in ("ledger.db", "ledger.db-wal", "ledger.db-shm", "usage.jsonl"):
+        path = os.path.join(dest, name)
+        if os.path.exists(path):
+            info["files"].append(name)
+    info["db"] = os.path.join(dest, "ledger.db")
+    usage = os.path.join(dest, "usage.jsonl")
+    info["usage"] = usage if os.path.exists(usage) else ""
+    if not os.path.exists(info["db"]):
+        info["error"] = "本机没拿到 ledger.db（远端可能还没有账本文件）"
+        return info
+    info["ok"] = True
+    return info
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    info = pull()
+    if not info["ok"]:
+        print("✗ %s" % info["error"])
+        return 1
+    print("✓ 已拉取 → %s" % info["dir"])
+    for name in info["files"]:
+        print("  %-20s %8d B" % (name, os.path.getsize(os.path.join(info["dir"], name))))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

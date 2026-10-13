@@ -1146,6 +1146,47 @@ def t40_tiers_default_when_missing(mod, _plugin):
     return kept["money_name"] == "自定名" and len(kept["gift_tiers"]) == 1
 
 
+def t41_gift_count(mod, plugin):
+    """送礼的「份数」：数字**不当档位名**、count 才是个数（2026-10-13 真机踩过 ✗）
+
+    真机现场：主人说「送你 30 个伊磨吉」，她填 `tier='30'` ⇒ 被解释成"第 30 号档位" ✗
+     ⇒ 只收了 1 个伊磨吉（1 号档），主人的 30 变成 29 ⇒ 双方都懵 ✓
+    """
+    now = int(time.time())
+    raw_mood(mod, ALICE, 500, "gift-count-seed", now)
+    ev = Ev(sender=ALICE, name="小甲")
+    mod.learn_name(BOT, GROUP, ALICE, "小甲")
+    tiers = mod.resolve_tiers(CONFIG)
+    cheap = min(tiers, key=lambda t: t["cost"])
+    # ① 数字当档位名 ⇒ 必须**拦下来**（不能静默收别的东西）
+    bad = call(mod.wish_gift, plugin, ev, who="小甲", tier="30")
+    if "别写数字" not in bad:
+        print("      数字当档位名没被拦住:", bad)
+        return False
+    # ② 报名字 + count ⇒ 按份数收
+    before = balance_of(mod, ALICE)
+    many = call(mod.wish_gift, plugin, ev, who="小甲", tier=cheap["name"], count=30)
+    spent = before - balance_of(mod, ALICE)
+    if spent != cheap["cost"] * 30:
+        print("      count 没生效：扣了 %s（应为 %s）" % (spent, cheap["cost"] * 30))
+        return False
+    if "×30" not in many:
+        print("      回话没说清份数:", many)
+        return False
+    # ③ 单份照旧
+    single = call(mod.wish_gift, plugin, ev, who="小甲", tier=cheap["name"])
+    if "收下了" not in single or "×" in single:
+        print("      单份回话不对:", single)
+        return False
+    # ④ 份数把日上限撞了 ⇒ 直接拦下，不落账
+    cap_now = balance_of(mod, ALICE)
+    over = call(mod.wish_gift, plugin, ev, who="小甲", tier=cheap["name"], count=99999)
+    if "超天" not in over or balance_of(mod, ALICE) != cap_now:
+        print("      超上限没拦住:", over, balance_of(mod, ALICE))
+        return False
+    return True
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1187,6 +1228,7 @@ TESTS = [
     ("R38 面板不进部署产物", t38_panel_not_shipped),
     ("R39 框架式实例化（只传 context）", t39_framework_instantiation),
     ("R40 配置缺 gift_tiers 时有兜底档位", t40_tiers_default_when_missing),
+    ("R41 送礼份数：数字不当档位名 / count 生效", t41_gift_count),
 ]
 
 

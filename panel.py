@@ -23,6 +23,7 @@ import sqlite3
 import sys
 import time
 import types
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -196,100 +197,402 @@ def snapshot(path, now=None, self_id=None):
 
 PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
-<title>愿力中心 · 只读</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>愿力中心 · 只读面板</title>
 <style>
- body{{font:14px/1.6 -apple-system,"Segoe UI",system-ui,sans-serif;margin:24px;color:#222}}
- h1{{font-size:20px;margin:0 0 4px}} h2{{font-size:15px;margin:22px 0 6px;color:#444}}
- .meta{{color:#777;font-size:12px;margin-bottom:14px}}
- table{{border-collapse:collapse;width:100%;max-width:1100px}}
- th,td{{border-bottom:1px solid #eee;padding:5px 8px;text-align:left;vertical-align:top}}
- th{{background:#fafafa;font-weight:600;color:#555}}
- td.num{{text-align:right;font-variant-numeric:tabular-nums}}
- .k{{display:inline-block;margin:0 14px 6px 0}} .k b{{font-size:16px}}
- .kind{{color:#888;font-size:12px}} .warn{{color:#b26a00}} .ro{{color:#0a7;font-weight:600}}
+:root{{
+ --bg:#eef1f6; --card:#fff; --ink:#151b2b; --ink2:#4a5568; --mut:#7b8698;
+ --line:#e3e7ef; --line2:#eef1f6; --head:#0e1524; --head2:#1d2942;
+ --good:#118a55; --good-bg:#e6f6ee; --warn:#a35a06; --warn-bg:#fdf1de;
+ --bad:#c33a3a; --bad-bg:#fdecec; --info:#3159c9; --info-bg:#e8edfd;
+ --violet:#6c46c6; --violet-bg:#f0ebfd; --zebra:#f8fafc; --soft-bg:#f4f6fa;
+ --radius:12px; --pad:16px;
+}}
+@media (prefers-color-scheme:dark){{
+ :root{{
+  --bg:#0b0f18; --card:#141a26; --ink:#e8ecf4; --ink2:#b3bccd; --mut:#8a94a8;
+  --line:#232c3d; --line2:#1c2434; --head:#080c13; --head2:#141d2f;
+  --good:#4ecb8d; --good-bg:#12301f; --warn:#e0a353; --warn-bg:#33260f;
+  --bad:#f08585; --bad-bg:#3a1b1b; --info:#8aa8f5; --info-bg:#182342;
+  --violet:#b79bf0; --violet-bg:#251c40; --zebra:#171e2b; --soft-bg:#1a2231;
+ }}
+}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--bg);color:var(--ink);
+ font:14px/1.55 -apple-system,"Segoe UI",Roboto,"Helvetica Neue",
+ "PingFang SC","Microsoft YaHei",system-ui,sans-serif;
+ -webkit-font-smoothing:antialiased}}
+a{{color:var(--info)}}
+
+/* ── 深色标题区 ── */
+.top{{background:linear-gradient(135deg,var(--head),var(--head2));
+ color:#f2f5fb;padding:22px 20px 18px}}
+.top .wrap{{max-width:1240px;margin:0 auto}}
+.brand{{display:flex;align-items:center;gap:10px;flex-wrap:wrap}}
+.brand h1{{font-size:19px;margin:0;letter-spacing:.01em;font-weight:650}}
+.dot{{width:8px;height:8px;border-radius:50%;background:#54d19a;
+ box-shadow:0 0 0 3px rgba(84,209,154,.18)}}
+.chips{{display:flex;flex-wrap:wrap;gap:8px;margin-top:12px}}
+.chip{{background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.14);
+ border-radius:999px;padding:4px 11px;font-size:12px;color:#cfd7e6;
+ max-width:100%;overflow-wrap:anywhere}}
+.chip b{{color:#fff;font-weight:600}}
+.chip.ok{{background:rgba(84,209,154,.16);border-color:rgba(84,209,154,.4);color:#c8f2dc}}
+
+/* ── 浅色内容区 ── */
+main{{max-width:1240px;margin:0 auto;padding:20px var(--pad) 48px}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+ margin-top:18px;overflow:hidden;box-shadow:0 1px 2px rgba(16,24,40,.04)}}
+.card>h2{{font-size:13px;margin:0;padding:11px 16px;color:var(--ink2);font-weight:650;
+ letter-spacing:.06em;border-bottom:1px solid var(--line);background:var(--soft-bg);
+ display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}}
+.card>h2 .tag{{font-size:11px;font-weight:500;color:var(--mut);letter-spacing:0}}
+.card .pad{{padding:var(--pad)}}
+
+.bot{{display:flex;gap:10px;align-items:center;flex-wrap:wrap;
+ margin:26px 0 4px;font-size:13px;color:var(--ink2)}}
+.bot .who{{background:var(--card);border:1px solid var(--line);border-radius:999px;
+ padding:3px 11px;font-weight:600;color:var(--ink);font-variant-numeric:tabular-nums}}
+.bot .day{{color:var(--mut)}}
+
+/* ── 指标卡 ── */
+.metrics{{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
+ gap:10px;padding:var(--pad)}}
+.metric{{background:var(--soft-bg);border:1px solid var(--line2);border-radius:10px;
+ padding:11px 13px;min-width:0}}
+.metric .lab{{font-size:11.5px;color:var(--mut);letter-spacing:.03em;
+ display:flex;align-items:center;gap:5px}}
+.metric .val{{font-size:21px;font-weight:650;margin-top:5px;line-height:1.2;
+ font-variant-numeric:tabular-nums;overflow-wrap:anywhere}}
+.metric .sub{{font-size:11.5px;color:var(--mut);margin-top:3px;overflow-wrap:anywhere}}
+.metric.good .val{{color:var(--good)}} .metric.warn .val{{color:var(--warn)}}
+.metric.bad .val{{color:var(--bad)}}
+
+/* ── 表格 ── */
+.tw{{overflow-x:auto}}
+table{{width:100%;border-collapse:separate;border-spacing:0;font-size:13px}}
+thead th{{position:sticky;top:0;z-index:1;background:var(--soft-bg);color:var(--ink2);
+ text-align:left;font-weight:600;font-size:11.5px;letter-spacing:.05em;
+ padding:8px 12px;border-bottom:1px solid var(--line);white-space:nowrap}}
+tbody td{{padding:7px 12px;border-bottom:1px solid var(--line2);vertical-align:top;
+ overflow-wrap:anywhere;min-width:0}}
+tbody tr:nth-child(even){{background:var(--zebra)}}
+tbody tr:last-child td{{border-bottom:0}}
+tbody tr:hover{{background:var(--soft-bg)}}
+td.num,th.num{{text-align:right;white-space:nowrap;
+ font-variant-numeric:tabular-nums;
+ font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px}}
+td.num{{font-size:13px}}
+tr.muted td{{color:var(--mut)}}
+.pos{{color:var(--good)}} .neg{{color:var(--warn)}}
+.zero{{color:var(--mut)}}
+.ids{{font-size:11.5px;color:var(--mut);font-variant-numeric:tabular-nums}}
+
+/* ── 徽章 ── */
+.pill{{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11.5px;
+ font-weight:600;line-height:1.6;white-space:nowrap;
+ background:var(--soft-bg);color:var(--ink2);border:1px solid var(--line)}}
+.p-mood{{background:var(--good-bg);color:var(--good)}}
+.p-gift{{background:var(--info-bg);color:var(--info)}}
+.p-grant{{background:var(--warn-bg);color:var(--warn)}}
+.p-refund{{background:var(--bad-bg);color:var(--bad)}}
+.p-credit{{background:var(--violet-bg);color:var(--violet)}}
+
+/* ── 空状态 ── */
+.empty{{padding:22px 16px;text-align:center;color:var(--mut);font-size:13px}}
+.empty .big{{font-size:22px;display:block;margin-bottom:6px;opacity:.5}}
+
+/* ── 提示条 ── */
+.note{{border-left:3px solid var(--warn);background:var(--warn-bg);color:var(--ink);
+ border-radius:8px;padding:12px 14px;font-size:13.5px;overflow-wrap:anywhere}}
+.note .t{{font-weight:650;margin-bottom:3px}}
+.note .r{{color:var(--ink2)}}
+.note .p{{margin-top:8px;font-size:12px;color:var(--mut);font-variant-numeric:tabular-nums}}
+
+footer{{max-width:1240px;margin:0 auto;padding:0 var(--pad) 40px;
+ color:var(--mut);font-size:11.5px;line-height:1.7;overflow-wrap:anywhere}}
+
+@media (max-width:720px){{
+ :root{{--pad:12px}}
+ .top{{padding:18px 14px 15px}}
+ .brand h1{{font-size:17px}}
+ .metrics{{grid-template-columns:repeat(auto-fit,minmax(128px,1fr));gap:8px}}
+ .metric .val{{font-size:18px}}
+ .card{{border-radius:10px}}
+ tbody td,thead th{{padding:6px 10px}}
+ table{{font-size:12.5px}}
+}}
 </style></head><body>
-<h1>愿力中心 · 只读面板</h1>
-<div class="meta">数据文件：{path} ｜ 看的时间：{shown} ｜ 连接：<span class="ro">只读</span>（面板写不了库 ✓）</div>
+<div class="top"><div class="wrap">
+ <div class="brand"><span class="dot"></span><h1>愿力中心 · 只读面板</h1></div>
+ <div class="chips">
+  <span class="chip">数据文件：<b>{path}</b></span>
+  <span class="chip">看的时间：<b>{shown}</b></span>
+  <span class="chip ok">连接：只读（面板写不了库 ✓）</span>
+  {refresh_chip}
+ </div>
+</div></div>
+<main>
 {body}
+</main>
+<footer>本页是**只读**视图：数据来自账本的只读快照，页面上不会写入任何东西。<br>
+ 页面零外部依赖（没有 CDN / 外链字体 / 外链脚本），可直接离线打开。</footer>
 </body></html>
 """
 
-
-def _kv(label, value, warn=False):
-    return '<span class="k">%s <b class="%s">%s</b></span>' % (
-        html.escape(label), "warn" if warn else "", html.escape(str(value)))
+KIND_LABEL = {"mood": "收愿力", "gift": "送礼", "grant": "点单", "refund": "撤回",
+              "credit": "信誉"}
 
 
-def _table(headers, rows):
-    out = ["<table><tr>" + "".join("<th>%s</th>" % html.escape(h) for h in headers) + "</tr>"]
-    for row in rows:
+def _badge(kind):
+    """流水类别小徽章（颜色按类别分 ✓）。"""
+    text = str(kind)
+    cls = text if text in KIND_LABEL else "other"
+    return '<span class="pill p-%s">%s</span>' % (cls, html.escape(text))
+
+
+def _metric(label, value, sub="", tone=""):
+    """指标卡：大数字 + 小标签（`tone` = good / warn / bad ✓）。"""
+    tail = '<div class="sub">%s</div>' % html.escape(str(sub)) if sub else ""
+    return ('<div class="metric %s"><div class="lab">%s</div>'
+            '<div class="val">%s</div>%s</div>'
+            % (tone, html.escape(str(label)), html.escape(str(value)), tail))
+
+
+def _table(headers, rows, align=(), rowcls=None):
+    """表格：斑马纹 / 紧凑行高 / 表头吸顶 / 数字右对齐（等宽数字）。
+
+    单元格可以是 `str`（原样转义后当文本）或
+    `{"v": 取值, "cls": "pos|neg|zero|muted|ids", "raw": True}`（`raw` = 已经是 HTML ✓）；
+    `align` 里点名过的列一律右对齐 + 等宽数字；
+    `rowcls` 是与 `rows` 等长的行级 class 列表（余额 <= 0 的行整行弱化 ✓）
+    """
+    heads = []
+    for index, head in enumerate(headers):
+        cls = ' class="num"' if index in align else ""
+        heads.append("<th%s>%s</th>" % (cls, html.escape(str(head))))
+    body = []
+    for position, row in enumerate(rows):
         cells = []
         for index, cell in enumerate(row):
-            cls = ' class="num"' if index and isinstance(cell, int) else ""
-            cells.append("<td%s>%s</td>" % (cls, html.escape(str(cell))))
-        out.append("<tr>" + "".join(cells) + "</tr>")
-    out.append("</table>")
-    return "".join(out)
+            spec = {"v": cell} if isinstance(cell, (str, int, float)) else dict(cell)
+            tokens = str(spec.get("cls", "")).split()
+            if index in align:
+                tokens = (["num"] + [tok for tok in tokens if tok != "num"])
+            inner = str(spec.get("v", ""))
+            if not spec.get("raw"):
+                inner = html.escape(inner)                   # 默认一律转义 ✓
+            cls = ' class="%s"' % " ".join(tokens) if tokens else ""
+            cells.append("<td%s>%s</td>" % (cls, inner))
+        cls = rowcls[position] if rowcls else ""
+        attr = ' class="%s"' % cls if cls else ""
+        body.append("<tr%s>%s</tr>" % (attr, "".join(cells)))
+    return ('<div class="tw"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
+            % ("".join(heads), "".join(body)))
 
 
-def render(data):
+def _empty(text, mark="—"):
+    return '<div class="empty"><span class="big">%s</span>%s</div>' % (
+        html.escape(mark), html.escape(text))
+
+
+def _card(title, inner, tag=""):
+    tail = '<span class="tag">%s</span>' % html.escape(str(tag)) if tag else ""
+    return '<section class="card"><h2>%s%s</h2>%s</section>' % (
+        html.escape(str(title)), tail, inner)
+
+
+def _refresh_chip(on):
+    """紫色那颗「一键拉取」按钮（**纯链接 + GET** ⇒ 不需要任何 JS ✓）"""
+    if not on:
+        return '<span class="chip">一键拉取：关（启动时加 --refresh 打开）</span>'
+    return ('<a class="chip btn" href="?refresh=1" '
+            'title="去服务器把账本的只读副本拉一份新的过来（不会改动远端任何东西）">'
+            '⟳ 一键拉取新副本</a>')
+
+
+def render(data, refresh_on=False, flash=""):
+    """把 `snapshot()` 的 dict 拼成一整页 HTML（**纯呈现**：一个数据查询都不做 ✓）。"""
+
+
+def render(data, refresh_on=False, flash=""):
+    """把 `snapshot()` 的 dict 拼成一整页 HTML（**纯呈现**：一个数据查询都不做 ✓）。"""
+    chip = _refresh_chip(refresh_on)
     if not data.get("available"):
-        body = ('<p class="warn">还读不到账本：%s</p><p class="meta">%s</p>'
-                % (html.escape(str(data.get("reason"))), html.escape(str(data.get("path")))))
-        return PAGE.format(path=html.escape(str(data.get("path"))),
-                           shown="-", body=body)
+        note = ('<div class="note"><div class="t">还读不到账本</div>'
+                '<div class="r">%s</div><div class="p">%s</div></div>'
+                % (html.escape(str(data.get("reason") or "")),
+                   html.escape(str(data.get("path") or ""))))
+        return PAGE.format(path=html.escape(str(data.get("path") or "")), shown="-",
+                           refresh_chip=chip,
+                           body=flash + _card("读不到账本", '<div class="pad">%s</div>' % note))
+
     blocks = []
-    for bot in data["bots"]:
+    for bot in data.get("bots") or []:
         today = bot["today"]
         detail = bot["today_detail"]
-        head = "<h2>bot %s ｜ %s 的账</h2>" % (html.escape(bot["self_id"]),
-                                              html.escape(bot["day"]))
-        stats = "".join([
-            _kv("收愿力", plugin.money_text(today["issued"])),
-            _kv("送礼", plugin.money_text(today["gifted"])),
-            _kv("支出（点单）", plugin.money_text(today["granted"])),
-            _kv("撤回", plugin.money_text(today["refunded"])),
-            _kv("账上共", plugin.money_text(today["total"])),
-            _kv("钱包", "%d 个" % today["wallets"]),
-            _kv("未结欠条", "%d 张（挂着 %s）" % (detail["open_ious"],
-                                              plugin.money_text(detail["iou_amount"])),
-                warn=detail["open_ious"] > 0),
-            _kv("今日信誉分", "+%d / -%d" % (detail["credit_up"], detail["credit_down"])),
-        ])
-        blocks.append(head + "<div>" + stats + "</div>")
+        blocks.append('<div class="bot"><span class="who">bot %s</span>'
+                      '<span class="day">%s 这一天的账</span></div>'
+                      % (html.escape(str(bot["self_id"])), html.escape(str(bot["day"]))))
 
-        blocks.append("<h2>钱包一览</h2>" + _table(
-            ["谁", "愿力", "信誉分", "未结欠条", "最近动过"],
-            [[w["name"], w["balance"], w["credit"], w["open_ious"], w["updated_at"]]
-             for w in bot["wallets"]] or [["（还没有人动过账）", "", "", "", ""]]))
-        blocks.append("<h2>还没兑现的要求</h2>" + _table(
-            ["#", "谁欠的", "要他做什么", "付了多少", "什么时候点的", "期限"],
-            [[i["id"], i["debtor"], i["item"], i["amount"], i["time"], i["due"] or "—"]
-             for i in bot["ious"]] or [["—", "（没有未结的欠条）", "", "", "", ""]]))
-        blocks.append("<h2>今天动得最多的人</h2>" + _table(
-            ["账号", "收", "出"],
-            [[t["user_id"], t["got"], t["gave"]] for t in detail["top"]]
-            or [["—", "（今天还没人动过）", ""]]))
-        blocks.append("<h2>最近流水</h2>" + _table(
-            ["时间", "类别", "从", "到", "数额", "她/他写的原话"],
-            [[b["time"], b["kind"], b["from"], b["to"], b["amount"], b["reason"]]
-             for b in bot["brief"]] or [["—", "", "", "", "", "（还没有流水）"]]))
-    return PAGE.format(path=html.escape(str(data["path"])),
+        # ① 当日概览 —— 指标卡
+        metrics = "".join([
+            _metric("收愿力（发行）", plugin.money_text(today["issued"]), tone="good"),
+            _metric("送出（送礼）", plugin.money_text(today["gifted"])),
+            _metric("支出（点单）", plugin.money_text(today["granted"]), tone="warn"),
+            _metric("撤回", plugin.money_text(today["refunded"])),
+            _metric("账上共", plugin.money_text(today["total"]),
+                    sub="%d 个钱包" % today["wallets"]),
+            _metric("未结欠条", "%d 张" % detail["open_ious"],
+                    sub="挂着 %s" % plugin.money_text(detail["iou_amount"]),
+                    tone="warn" if detail["open_ious"] else ""),
+            _metric("今日信誉分",
+                    "+%d / −%d" % (detail["credit_up"], detail["credit_down"]),
+                    sub="涨 / 跌"),
+            _metric("今日活跃", "%d 人" % len(detail["top"]), sub="有过往来的人"),
+        ])
+        blocks.append(_card("当日概览", '<div class="metrics">%s</div>' % metrics,
+                            tag=str(bot["day"])))
+
+        # ② 钱包一览
+        wallets = bot["wallets"]
+        if wallets:
+            rows, weak_rows = [], []
+            for wal in wallets:
+                toned = "pos" if wal["credit"] > 0 else ("neg" if wal["credit"] < 0 else "zero")
+                rows.append([wal["name"],
+                             {"v": wal["balance"]},
+                             {"v": "%+d" % wal["credit"], "cls": toned},
+                             {"v": wal["open_ious"]},
+                             {"v": wal["updated_at"]},
+                             {"v": wal["user_id"], "cls": "ids"}])
+                weak_rows.append("muted" if int(wal["balance"]) <= 0 else "")
+            table = _table(["谁", "愿力", "信誉分", "未结欠条", "最近动过", "账号"], rows,
+                           align=(1, 2, 3, 4, 5), rowcls=weak_rows)   # 余额 <= 0 ⇒ 整行弱化 ✓
+        else:
+            table = _empty("还没有人动过账", "·")
+        blocks.append(_card("钱包一览", table, tag="按愿力多少排"))
+
+        # ③ 未结欠条
+        ious = bot["ious"]
+        if ious:
+            rows = [[{"v": i["id"], "cls": "num"}, i["debtor"], i["item"],
+                     {"v": i["amount"], "cls": "num"},
+                     {"v": i["time"], "cls": "num"},
+                     {"v": i["due"] or "—", "cls": "num"}] for i in ious]
+            table = _table(["#", "谁欠的", "要他做什么", "愿力", "什么时候点的", "期限"],
+                           rows, align=(0, 3, 4, 5))
+        else:
+            table = _empty("没有未结的欠条", "·")
+        blocks.append(_card("未结欠条", table, tag="还没兑现的要求"))
+
+        # ④ 今日活跃
+        top = detail["top"]
+        if top:
+            rows = [[t["user_id"],
+                     {"v": "+%d" % t["got"], "cls": "num pos"} if t["got"] else
+                     {"v": "0", "cls": "num zero"},
+                     {"v": "−%d" % t["gave"], "cls": "num neg"} if t["gave"] else
+                     {"v": "0", "cls": "num zero"}] for t in top]
+            table = _table(["账号", "收（进）", "出"], rows, align=(1, 2))
+        else:
+            table = _empty("今天还没人动过", "·")
+        blocks.append(_card("今日活跃", table, tag="进 / 出合计"))
+
+        # ⑤ 最近流水
+        brief = bot["brief"]
+        if brief:
+            rows = [[{"v": b["time"], "cls": "num"}, {"v": _badge(b["kind"]), "raw": True},
+                     b["from"], b["to"],
+                     {"v": "+%d" % b["amount"] if b["amount"] > 0 else "%+d" % b["amount"],
+                      "cls": "num pos" if b["amount"] > 0 else "num neg"},
+                     b["reason"] or "—"]
+                    for b in brief]
+            table = _table(["时间", "类别", "从", "到", "数额", "她/他写的原话"], rows,
+                           align=(0, 4))
+        else:
+            table = _empty("还没有流水", "·")
+        blocks.append(_card("最近流水", table, tag="最新在前"))
+
+    if not blocks:
+        blocks.append(_card("账本", '<div class="pad">%s</div>'
+                            % _empty("账本里还没有任何 bot 的账", "·")))
+    return PAGE.format(path=html.escape(str(data.get("path") or "")),
                        shown=datetime.fromtimestamp(int(data["now"]), CN_TZ)
                        .strftime("%Y-%m-%d %H:%M:%S"),
-                       body="".join(blocks))
+                       refresh_chip=chip,
+                       body=flash + "".join(blocks))
 
 
 class Handler(BaseHTTPRequestHandler):
     db_path = ""
     quiet = True
+    refresh = False          # 是否允许「一键拉取」（由服务启动参数决定 ✓）
+    refresh_fn = None        # 可注入的拉取函数（自检用它，不真连服务器）
+
+    def _path_text(self):
+        """`self.path` 在标准库里可能是 `pathlib.Path` —— 先转成字符串再解析 ✓"""
+        return str(self.path or "/")
+
+    def _same_origin(self):
+        """只认本机来源：Host 必须是回环；带了 Origin/Referer 也必须是回环 ✓（防 CSRF）"""
+        host = (self.headers.get("Host") or "").split(":")[0].strip().lower()
+        if host not in ("127.0.0.1", "localhost", "::1", "[::1]"):
+            return False
+        for name in ("Origin", "Referer"):
+            value = self.headers.get(name)
+            if not value:
+                continue
+            parsed = urllib.parse.urlparse(value)
+            if (parsed.hostname or "").lower() not in ("127.0.0.1", "localhost", "::1"):
+                return False
+        return True
+
+    def _json(self, obj, code=200):
+        payload = json.dumps(obj, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _refresh_now(self):
+        if self.refresh_fn is not None:
+            info = self.refresh_fn()
+        else:
+            import refresh as _refresh       # 懒导入：不开刷新时连它都不碰 ✓
+            info = _refresh.pull()
+        if isinstance(info, dict) and info.get("db"):
+            type(self).db_path = info["db"]
+        return info if isinstance(info, dict) else {"ok": False, "error": str(info)}
 
     def do_GET(self):                                   # noqa: N802 —— http.server 的约定
-        if self.path.split("?")[0] not in ("/", "/index.html"):
+        target = self._path_text()
+        path, _sep, query = target.partition("?")
+        if path not in ("/", "/index.html"):
             self.send_error(404, "only / is served")
             return
+        flash = ""
+        wants = urllib.parse.parse_qs(query or "")
+        # 「一键拉取」：同一台机器上的页面点那个按钮 ⇒ 走这里（GET 只是为了让浏览器停在页面上 ✓）
+        if "refresh" in wants and self.refresh and self._same_origin():
+            try:
+                info = self._refresh_now()
+                if info.get("ok"):
+                    flash = ('<div class="note ok"><div class="t">已从服务器拉取新副本</div>'
+                             '<div class="r">%s</div></div>'
+                             % html.escape("、".join(info.get("files") or [])))
+                else:
+                    flash = ('<div class="note"><div class="t">拉取失败</div><div class="r">%s</div></div>'
+                             % html.escape(str(info.get("error") or "未知原因")))
+            except Exception as exc:            # noqa: BLE001 —— 拉取失败要把话说清楚
+                flash = ('<div class="note"><div class="t">拉取失败</div><div class="r">%s</div></div>'
+                         % html.escape(str(exc)[:200]))
         try:
-            payload = render(snapshot(self.db_path)).encode("utf-8")
+            payload = render(snapshot(self.db_path), refresh_on=self.refresh,
+                             flash=flash).encode("utf-8")
             status = 200
         except Exception as exc:                        # noqa: BLE001 —— 面板出错也别把栈甩给浏览器
             payload = ("读账本失败：%s" % html.escape(str(exc)[:200])).encode("utf-8")
@@ -301,14 +604,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def do_POST(self):                                  # noqa: N802 —— http.server 的约定
+        """唯一的一个写动作：**去服务器拉一份新的只读副本**（不碰远端任何文件 ✓）"""
+        path = self._path_text().split("?")[0]
+        if path != "/api/refresh":
+            self._json({"ok": False, "error": "only /api/refresh"}, 404)
+            return
+        if not self.refresh:
+            self._json({"ok": False, "error": "这次启动没开一键拉取（用 --refresh 打开）"}, 403)
+            return
+        if not self._same_origin():
+            self._json({"ok": False, "error": "只接受本机页面发来的请求"}, 403)
+            return
+        try:
+            if self.refresh_fn is not None:
+                info = self.refresh_fn()
+            else:
+                import refresh as _refresh       # 懒导入：不开刷新时连它都不碰 ✓
+                info = _refresh.pull()
+            if isinstance(info, dict) and info.get("db"):
+                type(self).db_path = info["db"]
+            self._json({"ok": bool(isinstance(info, dict) and info.get("ok")),
+                        "info": info if isinstance(info, dict) else str(info)})
+        except Exception as exc:                 # noqa: BLE001 —— 拉取失败要如实回报，不许静默
+            self._json({"ok": False, "error": str(exc)[:200]}, 500)
+
     def log_message(self, *args):
         if not self.quiet:
             BaseHTTPRequestHandler.log_message(self, *args)
 
 
-def serve(db_path, host="127.0.0.1", port=8765, quiet=True):
+def serve(db_path, host="127.0.0.1", port=8765, quiet=True, refresh=False,
+          refresh_fn=None):
     Handler.db_path = db_path
     Handler.quiet = quiet
+    Handler.refresh = bool(refresh)
+    Handler.refresh_fn = refresh_fn
     httpd = ThreadingHTTPServer((host, port), Handler)
     return httpd
 
@@ -321,6 +652,9 @@ def main():
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--json", action="store_true", help="不开服务，直接吐 JSON")
     parser.add_argument("--self-id", default="", help="只看某个 bot（默认全部）")
+    parser.add_argument("--refresh", action="store_true",
+                        help="打开「一键拉取」（POST /api/refresh 会去服务器取新副本）")
+    parser.add_argument("--no-refresh", action="store_true", help="明确关掉一键拉取")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -329,12 +663,15 @@ def main():
         print(json.dumps(snapshot(db_path, self_id=args.self_id or None),
                          ensure_ascii=False, indent=2))
         return 0
+    allow_refresh = bool(args.refresh) and not bool(args.no_refresh)
     if not os.path.exists(db_path):
         print("⚠️ 数据文件还不存在：%s" % db_path)
         print("  （面板照常起得来，页面上会写「还读不到账本」✓）")
-    httpd = serve(db_path, args.host, args.port, quiet=not args.verbose)
+    httpd = serve(db_path, args.host, args.port, quiet=not args.verbose,
+                  refresh=allow_refresh)
     print("愿力中心 · 只读面板：http://%s:%d/  （Ctrl+C 停）" % (args.host, args.port))
     print("数据文件：%s" % db_path)
+    print("一键拉取：%s" % ("开 ✓（页面上那个按钮）" if allow_refresh else "关（加 --refresh 打开）"))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

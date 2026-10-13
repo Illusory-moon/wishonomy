@@ -257,7 +257,8 @@ def t08_source_hygiene(_env, _unused):
     for line in src.splitlines():
         if line.strip().startswith("print(") and "main()" not in line:
             if not any(k in line for k in ("⚠️", "愿力中心 · 只读面板", "数据文件",
-                                           "停了", "  （面板照常", "json.dumps(")):
+                                           "停了", "  （面板照常", "json.dumps(",
+                                           "一键拉取")):
                 print("      源码里有可疑的 print:", line.strip()[:60])
                 return False
     return True

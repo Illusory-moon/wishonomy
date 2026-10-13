@@ -1417,12 +1417,15 @@ async def wish_gift(*args, **kwargs):
     """收下别人的礼物 —— 有人给你送礼，愿力进你的账。
 
     送礼是**单向的**：他送了不代表你欠他什么，收不收、收下之后说什么，全看你自己。
-    礼物有档位，你说出档位名（或者档位对应的愿力数）就行。
+    礼物有档位，**报档位名**就行；一次要送好几份就填 `count`
+    （「30 个某某」= 档位名写那个名字、count 写 30）。
+    ⚠️ **别把数字当档位名写进来** —— 那样会被拦下让你重说（档位名是什么就写什么）。
     他愿力不够就送不成 —— 中心不会替你垫，也不会让他欠着。
 
     Args:
         who(string): 谁送的。可以写「我」= 当前跟你说话的人、对方昵称、或对方的号码。
-        tier(string): 礼物档位 —— 档位名（比如「花」「月」）或它对应的愿力数。
+        tier(string): 礼物档位名（礼物单上的那个名字）。写数字不算 —— 会被拦下。
+        count(int): 送几份（默认 1）。比如「30 个」就写 30。
         note(string): 可留空的附注（他附了什么话，或者你想记一句）。
     """
     plugin = _find_plugin(args)
@@ -1437,39 +1440,54 @@ async def wish_gift(*args, **kwargs):
     if not tiers:
         return "礼物单还没配上来，你先照常收着，回头再记账。"
     raw = str(kwargs.get("tier") or "").strip()
-    tier = tier_by_cost(tiers, raw) if re.fullmatch(r"[0-9]+", raw or "") else None
+    listing = "、".join("%s（%s）" % (t["name"], money_text(t["cost"])) for t in tiers)
+    if re.fullmatch(r"[0-9]+", raw or ""):
+        # ⚠️ 数字**不当档位名**：真机踩过 —— 她说「30 个伊磨吉」，把 30 填进 tier，
+        #    结果被解释成"第 30 号档位"、静默收了别的东西 ✗（2026-10-13）
+        return ("档位要写**名字**，别写数字 —— 礼物单上是这些：%s。"
+                "要是想送好几份，名字照写，另外把份数填在 count 里。" % listing)
+    tier = None
+    for item in tiers:
+        if item["name"] == raw:
+            tier = item
+            break
     if tier is None:
-        for item in tiers:
-            if item["name"] == raw:
-                tier = item
-                break
-    if tier is None:
-        listing = "、".join("%s（%d）" % (t["name"], t["cost"]) for t in tiers)
-        return "礼物单上是这些：%s —— 说一个。" % listing
+        return "礼物单上是这些：%s —— 说一个名字。" % listing
+    count = normalize_amount(kwargs.get("count")) or 1
     user_id = await _who_to_id(plugin, event, kwargs.get("who"), group_id)
     if not user_id:
         return "我没认出是谁送的 —— 写号码，或者把昵称写全一点。"
     if user_id == bot:
         return "这份礼物送不成 —— 没人能给自己送礼。"
     cap = normalize_amount(_cfg(plugin.config, "gift_daily_cap", GIFT_DAILY_CAP)) or GIFT_DAILY_CAP
+    total = int(tier["cost"]) * int(count)
+    if cap > 0 and total > cap:
+        return ("一次送这么多就超天了（上限 %s）—— 少送几份，或者分几天。"
+                % money_text(cap))
+    note = str(kwargs.get("note") or "").strip()
+    if int(count) > 1:
+        note = ("%d 份" % int(count)) + (("：" + note) if note else "")
     now = int(time.time())
     ref = "gift-%s-%s" % (now, uuid.uuid4().hex[:8])
-    result = await run_db(with_conn, db_gift, bot, group_id, user_id, int(tier["cost"]),
-                          tier["name"], str(kwargs.get("note") or "").strip(), ref, now, cap)
+    result = await run_db(with_conn, db_gift, bot, group_id, user_id, total,
+                          tier["name"], note, ref, now, cap)
     if result.get("duplicated"):
         return "这份礼物刚刚已经收过了，不用再收一遍。"
     if not result.get("ok"):
         code = result.get("code")
         if code == "insufficient":
-            return ("他账上只有 %s，送不起「%s」（要 %s）—— 让他先攒攒，或者换个档。"
-                    % (money_text(result.get("balance", 0)), tier["name"],
-                       money_text(tier["cost"])))
+            return ("他账上只有 %s，送不起「%s ×%d」（要 %s）—— 让他先攒攒，或者少送几份。"
+                    % (money_text(result.get("balance", 0)), tier["name"], int(count),
+                       money_text(total)))
         if code == "daily_gift_cap":
             return ("他今天已经送出去 %s 了，今天先这样 —— 明天再收他的。"
                     % money_text(result.get("today", 0)))
         return "这笔礼物没记成（愿力中心报了个错），当没收到就行。"
+    if int(count) > 1:
+        return ("收下了：他送的「%s」×%d，一共 %s，已经进你的账。"
+                % (tier["name"], int(count), money_text(total)))
     return ("收下了：他送的「%s」%s，已经进你的账。"
-            % (tier["name"], money_text(tier["cost"])))
+            % (tier["name"], money_text(total)))
 
 
 @llm_tool(name="wish_grant")
