@@ -1207,6 +1207,63 @@ def t41_gift_count(mod, plugin):
     return True
 
 
+class _RespMood:
+    def __init__(self, text):
+        self.completion_text = text
+        self.usage = None
+
+
+def t42_mood_tag_parse(mod, _plugin):
+    """私有心情标签：三种写法都认、任何位置都扒、**正文一个字不删** ✓"""
+    cases = [
+        ("双中括号", '你这话我可记住了~[[wish_mood]]{"delta":5,"reason":"他今天嘴甜"}[[/wish_mood]]',
+         5, "你这话我可记住了~"),
+        ("无变化", '嗯，知道了~ [[wish_mood]]{"delta":0}[[/wish_mood]]', 0, "嗯，知道了~"),
+        ("在中间", '前半句[[wish_mood]]{"delta":-3,"reason":"拆台"}[[/wish_mood]]后半句',
+         -3, "前半句后半句"),
+        ("尖括号", '收到<wish_mood>{"delta":2,"reason":"接梗"}</wish_mood>', 2, "收到"),
+        ("没有标签（不许误伤）", '今天就聊到这儿吧~', 0, "今天就聊到这儿吧~"),
+    ]
+    for name, text, want_delta, want_text in cases:
+        cleaned, delta, _reason = mod.parse_mood_tag(text)
+        if "wish_mood" in cleaned:
+            print("      %s：标签没扒干净 ✗ %r" % (name, cleaned[-40:]))
+            return False
+        if delta != want_delta:
+            print("      %s：delta 不对（%s ≠ %s）" % (name, delta, want_delta))
+            return False
+        if want_text not in cleaned:
+            print("      %s：正文被删了（少了 %r）" % (name, want_text))
+            return False
+    return True
+
+
+def t43_mood_tag_records(mod, plugin):
+    """标签那条路**真的记账**：回复里的标签被扒掉 + 愿力真的涨 ✓
+
+    ⚠️ 这是主人 2026-10-13 报的真问题（她只在聊到愿力时才记账 ✗）的回归 ✓
+    """
+    before = balance_of(mod, ALICE)
+    resp = _RespMood('你这话我可记住了~[[wish_mood]]{"delta":7,"reason":"今天嘴甜"}[[/wish_mood]]')
+    asyncio.run(plugin.record_mood(Ev(sender=ALICE), resp))
+    if "wish_mood" in (resp.completion_text or ""):
+        print("      标签漏在回复里:", resp.completion_text)
+        return False
+    if balance_of(mod, ALICE) != before + 7:
+        print("      没记账：%s → %s" % (before, balance_of(mod, ALICE)))
+        return False
+    # 无变化 ⇒ 一分不动
+    resp0 = _RespMood('随便说一句~[[wish_mood]]{"delta":0}[[/wish_mood]]')
+    asyncio.run(plugin.record_mood(Ev(sender=ALICE), resp0))
+    if balance_of(mod, ALICE) != before + 7 or "wish_mood" in resp0.completion_text:
+        print("      delta=0 时动了账或漏了标签:", balance_of(mod, ALICE))
+        return False
+    # 她给自己 ⇒ 不许记账（身份闸门 + who==bot 双拦 ✓）
+    resp_self = _RespMood('给自己记一笔[[wish_mood]]{"delta":50,"reason":"自夸"}[[/wish_mood]]')
+    asyncio.run(plugin.record_mood(Ev(sender=BOT), resp_self))
+    return balance_of(mod, BOT) == 0
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1249,6 +1306,8 @@ TESTS = [
     ("R39 框架式实例化（只传 context）", t39_framework_instantiation),
     ("R40 配置缺 gift_tiers 时有兜底档位", t40_tiers_default_when_missing),
     ("R41 送礼份数：数字不当档位名 / count 生效", t41_gift_count),
+    ("R42 心情标签：三写法/任何位置/不删正文", t42_mood_tag_parse),
+    ("R43 心情标签真记账 + 标签不漏进回复", t43_mood_tag_records),
 ]
 
 

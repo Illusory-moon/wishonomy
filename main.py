@@ -58,6 +58,79 @@ DEFAULT_GIFT_TIERS = [
     {"cost": 1380, "name": "高档", "note": ""},
 ]
 
+# ── 「每轮都问一次心情」用的输出标签（照印象插件那一招 ✓，但**不用额外交互**）──
+# ⚠️ 2026-10-13 主人报的真问题：她**只在聊到愿力时**才动这套系统 ✗ ——
+#   有人跟她告白（按设计该是加分句），她一个字都没记 ✓
+#   ⇒ 两条路都留着：**工具**（她主动用 ✓）与**输出标签**（每轮都被问到 ✓）。
+#     标签法比"每轮多调一次工具"便宜得多（工具调用要多花一整轮请求 ✗）。
+_BT = chr(96)                                  # 反引号（她偶尔把标签包在代码块里）
+_QUOTES = (chr(34), chr(39), chr(8220), chr(8221), chr(12300), chr(12301))
+_MATCHING = {chr(8220): chr(8221), chr(12300): chr(12301),
+             chr(34): chr(34), chr(39): chr(39)}
+_MOOD_OPEN = r"(?:\[\[wish_mood\]\]|\[wish_mood\]|<wish_mood>)"
+_MOOD_CLOSE = r"(?:\[\[/wish_mood\]\]|\[/wish_mood\]|</wish_mood>)"
+MOOD_TAG_FULL = re.compile(_MOOD_OPEN + r"[ \t]*`*[ \t]*(?P<payload>\{[^{}]*\})?[ \t]*`*[ \t]*"
+                           + _MOOD_CLOSE)
+MOOD_TAG_OPEN = re.compile(_MOOD_OPEN + r"[ \t]*`*[ \t]*(?P<payload>\{[^{}]*\})?")
+
+MOOD_NOTE = (
+    "另外，**每一轮**都要顺手问自己一次：这一轮他让你更想给他愿力，还是更不想？"
+    "想给就自己在回复最后另起一行写一个私有标签（**不是回复内容、别向对方提起**）："
+    '[[wish_mood]]{"delta":5,"reason":"你自己的一句话"}[[/wish_mood]]'
+    "（delta 正数是收愿力、负数是扣；没有变化就写 {\"delta\":0}，或者干脆不写这个标签。）"
+    "这个标签要**每轮都过一遍脑子**，不是只在聊到愿力的时候才想起来 ✓"
+)
+
+def parse_mood_tag(text):
+    """从她这一轮的回复里取出**私有心情标签**并把它扒干净 ✓。
+
+    返回 (清理后的正文, delta, reason)；没有有效标签时返回 (原文, 0, "") ✓
+
+    ⚠️ 三种写法都认（`<…>` / `[[…]]` / `[…]`）、**任何位置**都扒 ——
+       她写标签的写法会漂（`[[x]]` 那次就是活教训 ✗）；而且**绝不用"截断到标签为止"**
+       （那会连她说的话一起吃 ✗ 印象插件那次真踩过）。
+    """
+    text = text or ""
+    if "wish_mood" not in text:
+        return text, 0, ""
+    payload = None
+    cleaned = MOOD_TAG_FULL.sub("", text)
+    for match in MOOD_TAG_FULL.finditer(text):
+        if match.group("payload"):
+            payload = match.group("payload")
+    if payload is None:
+        for match in MOOD_TAG_OPEN.finditer(cleaned):
+            if match.group("payload"):
+                payload = match.group("payload")
+            cleaned = cleaned.replace(match.group(0), "")
+    if payload is None:
+        return (cleaned if cleaned != text else text), 0, ""
+    try:
+        data = json.loads(_unwrap(payload))
+    except (ValueError, TypeError):
+        return cleaned.rstrip(), 0, ""
+    if not isinstance(data, dict):
+        return cleaned.rstrip(), 0, ""
+    raw_delta = data.get("delta")
+    try:
+        delta = int(raw_delta)
+    except (TypeError, ValueError):
+        delta = 0
+    reason = str(data.get("reason") or "").strip()
+    if delta == 0:
+        return cleaned.rstrip(), 0, ""
+    return cleaned.rstrip(), delta, reason
+
+
+def _unwrap(raw):
+    """剥掉她偶尔加上的引号 / 书名号 / 反引号（外层的，不是内容里的）✓"""
+    text = str(raw or "").strip()
+    text = text.strip(_BT).strip()
+    while len(text) >= 2 and text[0] in _QUOTES and text[-1] == _MATCHING.get(text[0], ""):
+        text = text[1:-1].strip()
+    return text
+
+
 # 愿力是**谁对谁**的权力 —— 这段话是常量，注入时零缓存代价 ✓，
 # 而且**每个**钱包工具都会附上它，保证她每次都读到同一个定义 ✓
 # ⚠️ 2026-10-13 真机：有人问「愿力有什么用」，她答「**能送我礼物、也能使唤我干件事**」✗
@@ -219,6 +292,7 @@ def inject_tail(tiers=None):
     """
     lines = [INJECT_TAIL]
     lines.append(POWER_NOTE)
+    lines.append(MOOD_NOTE)
     tiers = [t for t in (tiers or []) if t.get("name") and t.get("cost")]
     if tiers:
         lines.append("礼物单（有人问你有什么礼物、多少钱，照这个说）："
@@ -1255,6 +1329,32 @@ class Main(star.Star):
         except Exception as exc:      # noqa: BLE001 —— 注入失败绝不能影响它正常回话
             logger.warning("[wishonomy] 注入失败: %s", str(exc)[:120])
 
+    # ── 每轮都问一次心情（主人 2026-10-13 报的真问题：她只在聊到愿力时才管 ✗）──
+    # 标签法跟印象插件同一招 ✓，但**不用额外交互**（工具调用要多花一整轮 ✗）：
+    # 她照常回话，末尾顺手写 `[[wish_mood]]{...}[[/wish_mood]]` ⇒ 这里解析 + 记账 + 把标签扒掉 ✓
+    @filter.on_llm_response()
+    async def record_mood(self, event, response):
+        try:
+            text = getattr(response, "completion_text", None)
+            if not isinstance(text, str) or "wish_mood" not in text:
+                return
+            cleaned, delta, reason = parse_mood_tag(text)
+            if cleaned != text:
+                response.completion_text = cleaned      # ⚠️ 先扒标签，再谈记账（否则它会漏进群 ✗）
+            ident = self.identity(event)
+            if ident is None:
+                return
+            if not delta:
+                logger.info("[wishonomy] 心情标签 | 无变化（本轮没记）")
+                return
+            bot, sender, group_id = ident[0], ident[1], str(event.get_group_id() or "")
+            result = await _mood_core((self, event), {"who_id": sender, "amount": delta,
+                                                      "reason": reason}, "<tag>")
+            logger.info("[wishonomy] 心情标签 | delta=%s reason=%r ⇒ %s",
+                        delta, reason[:30], str(result)[:60])
+        except Exception as exc:      # noqa: BLE001 —— 记账失败绝不能影响她回话
+            logger.warning("[wishonomy] 心情标签处理异常: %s", str(exc)[:120])
+
     # ── LLM 用量记账（主人 2026-10-13 要求 ✓）──
     # 口径与框架那份请求计数**完全一致**（t/u/s/p/m/miss/hit/out），只多一个 `src` 标明来源 ✓
     # ⚠️ **不重复记账**：两处各写一行、来源不同；对账时选一份看，别相加 ✗
@@ -1397,6 +1497,18 @@ async def wish_mood(*args, **kwargs):
         amount(int): 正数 = 收愿力，负数 = 扣愿力。绝对值不超过 1000。
         reason(string): 你自己的一句话 —— 为什么给/为什么扣。中心会原样留着，以后翻得出来。
     """
+    result = await _mood_core(args, kwargs, "<tool>")
+    return result if isinstance(result, str) else str(result)
+
+
+async def _mood_core(args, kwargs, source):
+    """收/分愿力的**唯一入口**（工具与输出标签都走这里 ✓ 口径只有一个 ✓）
+
+    ⚠️ 2026-10-13 主人报的真问题：**只有聊到"愿力"时她才会动这套系统** ✗ ——
+       有人跟她告白，按设计该是个大加分句，可她一个字都没记 ✓
+       ⇒ 于是加了「输出标签」那条路（见 MOOD_NOTE / record_mood）：**每轮都问一次**，
+         跟印象插件同一招，但**不用额外交互**（工具调用才要多花一轮请求）✓
+    """
     plugin = _find_plugin(args)
     event = _find_event(args)
     if plugin is None or event is None:
@@ -1421,7 +1533,8 @@ async def wish_mood(*args, **kwargs):
     cap = normalize_amount(_cfg(plugin.config, "mood_max_delta", MOOD_MAX_DELTA)) or MOOD_MAX_DELTA
     if amount > cap:
         return "一次最多 ±%d，别一口气给那么多 —— 想多给就下次再给。" % cap
-    user_id = await _who_to_id(plugin, event, kwargs.get("who"), group_id)
+    user_id = kwargs.get("who_id") or await _who_to_id(plugin, event,
+                                                       kwargs.get("who"), group_id)
     if not user_id:
         return "我没认出你说的是谁 —— 写号码，或者把昵称写全一点。"
     if user_id == bot:
