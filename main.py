@@ -1164,10 +1164,14 @@ async def wish_mood(*args, **kwargs):
     daily = normalize_amount(_cfg(plugin.config, "mood_daily_gain", MOOD_DAILY_GAIN)) or MOOD_DAILY_GAIN
     issue_cap = normalize_amount(_cfg(plugin.config, "issue_global_daily",
                                       ISSUE_GLOBAL_DAILY)) or 0
+    # 顺带把「显示名」写进账本（面板/排行要显示人名，不能只有号码 ✓）
+    shown = ""
+    if str(user_id) == str(sender):
+        shown = str(event.get_sender_name() or "").strip()
     now = int(time.time())
     ref = "%s%s-%s" % ("mood-", now, uuid.uuid4().hex[:8])
     result = await run_db(with_conn, db_mood, bot, group_id, user_id, amount, reason,
-                          ref, now, daily, "", issue_cap)
+                          ref, now, daily, shown, issue_cap)
     if not result.get("ok"):
         return _mood_failure(result, daily)
     name = await _display_name(plugin, event, bot, group_id, user_id)

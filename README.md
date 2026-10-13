@@ -69,13 +69,32 @@ bot 攒到的愿力还能打给别人、换别人为它做一件事（欠条 = I
 3. 按自己的世界观填 `money_name` 与 `gift_tiers`
 4. 想让她每轮都知道对方有多少愿力 ⇒ `inject_money` 保持打开；想更省 token ⇒ 关掉（只按需查）
 
+## 只读面板（给运营看的一页）
+
+```bash
+python panel.py                  # http://127.0.0.1:8765/（只绑本机 ✓）
+python panel.py --port 9000      # 换端口
+python panel.py --json           # 不开服务，直接吐 JSON（部署后核对用）
+```
+
+页面上有：当日发行/送礼/支出/撤回/账上总量 · 钱包一览 · 还没兑现的要求 ·
+今天动得最多的人 · 最近流水（含**她写的原话**）。
+
+三条纪律（**代码保证** ✓）：
+1. **只读** —— 连接一律用 SQLite 的 `mode=ro` 打开，面板**写不了**库（连 WAL 都不碰 ✓）
+2. **只绑 `127.0.0.1`** —— 默认不对外；要对外请自己套反代
+3. **转义** —— 流水里的原话一律 `html.escape`（防 XSS ✓）
+
+自检：`python panelcheck.py`（9 项，含真 HTTP 冒烟 / 只读保证 / 转义 / CLI 入口）
+
 ## 自检
 
 ```bash
-python selfcheck.py     # 失败会 exit 1
+python selfcheck.py     # 工具与账本：35 项
+python panelcheck.py    # 只读面板：9 项
 ```
 
-不依赖任何第三方库（只用标准库 + 临时目录里的真 SQLite 库）。
+两个都**失败就 exit 1**；不依赖任何第三方库（只用标准库 + 临时目录里的真 SQLite 库）。
 
 ## 目录
 
