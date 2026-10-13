@@ -586,6 +586,26 @@ def t23_no_prompt_injection(mod, _plugin):
     return True
 
 
+def t23_tool_docs_are_const(mod, _plugin):
+    """工具说明必须是**常量**（docstring 里不许有随轮次变化的格式化占位）。"""
+    import ast
+    with open(PLUGIN, encoding="utf-8") as handle:
+        src = handle.read()
+    tree = ast.parse(src)
+    found = 0
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("wish_"):
+            doc = ast.get_docstring(node) or ""
+            if not doc.strip():
+                print("      工具没有说明（模型会看不懂）:", node.name)
+                return False
+            if "%s" in doc or "{}" in doc or "{0}" in doc:
+                print("      工具说明里有格式化占位:", node.name)
+                return False
+            found += 1
+    return found >= 4
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),

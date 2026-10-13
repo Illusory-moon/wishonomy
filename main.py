@@ -31,7 +31,7 @@ from astrbot.api.star import StarTools
 PLUGIN_NAME = "astrbot_plugin_wishonomy"
 SCHEMA_VERSION = 1
 
-CN_TZ = timezone(timedelta(hours=8))     # 账本按北京时间分日（服务器是 UTC）
+CN_TZ = timezone(timedelta(hours=8))     # 账本账本按北京时间分日（服务器是 UTC）
 MONEY_NAME = "愿力"                       # 默认单位名；只是默认值，语义不依赖它
 CREDIT_NAME = "信誉分"
 
