@@ -1076,6 +1076,28 @@ def t38_panel_not_shipped(mod, _plugin):
     return True
 
 
+def t39_framework_instantiation(mod, _plugin):
+    """**框架只传 context** 时也要能实例化（2026-10-13 上线当场栽在这儿 ✗）
+
+    框架那句是 `metadata.star_cls_type(context=self.context)` ——
+    少传 config 就 `TypeError: missing 1 required positional argument` ✗
+    ⇒ 自检里永远要按**框架的调用方式**实例化一次 ✓
+    """
+    CONFIG.clear()                                  # 故意不给配置 ⇒ 走"自己去读文件"那条路
+    try:
+        plugin = mod.Main(context=None)             # 只传 context（框架就是这么调的）
+    except TypeError as exc:
+        print("      框架式实例化失败了:", exc)
+        return False
+    finally:
+        make_plugin(mod)                            # 把配置补回来给后面的项用
+    # 没有配置 ⇒ 一切按"不启用"，但**不许崩** ✓
+    if plugin.identity(Ev()) is not None:
+        print("      没配置却启用了身份闸门 ✗")
+        return False
+    return isinstance(getattr(plugin, "config", None), dict)
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1115,6 +1137,7 @@ TESTS = [
     ("R36 用量记账：同口径 + src + 不写库", t36_usage_record),
     ("R37 用量汇总：按天 + 按来源过滤", t37_usage_summary),
     ("R38 面板不进部署产物", t38_panel_not_shipped),
+    ("R39 框架式实例化（只传 context）", t39_framework_instantiation),
 ]
 
 

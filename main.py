@@ -199,6 +199,23 @@ def money_hint(snap, who_text="他"):
 
 # ─────────────────────────── 库路径 / 线程池 ───────────────────────────
 
+def config_paths():
+    """插件配置文件的候选路径（框架不给 config 时自己去找 ✓）。
+
+    约定与部署实测一致：`<AstrBot 根>/data/config/<插件名>_config.json`
+    —— 印象插件就是这份路径（`astrbot_plugin_impression_config.json` ✓）。
+    """
+    name = "%s_config.json" % PLUGIN_NAME
+    roots = [os.environ.get("ASTRBOT_ROOT") or "", "/opt/astrbot", os.getcwd()]
+    out = []
+    for root in roots:
+        if not root:
+            continue
+        out.append(os.path.join(root, "data", "config", name))
+    out.append(os.path.join(os.path.expanduser("~"), ".astrbot", "data", "config", name))
+    return out
+
+
 def resolve_db_path(config=None):
     """愿力中心的数据文件位置（只算一次）。"""
     global _DB_PATH
@@ -1051,18 +1068,38 @@ def tier_by_cost(tiers, cost):
 # ─────────────────────────── 插件 ───────────────────────────
 
 class Main(star.Star):
-    def __init__(self, context: star.Context, config: AstrBotConfig):
+    def __init__(self, context: star.Context, config=None):
+        """⚠️ 框架实例化插件时**只传 context**（2026-10-13 上线实测 ✓）——
+        `config` 必须可选，否则 `TypeError: missing 1 required positional argument` ✗
+        拿不到就自己去读配置文件（路径与印象插件同一套约定 ✓）。
+        """
         super().__init__(context)
-        self.config = config
+        self.config = config if config is not None else self._load_config()
         global MONEY_NAME, CREDIT_NAME, _GIFT_TIERS
-        MONEY_NAME = str(_cfg(config, "money_name", MONEY_NAME) or MONEY_NAME)
-        CREDIT_NAME = str(_cfg(config, "credit_name", CREDIT_NAME) or CREDIT_NAME)
-        _GIFT_TIERS = resolve_tiers(config)
-        self.self_ids = target_ids(_cfg(config, "enabled_self_ids", ""))
-        self.path = resolve_db_path(config)
-        logger.info("[wishonomy] loaded | dir=%s bots=%d tiers=%d path=%s",
-                    str(_cfg(config, "data_dir", "")), len(self.self_ids),
-                    len(_GIFT_TIERS), self.path)
+        conf = self.config
+        MONEY_NAME = str(_cfg(conf, "money_name", MONEY_NAME) or MONEY_NAME)
+        CREDIT_NAME = str(_cfg(conf, "credit_name", CREDIT_NAME) or CREDIT_NAME)
+        _GIFT_TIERS = resolve_tiers(conf)
+        self.self_ids = target_ids(_cfg(conf, "enabled_self_ids", ""))
+        self.path = resolve_db_path(conf)
+        logger.info("[wishonomy] loaded | dir=%s bots=%d tiers=%d path=%s usage_log=%s",
+                    str(_cfg(conf, "data_dir", "")), len(self.self_ids),
+                    len(_GIFT_TIERS), self.path,
+                    bool(_cfg(conf, "usage_log", True)))
+
+    def _load_config(self):
+        """自己去读配置（框架不给 config 时走这条）—— 读不到就用空配置（= 不启用 ✓）"""
+        for path in config_paths():
+            try:
+                with open(path, encoding="utf-8") as handle:
+                    data = json.load(handle)
+                if isinstance(data, dict):
+                    logger.info("[wishonomy] 自己读到配置: %s", path)
+                    return data
+            except (OSError, ValueError):
+                continue
+        logger.warning("[wishonomy] 没读到配置文件，按「不启用」处理（enabled=false）")
+        return {}
 
     # ── 身份闸门：四条，任何一条不满足就**什么都不做** ──
     def identity(self, event, allow_self_mood=False):
@@ -1248,7 +1285,7 @@ async def wish_mood(*args, **kwargs):
 
     Args:
         who(string): 记给谁。可以写「我」= 当前跟你说话的人、对方昵称、或对方的号码。
-        amount(integer): 正数 = 收愿力，负数 = 扣愿力。绝对值不超过 1000。
+        amount(int): 正数 = 收愿力，负数 = 扣愿力。绝对值不超过 1000。
         reason(string): 你自己的一句话 —— 为什么给/为什么扣。中心会原样留着，以后翻得出来。
     """
     plugin = _find_plugin(args)
@@ -1381,7 +1418,7 @@ async def wish_grant(*args, **kwargs):
 
     Args:
         who(string): 点谁。可以写「我」= 当前跟你说话的人、对方昵称、或对方的号码。
-        amount(integer): 打给他多少愿力。
+        amount(int): 打给他多少愿力。
         item(string): 你要他做的那件事 —— 写**你自己的原话**，越具体越好（这句会一直留着）。
         due(string): 期限。留空 = 不急；也可以写「3」= 三天内，或「2026-12-31」。
     """
@@ -1436,7 +1473,7 @@ async def wish_iou_settle(*args, **kwargs):
     ⚠️ 撤回只在**他一分没花**的时候成功 —— 花掉了就撤不回来，那时候用信誉分说话。
 
     Args:
-        iou_id(integer): 欠条号。你记不清就用看欠条那个工具先查一眼。
+        iou_id(int): 欠条号。你记不清就用看欠条那个工具先查一眼。
         verdict(string): 四选一 —— delivered（他做了）/ defaulted（没做）/ forgiven（算了）/ refunded（撤回愿力）。
         evidence(string): 可留空。写清依据（他说了什么、做了什么），以后翻得出来。
     """
@@ -1534,7 +1571,7 @@ async def wish_credit(*args, **kwargs):
 
     Args:
         who(string): 给谁记。可以写「我」= 当前跟你说话的人、对方昵称、或对方的号码。
-        delta(integer): 正数是加（比如 5），负数是减（比如 -10）。
+        delta(int): 正数是加（比如 5），负数是减（比如 -10）。
         reason(string): 你自己的一句话 —— 为什么。
     """
     plugin = _find_plugin(args)
@@ -1583,7 +1620,7 @@ async def wish_leaderboard(*args, **kwargs):
 
     Args:
         by(string): 留空 = 按愿力排；写「信誉」= 按信誉分排。
-        n(integer): 要几个人（默认 5，最多 10）。
+        n(int): 要几个人（默认 5，最多 10）。
     """
     plugin = _find_plugin(args)
     event = _find_event(args)
@@ -1619,7 +1656,7 @@ async def wish_usage(*args, **kwargs):
     你自己的愿力跟这个没关系 —— 这是"跟她说话本身要花多少"的账。
 
     Args:
-        days(integer): 看最近几天（默认 7）。
+        days(int): 看最近几天（默认 7）。
     """
     plugin = _find_plugin(args)
     event = _find_event(args)
