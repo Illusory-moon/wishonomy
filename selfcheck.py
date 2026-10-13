@@ -506,12 +506,33 @@ def t19_external_write_path_missing(mod, _plugin):
 
 
 def t20_json_safe_defaults(mod, _plugin):
-    """配置缺席/畸形时不能炸（默认值兜底）。"""
-    tiers = mod.resolve_tiers({"gift_tiers": "[{\"cost\": 7, \"name\": \"丁档\"}]"})
-    junk = mod.resolve_tiers({"gift_tiers": "不是 JSON"})
-    empty = mod.resolve_tiers({})
-    return (tiers == [{"cost": 7, "name": "丁档", "note": ""}]
-            and junk == [] and empty == [] and mod.tier_by_cost(tiers, 7)["name"] == "丁档")
+    """配置畸形不炸：JSON 字符串能解析；坏值/缺项一律走兜底（**绝不静默变空** ✗）。
+
+    ⚠️ 2026-10-13 起口径变了：坏掉的 `gift_tiers` 不再返回空表，而是**退回兜底档位** ✓
+       （真机栽过：配置漏了这一项 ⇒ 礼物单空 ⇒ 送礼一分愿力不动 ✗ 见 R40）
+    """
+    ok_json = mod.resolve_tiers({"gift_tiers": "[{\"cost\": 7, \"name\": \"丁档\"}]"})
+    if ok_json != [{"cost": 7, "name": "丁档", "note": ""}]:
+        print("      JSON 字符串没解析对:", ok_json)
+        return False
+    fallback = len(mod.DEFAULT_GIFT_TIERS)
+    for bad in ("不是 JSON", "", None, [], "{}", 5):
+        got = mod.resolve_tiers({"gift_tiers": bad})
+        if len(got) != fallback:
+            print("      坏值 %r 没走兜底:" % (bad,), got)
+            return False
+    if mod.tier_by_cost(ok_json, 7)["name"] != "丁档":
+        return False
+    # 整份配置都是坏值时，实例化与工具也不许炸 ✓
+    CONFIG.clear()
+    CONFIG.update({"enabled": True, "enabled_self_ids": [BOT], "gift_tiers": "坏",
+                   "mood_max_delta": "abc", "gift_daily_cap": -5, "grant_max_open": 0})
+    try:
+        plugin = mod.Main(context=None, config=CONFIG)
+        out = call(mod.wish_mood, plugin, Ev(), who="我", amount=5, reason="畸形配置自检")
+        return isinstance(out, str) and out.strip() != ""
+    finally:
+        make_plugin(mod)
 
 
 def t21_source_hygiene(mod, _plugin):
@@ -1098,6 +1119,33 @@ def t39_framework_instantiation(mod, _plugin):
     return isinstance(getattr(plugin, "config", None), dict)
 
 
+def t40_tiers_default_when_missing(mod, _plugin):
+    """配置**漏了 `gift_tiers`** 时必须有兜底档位，不能是空表（2026-10-13 真机栽过 ✗）
+
+    真机现场：配置是手写的、没写 `gift_tiers`，而框架**不会**把 schema 的 default
+    自动落盘 ⇒ `resolve_tiers` 返回 `[]` ⇒ 她认不出任何礼物、**送礼一分愿力不动** ✗
+    """
+    tiers = mod.resolve_tiers({})
+    merged = mod.merge_config({"enabled": True})
+    default_keys = mod.config_defaults()
+    if len(tiers) != len(mod.DEFAULT_GIFT_TIERS):
+        print("      缺配置时档位表是空的 ✗:", tiers)
+        return False
+    if not all(t["cost"] and t["name"] for t in tiers):
+        print("      兜底档位不完整:", tiers)
+        return False
+    if "gift_tiers" not in merged or len(merged["gift_tiers"]) != len(tiers):
+        print("      merge_config 没补上 gift_tiers:", merged.get("gift_tiers"))
+        return False
+    if set(merged) != set(default_keys):
+        print("      merge_config 的键与 defaults 不一致:",
+              sorted(set(merged) ^ set(default_keys)))
+        return False
+    # 已给的项不许被默认值覆盖 ✓
+    kept = mod.merge_config({"money_name": "自定名", "gift_tiers": [{"cost": 7, "name": "甲"}]})
+    return kept["money_name"] == "自定名" and len(kept["gift_tiers"]) == 1
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1138,6 +1186,7 @@ TESTS = [
     ("R37 用量汇总：按天 + 按来源过滤", t37_usage_summary),
     ("R38 面板不进部署产物", t38_panel_not_shipped),
     ("R39 框架式实例化（只传 context）", t39_framework_instantiation),
+    ("R40 配置缺 gift_tiers 时有兜底档位", t40_tiers_default_when_missing),
 ]
 
 

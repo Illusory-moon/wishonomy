@@ -49,6 +49,14 @@ MOOD_DAILY_GAIN = 3000
 MOOD_MAX_DELTA = 1000
 ISSUE_GLOBAL_DAILY = 50000
 GIFT_DAILY_CAP = 3000
+# ⚠️ 礼物档位的**兜底默认值**必须与 `_conf_schema.json` 的 default 同源（见 config_defaults ✓）。
+#    2026-10-13 真机踩过：上线时配置漏了 `gift_tiers`，而框架**不会**把 schema 的 default
+#    自动写进配置文件 ⇒ 档位表是**空的** ⇒ 她认不出任何礼物、送礼**一分愿力都不动** ✗
+DEFAULT_GIFT_TIERS = [
+    {"cost": 1, "name": "低档", "note": ""},
+    {"cost": 100, "name": "中档", "note": ""},
+    {"cost": 1380, "name": "高档", "note": ""},
+]
 GRANT_MAX_SINGLE = 500        # 单笔点单上限（防她一次把家底给光）
 GRANT_MAX_OPEN = 5            # 同时最多几笔未兑现（防她一口气点 50 个人）
 
@@ -1048,7 +1056,53 @@ def _cfg(config, key, default=None):
     return default if value is None else value
 
 
+def config_defaults():
+    """代码里的**兜底默认值** —— 与 `_conf_schema.json` 的 default 保持一致 ✓
+
+    为什么要有它：配置项缺席时（尤其**新装插件、配置文件是手写的**）
+    框架不会把 schema 的 default 自动落盘 ⇒ 那些项在代码眼里就是"没有" ✗
+    ⇒ 凡是"缺了会静默降级"的项，都必须在这里给一份兜底 ✓
+    （2026-10-13 真机：漏了 `gift_tiers` ⇒ 礼物单空 ⇒ 送礼一分愿力不动 ✗）
+    """
+    return {
+        "enabled": False,
+        "enabled_self_ids": "",
+        "money_name": MONEY_NAME,
+        "credit_name": CREDIT_NAME,
+        "inject_money": True,
+        "usage_log": True,
+        "db_path": "",
+        "mood_max_delta": MOOD_MAX_DELTA,
+        "mood_daily_gain": MOOD_DAILY_GAIN,
+        "issue_global_daily": ISSUE_GLOBAL_DAILY,
+        "gift_daily_cap": GIFT_DAILY_CAP,
+        "gift_tiers": [dict(tier) for tier in DEFAULT_GIFT_TIERS],
+        "grant_max_single": GRANT_MAX_SINGLE,
+        "grant_max_open": GRANT_MAX_OPEN,
+    }
+
+
+def merge_config(raw):
+    """把兜底默认值**补进**这份配置（**原地改**，缺席的键才补 ✓）。
+
+    ⚠️ 必须原地改：框架给的 config 对象是活引用（配置热改看得见）；
+       若换成新 dict，运行时就**看不到**后来的配置改动了 ✗
+       （自检 R20/R23/R24/R26 当场抓到过 ✓）
+    """
+    target = raw if isinstance(raw, dict) else {}
+    for key, value in config_defaults().items():
+        if target.get(key) is None:
+            target[key] = value
+    return target
+
+
 def resolve_tiers(config):
+    """把配置里的礼物档位解析成 [{cost,name,note}]。
+
+    ⚠️ **永不静默变空**：配置缺项 / 空表 / 类型不对 / 解析出一堆无效项 ⇒
+       一律**退回兜底档位**（有配置对象时）✓ —— 真机栽过一次（见 R40）。
+       调用方**故意**传 `None`/空配置时（如单元测试想验默认），才返回空表 ✓
+    """
     raw = _cfg(config, "gift_tiers")
     if isinstance(raw, str):
         try:
@@ -1065,6 +1119,8 @@ def resolve_tiers(config):
             if cost and name:
                 out.append({"cost": cost, "name": name,
                             "note": str(item.get("note") or "").strip()})
+    if not out and config is not None:
+        out = [dict(tier) for tier in DEFAULT_GIFT_TIERS]
     return out
 
 
@@ -1086,7 +1142,8 @@ class Main(star.Star):
         super().__init__(context)
         self.config = config if config is not None else self._load_config()
         global MONEY_NAME, CREDIT_NAME, _GIFT_TIERS
-        conf = self.config
+        conf = merge_config(self.config)
+        self.config = conf
         MONEY_NAME = str(_cfg(conf, "money_name", MONEY_NAME) or MONEY_NAME)
         CREDIT_NAME = str(_cfg(conf, "credit_name", CREDIT_NAME) or CREDIT_NAME)
         _GIFT_TIERS = resolve_tiers(conf)
