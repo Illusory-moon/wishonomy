@@ -855,8 +855,8 @@ def t29_grant_limits(mod, plugin):
         print("      单笔上限没拦住:", single)
         return False
     for i in range(5):
-        raw_grant(mod, ALICE, 10, item="第%d件" % i)
-    full = call(mod.wish_grant, plugin, Ev(), who="我", amount=10, item="第六件")
+        raw_grant(mod, ALICE, mod.GRANT_MIN_AMOUNT, item="第%d件" % i)
+    full = call(mod.wish_grant, plugin, Ev(), who="我", amount=mod.GRANT_MIN_AMOUNT, item="第六件")
     if "没结的欠条" not in full:
         print("      未兑现上限没拦住:", full)
         return False
@@ -919,7 +919,7 @@ def t31_refund_rules(mod, _plugin):
         print("      花过的还能撤:", r2, before_bob, balance_of(mod, BOB))
         return False
     # ③ 花的是**自己的**钱（送礼），她给的那笔一分没动 ⇒ **撤得回来** ✓
-    g3 = raw_grant(mod, ALICE, 40, item="她给的那笔还没动")
+    g3 = raw_grant(mod, ALICE, 45, item="她给的那笔还没动")
     raw_mood(mod, ALICE, 25, "refund-own-money", now)   # 他自己另外赚了 25
     raw_gift(mod, ALICE, 25, "refund-own-spend", now)   # 又把自己那 25 送出去
     r3 = raw_refund(mod, g3["iou_id"])
@@ -933,7 +933,7 @@ def t32_ious_tool(mod, plugin):
     """看欠条：列出未结的；全结掉之后如实说「谁也不欠你什么」✓"""
     now = int(time.time())
     seed_bot(mod, 300, "ious-seed")
-    g = raw_grant(mod, ALICE, 40, item="念台词", due=now + 3 * 86400)
+    g = raw_grant(mod, ALICE, 45, item="念台词", due=now + 3 * 86400)
     listing = call(mod.wish_ious, plugin, Ev())
     if "念台词" not in listing or "#%d" % g["iou_id"] not in listing:
         print("      欠条清单不对:", listing)
@@ -999,7 +999,7 @@ def t35_audit_detail(mod, plugin):
     now = int(time.time())
     seed_bot(mod, 400, "audit-detail")
     raw_mood(mod, ALICE, 60, "audit-detail-a", now)
-    g = raw_grant(mod, ALICE, 30, item="留一张欠条")
+    g = raw_grant(mod, ALICE, 45, item="留一张欠条")
     raw_settle(mod, g["iou_id"], "defaulted", "没做")
     out = call(mod.wish_audit, plugin, Ev())
     ok = ("还没兑现的欠条" in out and "收愿力" in out and "送礼" in out
