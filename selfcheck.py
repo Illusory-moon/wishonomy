@@ -71,9 +71,25 @@ def load_plugin_module(tmpdir):
     event_api.filter = types.SimpleNamespace(
         on_llm_request=hook, on_llm_response=hook, on_agent_done=hook)
 
+    core = types.ModuleType("astrbot.core")
+    agent = types.ModuleType("astrbot.core.agent")
+    agent_message = types.ModuleType("astrbot.core.agent.message")
+
+    class TextPart:
+        """框架的「接在用户消息之后」那个位置的文本片段（注入用）。"""
+
+        def __init__(self, text):
+            self.text = text
+
+        def mark_as_temp(self):
+            return self
+
+    agent_message.TextPart = TextPart
+
     for name, mod in {
         "astrbot": root, "astrbot.api": api, "astrbot.api.event": event_api,
-        "astrbot.api.star": star_api,
+        "astrbot.api.star": star_api, "astrbot.core": core,
+        "astrbot.core.agent": agent, "astrbot.core.agent.message": agent_message,
     }.items():
         sys.modules[name] = mod
 
@@ -125,6 +141,7 @@ def make_plugin(mod):
         "enabled": True,
         "enabled_self_ids": [BOT],
         "money_name": "愿力",
+        "inject_money": True,
         "mood_max_delta": 1000,
         "mood_daily_gain": 3000,
         "gift_daily_cap": 3000,
@@ -546,47 +563,6 @@ def t22_sum_by_kind_windows(mod, _plugin):
         conn.close()
 
 
-def t23_no_prompt_injection(mod, _plugin):
-    """缓存纪律：**不许把会变的东西注入到前面**（那样会把它后面的历史缓存全废掉）。
-
-    现在这一版还没做注入（余额只靠 `wish_check` 按需查 ✓）；等做注入时，
-    这条要换成**行为断言**：常量进 `system_prompt` 尾部、每轮变的挂
-    `extra_user_content_parts` 的最后一个 part（见 `NEXT.md` ✓）。
-    """
-    with open(PLUGIN, encoding="utf-8") as handle:
-        src = handle.read()
-    banned = ("on_llm_request", "extra_user_content_parts", "system_prompt",
-              "request.prompt", "req.prompt")
-    hits = [token for token in banned if token in src]
-    if hits:
-        print("      源码里出现注入相关写法:", hits)
-        return False
-    if "@filter" in src:
-        print("      源码里挂了 filter 钩子（P1 不该有）")
-        return False
-    # 工具说明必须是**常量**：docstring 里不许出现随轮次变化的内容
-    import ast
-    tree = ast.parse(src)
-    fn_by_name = {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            fn_by_name[node.name] = node
-    for name in ("wish_check", "wish_mood", "wish_gift", "wish_audit"):
-        node = fn_by_name.get(name)
-        if node is None:
-            print("      找不到工具:", name)
-            return False
-        doc = ast.get_docstring(node) or ""
-        if not doc.strip():
-            print("      工具没有说明（模型会看不懂）:", name)
-            return False
-        # docstring 里不许出现格式化占位（那就会变成每轮不同的文本）
-        if "%s" in doc or "{}" in doc or "{0}" in doc:
-            print("      工具说明里有格式化占位（会变成每轮不同的前缀）:", name)
-            return False
-    return True
-
-
 def t23_tool_docs_are_const(mod, _plugin):
     """工具说明必须是**常量**（docstring 里不许有随轮次变化的格式化占位）。"""
     import ast
@@ -605,6 +581,90 @@ def t23_tool_docs_are_const(mod, _plugin):
                 return False
             found += 1
     return found >= 4
+
+
+def t23_cache_placement(mod, plugin):
+    """缓存纪律：**越不稳的放越后**（常量进 system_prompt 尾部、每轮变的挂用户消息之后）。
+
+    这是主人 2026-10-13 定的口径 —— 不是"不许注入"，而是"注入的位置要按稳定性排" ✓
+    """
+    class Req:
+        def __init__(self):
+            self.system_prompt = "人格与规矩"          # 稳定前缀
+            self.prompt = "本轮用户消息"
+            self.extra_user_content_parts = []
+
+    now = int(time.time())
+    raw_mood(mod, ALICE, 12, "inj-seed", now)
+    raw_mood(mod, BOB, 3, "inj-seed-b", now)
+
+    # ① 她（bot）自己没有账户 ⇒ 一个字都不注入（省 token 也省缓存）
+    req_none = Req()
+    asyncio.run(plugin.inject_money(Ev(sender=BOT), req_none))
+    if req_none.extra_user_content_parts or req_none.system_prompt != "人格与规矩":
+        print("      没账户也注入了:", req_none.system_prompt, req_none.extra_user_content_parts)
+        return False
+
+    # ② 有人说话 ⇒ 变动的那一行**只在 parts 里**，system_prompt 只多出常量段
+    req_a = Req()
+    asyncio.run(plugin.inject_money(Ev(sender=ALICE), req_a))
+    if len(req_a.extra_user_content_parts) != 1:
+        print("      变动内容没挂对位置:", req_a.extra_user_content_parts)
+        return False
+    hint = req_a.extra_user_content_parts[0].text
+    if "12" not in hint:
+        print("      提示里没有数字:", hint)
+        return False
+    if "12" in req_a.system_prompt:
+        print("      变动数字跑进 system_prompt 了（会废掉后面的缓存）:", req_a.system_prompt)
+        return False
+    if mod.INJECT_TAIL not in req_a.system_prompt:
+        print("      常量段没进 system_prompt:", req_a.system_prompt)
+        return False
+    if not req_a.system_prompt.startswith("人格与规矩"):
+        print("      常量段没挂在尾部:", req_a.system_prompt)
+        return False
+
+    # ③ 两个都有账户的人 ⇒ **系统提示一模一样**（常量），只有那一个 part 变（变动）
+    req_b = Req()
+    asyncio.run(plugin.inject_money(Ev(sender=BOB), req_b))
+    if req_b.system_prompt != req_a.system_prompt:
+        print("      换个人就让系统提示变了（缓存会废）")
+        return False
+    hint_b = req_b.extra_user_content_parts[0].text if req_b.extra_user_content_parts else ""
+    if hint_b == hint or "3" not in hint_b:
+        print("      换个人提示却没变对:", hint_b)
+        return False
+
+    # ④ 注入过程**绝不写库**（只是读一眼余额）
+    before = balance_of(mod, ALICE)
+    req_c = Req()
+    asyncio.run(plugin.inject_money(Ev(sender=ALICE), req_c))
+    if balance_of(mod, ALICE) != before:
+        print("      注入动了余额:", before, "→", balance_of(mod, ALICE))
+        return False
+
+    # ⑤ 开关关掉 ⇒ 一点都不注入
+    CONFIG["inject_money"] = False
+    try:
+        req_off = Req()
+        asyncio.run(plugin.inject_money(Ev(sender=ALICE), req_off))
+        if req_off.extra_user_content_parts or req_off.system_prompt != "人格与规矩":
+            print("      关了还在注入")
+            return False
+    finally:
+        CONFIG["inject_money"] = True
+
+    # ⑥ 身份闸门照旧管着注入（别的 bot / 定时轮 / 自己给自己 ⇒ 不注入）
+    for ev, why in ((Ev(self_id=OTHER_BOT), "别的 bot"),
+                    (Ev(cron=True), "定时轮"),
+                    (Ev(sender=BOT), "发送者是自己")):
+        req_g = Req()
+        asyncio.run(plugin.inject_money(ev, req_g))
+        if req_g.extra_user_content_parts or req_g.system_prompt != "人格与规矩":
+            print("      闸门没管住注入:", why)
+            return False
+    return True
 
 
 TESTS = [
@@ -630,7 +690,7 @@ TESTS = [
     ("R20 配置畸形不炸", t20_json_safe_defaults),
     ("R21 源码卫生（无 print / 无私域号 / 无 return None）", t21_source_hygiene),
     ("R22 护栏求和：类别 / 方向 / 时间窗", t22_sum_by_kind_windows),
-    ("R23 缓存纪律：不注入会变的内容 / 工具说明是常量", t23_no_prompt_injection),
+    ("R23 缓存纪律：常量进尾部 / 变动挂用户消息之后", t23_cache_placement),
 ]
 
 

@@ -31,6 +31,11 @@ from astrbot.api import AstrBotConfig, llm_tool, logger, star
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import StarTools
 
+try:                                       # 与项目既有模块同一套写法（挂「接在用户消息之后」的位置）
+    from astrbot.core.agent.message import TextPart
+except ImportError:                        # 老版本框架没有它 ⇒ 退回 prompt 兜底
+    TextPart = None
+
 PLUGIN_NAME = "astrbot_plugin_wishonomy"
 SCHEMA_VERSION = 1
 
@@ -167,6 +172,27 @@ def split_names(raw):
 
 def money_text(amount, name=None):
     return "%d %s" % (int(amount), name or MONEY_NAME)
+
+
+# ─────────────────── 注入用的常量（**必须稳定**，见 §缓存纪律） ───────────────────
+
+# ⚠️ 这段是**常量**：它进 system_prompt 的**尾部**；因为它永远不变，
+#    它前面的一切（人格 / 规矩 / 历史前缀）缓存照旧命中 ✓
+INJECT_TAIL = (
+    "上面那行是系统给你的实时账目（不是你收到的话）。"
+    "它只是让你自己心里有数 —— 说不说、给不给、认不认，都是你自己的事，"
+    "不用主动复述数字，也不用向谁解释这套东西怎么来的。"
+)
+
+
+def money_hint(snap, who_text="他"):
+    """按需拼一行提示；**什么都没有就一个字都不注入**（省 token 也省缓存 ✓）。"""
+    if not snap or not snap.get("exists"):
+        return ""
+    lines = ["%s现在的%s：%d" % (who_text, MONEY_NAME, int(snap.get("balance") or 0))]
+    if snap.get("credit") is not None:
+        lines.append("%s：%d" % (CREDIT_NAME, int(snap["credit"])))
+    return "（" + "，".join(lines) + "）"
 
 
 # ─────────────────────────── 库路径 / 线程池 ───────────────────────────
@@ -633,6 +659,37 @@ class Main(star.Star):
             return None
         return bot, sender
 
+    # ── 把「他现在的愿力」摆到它眼前（主人 2026-10-13 定的口径 ✓：**越不稳的放越后**）──
+    #   · **常量**（INJECT_TAIL）→ system_prompt 的**尾部** ⇒ 它前面的一切照旧命中缓存 ✓
+    #   · **每轮会变的那一行**（余额）→ `extra_user_content_parts` 的**最后一个 part**
+    #     ⇒ 框架把它接在用户消息之后 ⇒ 变动只作废它自己 ✓
+    #   · 平时不注入任何东西：没有账户就一个字都不发 ✓
+    @filter.on_llm_request(priority=50)
+    async def inject_money(self, event, request):
+        try:
+            if not bool(_cfg(self.config, "inject_money", True)):
+                return
+            ident = self.identity(event)
+            if ident is None:
+                return
+            bot = ident[0]
+            sender = str(event.get_sender_id() or "").strip()
+            snap = await run_db(db_snapshot, bot, sender)
+            hint = money_hint(snap, "他")
+            if not hint:
+                return
+            parts = getattr(request, "extra_user_content_parts", None)
+            if TextPart is not None and parts is not None:
+                parts.append(TextPart(text=hint))
+            else:
+                # 框架太老、没这个位置 ⇒ 宁可退回 prompt 尾部，也不要把数字丢了
+                request.prompt = (request.prompt or "") + "\n\n" + hint
+            if INJECT_TAIL not in (request.system_prompt or ""):
+                request.system_prompt = (request.system_prompt or "") + "\n\n" + INJECT_TAIL
+            logger.info("[wishonomy] injected | bot=%s bal=%s", bot, snap.get("balance"))
+        except Exception as exc:      # noqa: BLE001 —— 注入失败绝不能影响它正常回话
+            logger.warning("[wishonomy] 注入失败: %s", str(exc)[:120])
+
 
 # ── 工具：全部返回字符串（**绝不 None**） ──
 
@@ -683,6 +740,11 @@ async def _who_to_id(plugin, event, who, group_id):
         return hits[0][0]
     if len(hits) > 1:
         return None
+    if re.fullmatch(r"[0-9]{5,12}", text):
+        return text
+    return None
+
+
     if re.fullmatch(r"[0-9]{5,12}", text):
         return text
     return None

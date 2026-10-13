@@ -21,6 +21,12 @@
     "type": "text",
     "default": "信誉分"
   },
+  "inject_money": {
+    "description": "把「跟它说话的人现在有多少愿力」摆进每轮上下文",
+    "type": "bool",
+    "default": true,
+    "hint": "常量段进 system_prompt 尾部、每轮变的那一行挂在用户消息之后（都对缓存友好）。关掉则只靠 wish_check 按需查。"
+  },
   "db_path": {
     "description": "数据文件路径（留空 = 插件数据目录下的 ledger.db）",
     "type": "text",

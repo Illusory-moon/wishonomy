@@ -25,5 +25,5 @@
   `ponytail:` 不落盘是故意的 —— 它是易失的旁路信息，不值得为它多一张表
 - 单 worker 线程池：中心安全优先；真成瓶颈再改每账户锁
 - `iou` / `credit_event` 表 P1 只建表，动作在 P3/P4
-- **注入 vs 不注入**：现在**只按需查**（`wish_check`，最省 token）；开着注入她每轮都知道对方有多少愿力（更"活"）。
-  两种都支持，做法与判据见 `NEXT.md` ✓
+- **注入 vs 不注入**：默认**开**（常量进 `system_prompt` 尾部、每轮变的挂 `extra_user_content_parts` 最后一位 ✓
+  都对缓存友好）；关掉只按需查（最省 token）—— 开关 `inject_money` ✓
