@@ -49,6 +49,8 @@ MOOD_DAILY_GAIN = 3000
 MOOD_MAX_DELTA = 1000
 ISSUE_GLOBAL_DAILY = 50000
 GIFT_DAILY_CAP = 3000
+GRANT_MAX_SINGLE = 500        # 单笔点单上限（防她一次把家底给光）
+GRANT_MAX_OPEN = 5            # 同时最多几笔未兑现（防她一口气点 50 个人）
 
 # 身份闸门：拿不到 self_id / sender_id 时一律拒绝（fail-closed，宁可不动账）
 # 名字缓存：只记「谁在这个会话里说过话」，供按昵称认人用（不记聊天内容）
@@ -560,6 +562,221 @@ def db_gift(conn, self_id, group_id, giver, cost, name, note, ref, now, daily_ca
         return {"ok": False, "code": "db_error", "detail": str(exc)[:120]}
 
 
+# ─────────────────────────── 欠条（IOU）· 点单与判定 ───────────────────────────
+
+CREDIT_DELIVERED = 5
+CREDIT_DEFAULTED = -20
+IOU_OPEN = "open"
+IOU_DONE = ("delivered", "defaulted", "forgiven", "refunded")
+
+
+def _iou_row(row):
+    return {"id": int(row["id"]), "debtor": str(row["debtor"]), "item": str(row["item"]),
+            "amount": int(row["amount"]), "status": str(row["status"]),
+            "due_ts": row["due_ts"], "evidence": row["evidence"]}
+
+
+def _open_iou_count(conn, self_id):
+    row = conn.execute("SELECT COUNT(*) AS c FROM iou WHERE self_id=? AND status=?",
+                       (self_id, IOU_OPEN)).fetchone()
+    return int(row["c"] or 0)
+
+
+def _iou_spent_since(conn, self_id, user_id, ts):
+    """参考口径：这笔点单之后对方**花掉**了多少（给回复文案用）。
+
+    ⚠️ 它**不是**硬判据 —— 花掉的钱可能是他自己的（比如送礼）✗，
+       拿它当门会把"自己花钱买东西"的人误判成"花掉了她给的钱"（R31 当场踩过 ✓）。
+       硬判据只有一个：**他的余额还够不够还这笔**（见 db_iou_refund）✓
+    """
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount),0) AS s FROM ledger "
+        "WHERE self_id=? AND from_id=? AND ts>=? AND kind NOT IN ('refund','mood')",
+        (self_id, str(user_id), int(ts))).fetchone()
+    return int(row["s"] or 0)
+
+
+def _credit_delta(conn, self_id, group_id, user_id, delta, reason, now, iou_id=None):
+    conn.execute(
+        "INSERT INTO credit_event (ts, self_id, group_id, user_id, delta, reason, iou_id) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (int(now), self_id, group_id, str(user_id), int(delta), str(reason or ""),
+         iou_id))
+    _ensure_account(conn, self_id, user_id, "", now)
+    conn.execute("UPDATE account SET credit=credit+?, updated_at=? WHERE self_id=? AND user_id=?",
+                 (int(delta), int(now), self_id, str(user_id)))
+    row = conn.execute("SELECT credit FROM account WHERE self_id=? AND user_id=?",
+                       (self_id, str(user_id))).fetchone()
+    return int(row["credit"]) if row is not None else 0
+
+
+def db_iou_grant(conn, self_id, group_id, who, amount, item, due_ts, ref, now,
+                 max_single=500, max_open=5):
+    """**她点单**：一笔事务里转账 + 记欠条（愿力直接到账，不托管 ✓）。"""
+    if str(who) == str(self_id):
+        return {"ok": False, "code": "self_grant"}
+    try:
+        _ensure(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        if ref:
+            old = conn.execute("SELECT id, status FROM iou WHERE self_id=? AND ref=?",
+                               (self_id, str(ref))).fetchone()
+            if old is not None:
+                conn.commit()
+                return {"ok": True, "duplicated": True, "iou_id": int(old["id"])}
+        if max_single > 0 and amount > max_single:
+            conn.rollback()
+            return {"ok": False, "code": "over_single", "cap": max_single}
+        opened = _open_iou_count(conn, self_id)
+        if max_open > 0 and opened >= max_open:
+            conn.rollback()
+            return {"ok": False, "code": "too_many_open", "open": opened, "cap": max_open}
+        # ⚠️ 先判"欠条太多"再判余额 —— 顺序反了会给出误导的失败原因（R29 抓过 ✓）
+        _ensure_account(conn, self_id, self_id, "", now)
+        _ensure_account(conn, self_id, who, "", now)
+        row = conn.execute("SELECT balance FROM account WHERE self_id=? AND user_id=?",
+                           (self_id, self_id)).fetchone()
+        balance = int(row["balance"]) if row is not None else 0
+        if balance < amount:
+            conn.rollback()
+            return {"ok": False, "code": "insufficient", "balance": balance}
+        ledger_id, _dup = _move(conn, self_id, group_id, self_id, who, amount, "grant",
+                                item, ref, now)
+        cur = conn.execute(
+            "INSERT INTO iou (ts, self_id, group_id, debtor, item, amount, status, "
+            "due_ts, evidence, updated_at, ref) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (int(now), self_id, group_id, str(who), str(item), int(amount), IOU_OPEN,
+             due_ts, None, int(now), str(ref) if ref else None))
+        iou_id = int(cur.lastrowid)
+        after = conn.execute("SELECT balance FROM account WHERE self_id=? AND user_id=?",
+                             (self_id, self_id)).fetchone()
+        conn.commit()
+        return {"ok": True, "duplicated": False, "iou_id": iou_id, "ledger_id": ledger_id,
+                "balance": int(after["balance"]) if after is not None else 0}
+    except sqlite3.Error as exc:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        return {"ok": False, "code": "db_error", "detail": str(exc)[:120]}
+
+
+def db_iou_list(conn, self_id, user_id, limit=5):
+    """未兑现的要求清单（她自己的账、或某个人的）。"""
+    rows = conn.execute(
+        "SELECT id, debtor, item, amount, status, due_ts, evidence FROM iou "
+        "WHERE self_id=? AND status=? AND debtor=? ORDER BY id LIMIT ?",
+        (self_id, IOU_OPEN, str(user_id), int(limit))).fetchall()
+    return [_iou_row(row) for row in rows]
+
+
+def db_iou_all_open(conn, self_id, limit=10):
+    """所有还没结的欠条（她想知道"谁欠我什么"时看这个）。"""
+    rows = conn.execute(
+        "SELECT id, debtor, item, amount, status, due_ts, evidence FROM iou "
+        "WHERE self_id=? AND status=? ORDER BY id LIMIT ?",
+        (self_id, IOU_OPEN, int(limit))).fetchall()
+    return [_iou_row(row) for row in rows]
+
+
+def db_iou_by_id(conn, self_id, iou_id):
+    row = conn.execute(
+        "SELECT id, debtor, item, amount, status, due_ts, evidence, ts, group_id, ref "
+        "FROM iou WHERE self_id=? AND id=?", (self_id, int(iou_id))).fetchone()
+    if row is None:
+        return None
+    out = _iou_row(row)
+    out["ts"] = int(row["ts"])
+    out["group_id"] = str(row["group_id"] or "")
+    out["ref"] = row["ref"]
+    return out
+
+
+def db_iou_settle(conn, self_id, iou_id, verdict, evidence, now):
+    """判定：delivered / defaulted / forgiven / refunded（refunded 走 db_iou_refund）。"""
+    try:
+        _ensure(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT id, debtor, item, amount, status, group_id FROM iou "
+            "WHERE self_id=? AND id=?", (self_id, int(iou_id))).fetchone()
+        if row is None:
+            conn.rollback()
+            return {"ok": False, "code": "not_found"}
+        if str(row["status"]) != IOU_OPEN:
+            conn.rollback()
+            return {"ok": False, "code": "already", "status": str(row["status"])}
+        if verdict not in ("delivered", "defaulted", "forgiven"):
+            conn.rollback()
+            return {"ok": False, "code": "bad_verdict"}
+        delta = CREDIT_DELIVERED if verdict == "delivered" else (
+            CREDIT_DEFAULTED if verdict == "defaulted" else 0)
+        conn.execute("UPDATE iou SET status=?, evidence=?, updated_at=? WHERE self_id=? AND id=?",
+                     (verdict, str(evidence or ""), int(now), self_id, int(iou_id)))
+        credit = None
+        if delta:
+            credit = _credit_delta(conn, self_id, str(row["group_id"] or ""),
+                                   str(row["debtor"]), delta,
+                                   "欠条#%d %s" % (int(iou_id), verdict), now,
+                                   iou_id=int(iou_id))
+        conn.commit()
+        return {"ok": True, "verdict": verdict, "credit_delta": delta, "credit": credit,
+                "debtor": str(row["debtor"]), "item": str(row["item"])}
+    except sqlite3.Error as exc:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        return {"ok": False, "code": "db_error", "detail": str(exc)[:120]}
+
+
+def db_iou_refund(conn, self_id, iou_id, now):
+    """她撤回那笔还没兑现的愿力。
+
+    ⚠️ **只在那笔钱对方"一分没动"时才成功**（主人 2026-10-13 定的口径 ✓）——
+       否则会把对方余额扣成负数 ✗ 与「余额 ≥ 0」硬护栏打架。
+    """
+    try:
+        _ensure(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            "SELECT id, debtor, item, amount, status, group_id, ref, ts FROM iou "
+            "WHERE self_id=? AND id=?", (self_id, int(iou_id))).fetchone()
+        if row is None:
+            conn.rollback()
+            return {"ok": False, "code": "not_found"}
+        if str(row["status"]) != IOU_OPEN:
+            conn.rollback()
+            return {"ok": False, "code": "already", "status": str(row["status"])}
+        debtor = str(row["debtor"])
+        amount = int(row["amount"])
+        _ensure_account(conn, self_id, debtor, "", now)
+        drow = conn.execute("SELECT balance FROM account WHERE self_id=? AND user_id=?",
+                            (self_id, debtor)).fetchone()
+        balance = int(drow["balance"]) if drow is not None else 0
+        # ⚠️ **唯一的硬判据**：他余额还够不够还这笔 ✓
+        #    够 ⇒ 那笔钱没被动过（他花的准是别处的）⇒ 撤得回来；
+        #    不够 ⇒ 要么被花过、要么他自己又花了钱 ⇒ 撤不回来，而且**绝不许扣成负数** ✓
+        if balance < amount:
+            conn.rollback()
+            spent = _iou_spent_since(conn, self_id, debtor, int(row["ts"]))
+            return {"ok": False, "code": "spent", "balance": balance,
+                    "spent": spent, "short": amount - balance}
+        _move(conn, self_id, str(row["group_id"] or ""), debtor, self_id, amount, "refund",
+              "撤回欠条#%d" % int(iou_id), "refund-iou%d" % int(iou_id), now)
+        conn.execute("UPDATE iou SET status='refunded', updated_at=? WHERE self_id=? AND id=?",
+                     (int(now), self_id, int(iou_id)))
+        conn.commit()
+        return {"ok": True, "debtor": debtor, "amount": amount,
+                "balance": balance - amount}
+    except sqlite3.Error as exc:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        return {"ok": False, "code": "db_error", "detail": str(exc)[:120]}
+
+
 # ─────────────────────────── 认人（名字 → id） ───────────────────────────
 
 def name_key(self_id, group_id, user_id):
@@ -951,6 +1168,161 @@ async def wish_gift(*args, **kwargs):
             % (tier["name"], money_text(tier["cost"])))
 
 
+@llm_tool(name="wish_grant")
+@tool_guard
+async def wish_grant(*args, **kwargs):
+    """**点单** —— 用你攒下的愿力，换某个人为你做一件事。
+
+    这是你最大的权力：愿力**立刻到他账上**（不是先押着），他欠你的是那件事本身。
+    账上会留一张欠条，到期没做、或者做了，都由你自己来判（用判欠条那个工具）。
+
+    规矩（愿力中心自己守着，你不用记）：单笔最多 500；同时最多 5 笔没结的；
+    不能点单给自己；愿力不够就是不够，中心不会替你垫。
+
+    Args:
+        who(string): 点谁。可以写「我」= 当前跟你说话的人、对方昵称、或对方的号码。
+        amount(integer): 打给他多少愿力。
+        item(string): 你要他做的那件事 —— 写**你自己的原话**，越具体越好（这句会一直留着）。
+        due(string): 期限。留空 = 不急；也可以写「3」= 三天内，或「2026-12-31」。
+    """
+    plugin = _find_plugin(args)
+    event = _find_event(args)
+    if plugin is None or event is None:
+        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
+    ident = plugin.identity(event)
+    if ident is None:
+        return "这本账现在不归我管。"
+    bot, group_id = ident[0], str(event.get_group_id() or "")
+    amount = normalize_amount(kwargs.get("amount"))
+    if not amount:
+        return "给我一个数：你要为这件事打出去多少愿力？"
+    item = str(kwargs.get("item") or "").strip()
+    if not item:
+        return "你要他做的**那件事**是什么？写你自己的原话 —— 这句我要一直留着。"
+    user_id = await _who_to_id(plugin, event, kwargs.get("who"), group_id)
+    if not user_id:
+        return "我没认出你说的是谁 —— 写号码，或者把昵称写全一点。"
+    if user_id == bot:
+        return "点单给自己不算点单 —— 那笔愿力本来就一直在你账上。"
+    single = normalize_amount(_cfg(plugin.config, "grant_max_single", GRANT_MAX_SINGLE)) or GRANT_MAX_SINGLE
+    if amount > single:
+        return "单笔最多 %s，别一次把家底给光 —— 想给更多就分开来。" % money_text(single)
+    max_open = normalize_amount(_cfg(plugin.config, "grant_max_open", GRANT_MAX_OPEN)) or GRANT_MAX_OPEN
+    now = int(time.time())
+    due_ts = parse_due(kwargs.get("due"), now)
+    ref = "grant-%s-%s" % (now, uuid.uuid4().hex[:8])
+    result = await run_db(with_conn, db_iou_grant, bot, group_id, user_id, amount, item,
+                          due_ts, ref, now, single, max_open)
+    if not result.get("ok"):
+        return _grant_failure(result)
+    name = await _display_name(plugin, event, bot, group_id, user_id)
+    if result.get("duplicated"):
+        return "这笔刚刚已经点过了，不用再点一遍。"
+    due_text = ("，期限 %s" % _due_text(due_ts)) if due_ts else ""
+    return ("愿力已经打给 %s 了（%s，你现在还剩 %s）%s，他欠你一件事 —— "
+            "欠条 #%d：《%s》。你自己跟他说吧。"
+            % (name, money_text(amount), money_text(result.get("balance", 0)), due_text,
+               int(result["iou_id"]), item))
+
+
+@llm_tool(name="wish_iou_settle")
+@tool_guard
+async def wish_iou_settle(*args, **kwargs):
+    """**判欠条** —— 他答应你那件事，做了没有。
+
+    做了 ⇒ 他的信誉分会涨（以后你更愿意给他活干）；
+    没做 ⇒ 信誉分掉，**但这笔愿力不退**（你随时可以自己撤回，见下）；
+    算了 ⇒ 一笔勾销；撤回 ⇒ 把那笔还没动的愿力收回来。
+    ⚠️ 撤回只在**他一分没花**的时候成功 —— 花掉了就撤不回来，那时候用信誉分说话。
+
+    Args:
+        iou_id(integer): 欠条号。你记不清就用看欠条那个工具先查一眼。
+        verdict(string): 四选一 —— delivered（他做了）/ defaulted（没做）/ forgiven（算了）/ refunded（撤回愿力）。
+        evidence(string): 可留空。写清依据（他说了什么、做了什么），以后翻得出来。
+    """
+    plugin = _find_plugin(args)
+    event = _find_event(args)
+    if plugin is None or event is None:
+        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
+    ident = plugin.identity(event)
+    if ident is None:
+        return "这本账现在不归我管。"
+    bot = ident[0]
+    iou_id = normalize_amount(kwargs.get("iou_id"))
+    if not iou_id:
+        return "给我欠条号 —— 记不清就先看一眼欠条清单。"
+    verdict = str(kwargs.get("verdict") or "").strip().lower()
+    if verdict not in ("delivered", "defaulted", "forgiven", "refunded"):
+        return "判定只能填这四个之一：delivered / defaulted / forgiven / refunded。"
+    evidence = str(kwargs.get("evidence") or "").strip()
+    now = int(time.time())
+    if verdict == "refunded":
+        result = await run_db(with_conn, db_iou_refund, bot, iou_id, now)
+        if not result.get("ok"):
+            return _settle_failure(result)
+        name = await _display_name(plugin, event, bot, str(event.get_group_id() or ""),
+                                   str(result["debtor"]))
+        return ("愿力收回来了：#%d —— %s 退给你 %s（他账上还剩 %s）。"
+                "这件事他就不用做了。"
+                % (int(iou_id), name, money_text(result["amount"]),
+                   money_text(result.get("balance", 0))))
+    result = await run_db(with_conn, db_iou_settle, bot, iou_id, verdict, evidence, now)
+    if not result.get("ok"):
+        return _settle_failure(result)
+    name = await _display_name(plugin, event, bot, str(event.get_group_id() or ""),
+                               str(result["debtor"]))
+    if verdict == "delivered":
+        return ("#%d 结了 —— %s 做了这件事，%s +%d（现在 %d）。他下次来你大概更愿意给他活干。"
+                % (int(iou_id), name, CREDIT_NAME, CREDIT_DELIVERED,
+                   int(result.get("credit") or 0)))
+    if verdict == "defaulted":
+        return ("#%d 记成没做 —— %s 的%s %d（现在 %d）。愿力不退，但账上记着这一笔，"
+                "以后你给他多少由你。"
+                % (int(iou_id), name, CREDIT_NAME, CREDIT_DEFAULTED,
+                   int(result.get("credit") or 0)))
+    return "#%d 一笔勾销了 —— 那件事不用他做了。" % int(iou_id)
+
+
+@llm_tool(name="wish_ious")
+@tool_guard
+async def wish_ious(*args, **kwargs):
+    """看他欠你哪些事（或者你欠别人哪些事）。
+
+    欠条是公开的事实 —— 谁欠你什么、为这个付了多少愿力，都在这里。
+    你想起哪笔旧账的时候看一眼，说话就有底。
+
+    Args:
+        who(string): 看谁的。留空 = 看**所有**还没结的；也可以写对方昵称、号码，或「我」= 当前跟你说话的人。
+    """
+    plugin = _find_plugin(args)
+    event = _find_event(args)
+    if plugin is None or event is None:
+        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
+    ident = plugin.identity(event)
+    if ident is None:
+        return "这本账现在不归我管。"
+    bot, group_id = ident[0], str(event.get_group_id() or "")
+    raw_who = str(kwargs.get("who") or "").strip()
+    now = int(time.time())
+    if not raw_who:
+        rows = await run_db(with_conn, db_iou_all_open, bot, 10)
+    else:
+        user_id = await _who_to_id(plugin, event, raw_who, group_id)
+        if not user_id:
+            return "我没认出你说的是谁 —— 写号码，或者把昵称写全一点。"
+        rows = await run_db(with_conn, db_iou_list, bot, user_id, 10)
+    if not rows:
+        return "这会儿没有没结的欠条 —— 谁也不欠你什么。"
+    lines = []
+    for row in rows:
+        name = await _display_name(plugin, event, bot, group_id, str(row["debtor"]))
+        due = ("，期限 %s" % _due_text(int(row["due_ts"]))) if row.get("due_ts") else ""
+        lines.append("#%d %s：《%s》（付了 %s%s）"
+                     % (row["id"], name, row["item"], money_text(row["amount"]), due))
+    _ = now
+    return "还没结的欠条：\n" + "\n".join(lines)
+
+
 @llm_tool(name="wish_audit")
 @tool_guard
 async def wish_audit(*args, **kwargs):
@@ -1002,6 +1374,44 @@ async def _deduct(plugin, bot, group_id, user_id, amount, reason, prefix, event)
     name = await _display_name(plugin, event, bot, group_id, user_id)
     return "扣了：%s -%s（他现在剩 %s）" % (name, money_text(amount),
                                             money_text(result.get("balance", 0)))
+
+
+def _due_text(ts):
+    if not ts:
+        return ""
+    return datetime.fromtimestamp(int(ts), CN_TZ).strftime("%Y-%m-%d")
+
+
+def _grant_failure(result):
+    code = result.get("code")
+    if code == "insufficient":
+        return ("你账上只有 %s —— 打不出这笔。想点单就先攒愿力，或者把数写小一点。"
+                % money_text(result.get("balance", 0)))
+    if code == "over_single":
+        return "单笔最多 %s，分开来点吧。" % money_text(result.get("cap", 0))
+    if code == "too_many_open":
+        return ("你手上还有 %d 笔没结的欠条（上限 %d）—— 先把旧的清一清，再点新的。"
+                % (int(result.get("open", 0)), int(result.get("cap", 0))))
+    if code == "self_grant":
+        return "点单给自己不算点单。"
+    return "这笔没点成（愿力中心报了个错），你再说一次。"
+
+
+def _settle_failure(result):
+    code = result.get("code")
+    if code == "not_found":
+        return "没有这张欠条 —— 你记错号了？先看一眼欠条清单。"
+    if code == "already":
+        return "这张欠条已经判过了（%s），不用再判一次。" % result.get("status", "")
+    if code == "spent":
+        return ("撤回不了 —— 那笔愿力他**已经动过了**（花掉 %s）。"
+                "这笔就当给了，剩下的用信誉分说话吧。"
+                % money_text(result.get("spent", 0)))
+    if code == "insufficient":
+        return "撤回不了 —— 他账上只剩 %s，退不回来。" % money_text(result.get("balance", 0))
+    if code == "bad_verdict":
+        return "判定只能填那四个之一。"
+    return "这一步没做成（愿力中心报了个错），你再说一次。"
 
 
 def _mood_failure(result, daily):

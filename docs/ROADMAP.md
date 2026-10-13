@@ -6,7 +6,7 @@
 |---|---|---|
 | **P1** | 仓库骨架 · SQLite 愿力中心 + `user_version` 迁移 · 幂等 · 身份闸门 · `wish_check` / `wish_mood` / `wish_gift` / `wish_audit` · 自检 | ✅ 已做 |
 | **P2** | 发行侧护栏补齐：全局日发行熔断（只记日志）· 备份清单（含 WAL 边车）· 配置热生效 | ✅ 已做 |
-| **P3** | **点单**：`wish_grant`（愿力直接到账 + 记 IOU）· `wish_iou_settle` · `refund`（只在那笔对方没动过时成功） | ⏳ |
+| **P3** | **点单**：`wish_grant`（愿力直接到账 + 记 IOU）· `wish_iou_settle`（四种判定）· `refund`（余额够就撤得回来）· `wish_ious` | ✅ 已做 |
 | **P4** | 信誉分动作 · 排行 `wish_leaderboard` · 对账报表细化 | ⏳ |
 | **P5** | 部署 + 真机冒烟（真群小样验证；重启前先在对话里打招呼 ✓） | ⏳ |
 | **P6** | 只读面板（可选，只给运营看） | ⏳ |

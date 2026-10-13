@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import types
+import uuid
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PLUGIN = os.path.join(HERE, "main.py")
@@ -735,6 +736,168 @@ def t27_audit_reports_issued(mod, plugin):
     return "收愿力 42" in out and "送礼" in out and "钱包" in out
 
 
+def raw_grant(mod, who, amount, item="念一句台词", ref=None, now=None, due=None,
+              max_single=500, max_open=5):
+    now = int(now if now is not None else time.time())
+    ref = ref or ("grant-self-%s" % uuid.uuid4().hex[:8])
+    conn = mod._connect()
+    try:
+        return mod.db_iou_grant(conn, BOT, GROUP, who, amount, item, due, ref, now,
+                                max_single, max_open)
+    finally:
+        conn.close()
+
+
+def raw_settle(mod, iou_id, verdict, evidence=""):
+    conn = mod._connect()
+    try:
+        return mod.db_iou_settle(conn, BOT, iou_id, verdict, evidence, int(time.time()))
+    finally:
+        conn.close()
+
+
+def raw_refund(mod, iou_id):
+    conn = mod._connect()
+    try:
+        return mod.db_iou_refund(conn, BOT, iou_id, int(time.time()))
+    finally:
+        conn.close()
+
+
+def open_ious(mod):
+    conn = mod._connect()
+    try:
+        return mod.db_iou_all_open(conn, BOT, 20)
+    finally:
+        conn.close()
+
+
+def credit_of(mod, user_id):
+    return mod.db_snapshot(BOT, user_id)["credit"]
+
+
+def seed_bot(mod, amount, tag="seedbot"):
+    """给 **bot 自己**攒愿力 —— 只能走「别人送礼」这条路 ✓
+
+    ⚠️ 不能用 raw_mood(BOT, …)：那条路被硬拦着（她不能给自己加愿力 ✓ 设计要的）。
+    所以：先让送礼人有愿力，再让他送给她 —— 这正是她真实的进项 ✓
+    """
+    now = int(time.time())
+    raw_mood(mod, BOB, amount, tag + "-bob", now)
+    return raw_gift(mod, BOB, amount, tag + "-gift", now, cap=0)
+
+
+def t28_grant_atomic(mod, plugin):
+    """点单闭环：愿力**立刻到账** + 欠条入库；工具返回里带着欠条号 ✓"""
+    now = int(time.time())
+    seed_bot(mod, 400, "grant-seed")                    # 她的钱只能靠别人送礼进来 ✓
+    before = balance_of(mod, BOT)
+    out = call(mod.wish_grant, plugin, Ev(), who="我", amount=120, item="在群里念一句台词")
+    if "欠条 #" not in out or "已经打给" not in out:
+        print("      工具回话不对:", out)
+        return False
+    return (balance_of(mod, BOT) == before - 120
+            and balance_of(mod, ALICE) == 120
+            and len(open_ious(mod)) == 1)
+
+
+def t29_grant_limits(mod, plugin):
+    """点单四条护栏：单笔上限 / 未兑现上限 / 不能点自己 / 愿力不够。"""
+    now = int(time.time())
+    seed_bot(mod, 3000, "grant-seed2")
+    single = call(mod.wish_grant, plugin, Ev(), who="我", amount=900, item="太大了")
+    if "单笔最多" not in single:
+        print("      单笔上限没拦住:", single)
+        return False
+    for i in range(5):
+        raw_grant(mod, ALICE, 10, item="第%d件" % i)
+    full = call(mod.wish_grant, plugin, Ev(), who="我", amount=10, item="第六件")
+    if "没结的欠条" not in full:
+        print("      未兑现上限没拦住:", full)
+        return False
+    self_grant = raw_grant(mod, BOT, 10)
+    if self_grant.get("code") != "self_grant":
+        print("      没拦住点自己:", self_grant)
+        return False
+    # 愿力不够：先把手上那 5 笔清掉（否则会先撞"欠条太多"），再点一大笔
+    for row in open_ious(mod):
+        raw_settle(mod, row["id"], "forgiven")
+    conn = mod._connect()
+    try:
+        conn.execute("UPDATE account SET balance=1 WHERE self_id=? AND user_id=?", (BOT, BOT))
+    finally:
+        conn.close()
+    poor = raw_grant(mod, ALICE, 400)
+    return poor.get("code") == "insufficient"
+
+
+def t30_settle_verdicts(mod, plugin):
+    """判定：做了 ⇒ 信誉分涨；没做 ⇒ 信誉分掉且**愿力不退**；判过的不许再判。"""
+    now = int(time.time())
+    seed_bot(mod, 500, "settle-seed")
+    g1 = raw_grant(mod, ALICE, 50, item="做件事")
+    g2 = raw_grant(mod, BOB, 50, item="另一件事")
+    c0 = credit_of(mod, ALICE)
+    done = raw_settle(mod, g1["iou_id"], "delivered", "他做了")
+    c1 = credit_of(mod, ALICE)
+    miss = raw_settle(mod, g2["iou_id"], "defaulted", "他没做")
+    c2 = credit_of(mod, BOB)
+    again = raw_settle(mod, g1["iou_id"], "delivered")
+    if not (done.get("ok") and c1 == c0 + 5):
+        print("      做了没涨信誉分:", done, c0, c1)
+        return False
+    if not (miss.get("ok") and c2 == 100 - 20):
+        print("      没做没掉信誉分:", miss, c2)
+        return False
+    if again.get("code") != "already":
+        print("      判过还能再判:", again)
+        return False
+    return balance_of(mod, ALICE) == 50 and balance_of(mod, BOB) == 50
+
+
+def t31_refund_rules(mod, _plugin):
+    """撤回：只在**对方一分没动**时成功；动过了就撤回失败、余额不动 ✓"""
+    now = int(time.time())
+    seed_bot(mod, 500, "refund-seed")
+    # ① 没动过 ⇒ 撤回成功，愿力回到她账上，欠条变 refunded
+    g1 = raw_grant(mod, ALICE, 60, item="还没做的事")
+    r1 = raw_refund(mod, g1["iou_id"])
+    if not r1.get("ok") or balance_of(mod, ALICE) != 0:
+        print("      该撤的没撤成:", r1, balance_of(mod, ALICE))
+        return False
+    # ② 他把这笔花掉了一部分 ⇒ 余额不够还 ⇒ 撤回失败，余额不变（**绝不许扣成负数**）
+    g2 = raw_grant(mod, BOB, 80, item="他已经在花这笔了")
+    raw_gift(mod, BOB, 40, "refund-spend-1", now)     # 花掉 40 ⇒ 他只剩 40
+    before_bob = balance_of(mod, BOB)
+    r2 = raw_refund(mod, g2["iou_id"])
+    if r2.get("code") != "spent" or balance_of(mod, BOB) != before_bob or before_bob < 0:
+        print("      花过的还能撤:", r2, before_bob, balance_of(mod, BOB))
+        return False
+    # ③ 花的是**自己的**钱（送礼），她给的那笔一分没动 ⇒ **撤得回来** ✓
+    g3 = raw_grant(mod, ALICE, 40, item="她给的那笔还没动")
+    raw_mood(mod, ALICE, 25, "refund-own-money", now)   # 他自己另外赚了 25
+    raw_gift(mod, ALICE, 25, "refund-own-spend", now)   # 又把自己那 25 送出去
+    r3 = raw_refund(mod, g3["iou_id"])
+    if not r3.get("ok") or balance_of(mod, ALICE) != 0:
+        print("      自己花钱不该影响撤回:", r3, balance_of(mod, ALICE))
+        return False
+    return all(row["status"] == "open" for row in open_ious(mod) if row["id"] == g2["iou_id"])
+
+
+def t32_ious_tool(mod, plugin):
+    """看欠条：列出未结的；全结掉之后如实说「谁也不欠你什么」✓"""
+    now = int(time.time())
+    seed_bot(mod, 300, "ious-seed")
+    g = raw_grant(mod, ALICE, 40, item="念台词", due=now + 3 * 86400)
+    listing = call(mod.wish_ious, plugin, Ev())
+    if "念台词" not in listing or "#%d" % g["iou_id"] not in listing:
+        print("      欠条清单不对:", listing)
+        return False
+    raw_settle(mod, g["iou_id"], "forgiven")
+    empty = call(mod.wish_ious, plugin, Ev())
+    return "谁也不欠你什么" in empty
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -763,6 +926,11 @@ TESTS = [
     ("R25 备份清单含 WAL 边车", t25_backup_whitelist),
     ("R26 配置改动当轮生效", t26_config_hot_reload),
     ("R27 审计能看到当日发行量", t27_audit_reports_issued),
+    ("R28 点单闭环：愿力立刻到账 + 欠条入库", t28_grant_atomic),
+    ("R29 点单四条护栏（单笔/未兑现/自己/余额）", t29_grant_limits),
+    ("R30 判定：守约涨分 / 违约掉分 / 不许重复判", t30_settle_verdicts),
+    ("R31 撤回：只在那笔没被动过时成功", t31_refund_rules),
+    ("R32 欠条清单（列未结 / 全清后如实说）", t32_ious_tool),
 ]
 
 

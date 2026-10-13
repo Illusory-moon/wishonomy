@@ -52,6 +52,18 @@
     "type": "int",
     "default": 3000
   },
+  "grant_max_single": {
+    "description": "点单：单笔上限",
+    "type": "int",
+    "default": 500,
+    "hint": "一次点单最多打出去多少愿力（防它把家底一次给光）。"
+  },
+  "grant_max_open": {
+    "description": "点单：同时最多几笔未兑现",
+    "type": "int",
+    "default": 5,
+    "hint": "未兑现的欠条上限（防它一口气点 50 个人、把自己搞破产）。"
+  },
   "gift_tiers": {
     "description": "礼物档位（JSON 数组）",
     "type": "text",
