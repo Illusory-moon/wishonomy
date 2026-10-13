@@ -1,5 +1,5 @@
 name: astrbot_plugin_wishonomy
-desc: 愿力经济 —— 按用户记账的通用愿力账本（收愿力 / 送礼 / 点单 / 欠条 / 信誉分）
+desc: 愿力经济 —— 按用户记账的通用愿力中心（收愿力 / 送礼 / 点单 / 欠条 / 信誉分）
 author: Illusory-moon
 version: 0.1.0
 repo: https://github.com/Illusory-moon/wishonomy

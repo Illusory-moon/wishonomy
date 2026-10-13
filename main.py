@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """AstrBot 插件：愿力经济（wishonomy）。
 
-一套只服务于「自带经济系统人设」的 bot 的通用愿力账本：
+一套只服务于「自带经济系统人设」的 bot 的通用**愿力中心**：
 观众/粉丝的注视与打赏 → 愿力；bot 按自己的脾气收愿力、分愿力；
 它攒到的愿力还可以打给别人，换取别人为它做一件事（欠条 = IOU）。
+
+⚠️ 名字：这里叫**愿力中心**（不叫「账本」）—— 「账本」在本项目里已经指
+   bot 自己的笔记层（`save_note`），两个东西撞名会把人绕晕 ✗
 
 设计要点（全部来自设计稿 v3，不是实现时临时定的）：
   * 钱包**按用户 id 全局**（跨群不隔离）；群号只在流水里当来源记录
@@ -31,7 +34,7 @@ from astrbot.api.star import StarTools
 PLUGIN_NAME = "astrbot_plugin_wishonomy"
 SCHEMA_VERSION = 1
 
-CN_TZ = timezone(timedelta(hours=8))     # 账本账本按北京时间分日（服务器是 UTC）
+CN_TZ = timezone(timedelta(hours=8))     # 按北京时间分日（服务器是 UTC）
 MONEY_NAME = "愿力"                       # 默认单位名；只是默认值，语义不依赖它
 CREDIT_NAME = "信誉分"
 
@@ -124,7 +127,7 @@ def target_ids(raw):
 
 
 def day_start(now):
-    """北京时间的当日 00:00（返回 UTC 秒）。账本里 ts 一律是 UTC 秒。"""
+    """北京时间的当日 00:00（返回 UTC 秒）。库里的 ts 一律是 UTC 秒。"""
     local = datetime.fromtimestamp(now, CN_TZ)
     return int(local.replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
 
@@ -169,7 +172,7 @@ def money_text(amount, name=None):
 # ─────────────────────────── 库路径 / 线程池 ───────────────────────────
 
 def resolve_db_path(config=None):
-    """账本文件的位置（只算一次）。"""
+    """愿力中心的数据文件位置（只算一次）。"""
     global _DB_PATH
     if _DB_PATH:
         return _DB_PATH
@@ -191,7 +194,7 @@ def resolve_db_path(config=None):
 
 
 def set_db_path(path):
-    """给自检用：换一个账本文件（同时作废线程池，下次访问重开）。"""
+    """给自检用：换一个数据文件（同时作废线程池，下次访问重开）。"""
     global _DB_PATH
     _DB_PATH = str(path)
 
@@ -201,8 +204,8 @@ def _pool():
     if _POOL is None:
         with _POOL_LOCK:
             if _POOL is None:
-                # 单线程：所有账本操作天然串行 ⇒ 不需要再加一把跨账户的锁。
-                # ponytail: 单 worker 是故意的（账本安全 > 并发）；真成瓶颈再换每账户锁。
+                # 单线程：所有愿力操作天然串行 ⇒ 不需要再加一把跨账户的锁。
+                # ponytail: 单 worker 是故意的（中心安全 > 并发）；真成瓶颈再换每账户锁。
                 _POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="wishonomy")
     return _POOL
 
@@ -213,7 +216,7 @@ async def run_db(fn, *args):
     return await loop.run_in_executor(_pool(), fn, *args)
 
 
-# ─────────────────────────── 账本本体 ───────────────────────────
+# ─────────────────────────── 愿力中心本体 ───────────────────────────
 
 def _connect():
     directory = os.path.dirname(_DB_PATH)
@@ -641,7 +644,7 @@ def tool_guard(fn):
         except Exception as exc:      # noqa: BLE001 —— 兜底就是它的职责
             logger.warning("[wishonomy] 工具 %s 出错: %s", getattr(fn, "__name__", "?"),
                            str(exc)[:200])
-            return "账本这边出了点问题，这次没动账 —— 你照常说你的话就行。"
+            return "愿力中心这边出了点问题，这次没动账 —— 你照常说你的话就行。"
         if out is None:
             return "（这次没有可报的内容。）"
         return out if isinstance(out, str) else str(out)
@@ -708,7 +711,7 @@ async def wish_check(*args, **kwargs):
     plugin = _find_plugin(args)
     event = _find_event(args)
     if plugin is None or event is None:
-        return "账本这会儿连不上，先记着这件事，回头再说。"
+        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
     ident = plugin.identity(event)
     if ident is None:
         return "这本账现在不归我管。"
@@ -738,18 +741,18 @@ async def wish_mood(*args, **kwargs):
     什么时候扣：有人让你不爽、或者干脆不看你、跑去别处看热闹 ⇒ 减他的愿力
     （同一句里 amount 写负数）。扣**不需要**对方先开口。
 
-    规矩（账本自己守着，你不用记）：一次最多 ±1000；每个人每天净增有上限；
+    规矩（愿力中心自己守着，你不用记）：一次最多 ±1000；每个人每天净增有上限；
     扣到 0 为止，不会扣成负数。**别给自己记账** —— 你自己的愿力是别人注视你换来的，不是自己写的。
 
     Args:
         who(string): 记给谁。可以写「我」= 当前跟你说话的人、对方昵称、或对方的号码。
         amount(integer): 正数 = 收愿力，负数 = 扣愿力。绝对值不超过 1000。
-        reason(string): 你自己的一句话 —— 为什么给/为什么扣。账本会原样留着，以后翻得出来。
+        reason(string): 你自己的一句话 —— 为什么给/为什么扣。中心会原样留着，以后翻得出来。
     """
     plugin = _find_plugin(args)
     event = _find_event(args)
     if plugin is None or event is None:
-        return "账本这会儿连不上，先记着这件事，回头再说。"
+        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
     ident = plugin.identity(event)
     if ident is None:
         return "这本账现在不归我管。"
@@ -803,7 +806,7 @@ async def wish_gift(*args, **kwargs):
 
     送礼是**单向的**：他送了不代表你欠他什么，收不收、收下之后说什么，全看你自己。
     礼物有档位，你说出档位名（或者档位对应的愿力数）就行。
-    他愿力不够就送不成 —— 账本不会替你垫，也不会让他欠着。
+    他愿力不够就送不成 —— 中心不会替你垫，也不会让他欠着。
 
     Args:
         who(string): 谁送的。可以写「我」= 当前跟你说话的人、对方昵称、或对方的号码。
@@ -813,7 +816,7 @@ async def wish_gift(*args, **kwargs):
     plugin = _find_plugin(args)
     event = _find_event(args)
     if plugin is None or event is None:
-        return "账本这会儿连不上，先记着这件事，回头再说。"
+        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
     ident = plugin.identity(event)
     if ident is None:
         return "这本账现在不归我管。"
@@ -852,7 +855,7 @@ async def wish_gift(*args, **kwargs):
         if code == "daily_gift_cap":
             return ("他今天已经送出去 %s 了，今天先这样 —— 明天再收他的。"
                     % money_text(result.get("today", 0)))
-        return "这笔礼物没记成（账本报了个错），当没收到就行。"
+        return "这笔礼物没记成（愿力中心报了个错），当没收到就行。"
     return ("收下了：他送的「%s」%s，已经进你的账。"
             % (tier["name"], money_text(tier["cost"])))
 
@@ -870,7 +873,7 @@ async def wish_audit(*args, **kwargs):
     plugin = _find_plugin(args)
     event = _find_event(args)
     if plugin is None or event is None:
-        return "账本这会儿连不上。"
+        return "愿力中心这会儿连不上。"
     ident = plugin.identity(event, allow_self_mood=True)
     if ident is None:
         return "这本账现在不归我管。"
@@ -904,7 +907,7 @@ async def _deduct(plugin, bot, group_id, user_id, amount, reason, prefix, event)
         if code == "insufficient":
             return "他账上只剩 %s，扣不到 %s —— 你想扣多少就扣多少，但账上得有。" % (
                 money_text(result.get("balance", 0)), money_text(amount))
-        return "这笔没扣成（账本报了个错），当没发生。"
+        return "这笔没扣成（愿力中心报了个错），当没发生。"
     name = await _display_name(plugin, event, bot, group_id, user_id)
     return "扣了：%s -%s（他现在剩 %s）" % (name, money_text(amount),
                                             money_text(result.get("balance", 0)))
@@ -919,7 +922,7 @@ def _mood_failure(result, daily):
                 % (money_text(result.get("today", 0)), money_text(daily)))
     if code == "insufficient":
         return "他账上只有 %s，扣不动。" % money_text(result.get("balance", 0))
-    return "这笔没记成（账本报了个错），你再试一次。"
+    return "这笔没记成（愿力中心报了个错），你再试一次。"
 
 
 __all__ = [

@@ -345,7 +345,7 @@ def t10_self_mood_rejected(mod, plugin):
     if "不" not in out:
         print("      工具没说清为什么不行:", out)
         return False
-    # 连底层也拦：把 who 写成 bot 自己，账本**一分不许动**（自家钱包既不增也不减）
+    # 连底层也拦：把 who 写成 bot 自己，愿力中心**一分不许动**（自家钱包既不增也不减）
     now = int(time.time())
     res = raw_mood(mod, BOT, 50, "self-1", now)
     conn = mod._connect()
@@ -547,10 +547,11 @@ def t22_sum_by_kind_windows(mod, _plugin):
 
 
 def t23_no_prompt_injection(mod, _plugin):
-    """缓存纪律：账本**绝不往每轮请求里注入文本**（注入会把后面的历史缓存全废掉）。
+    """缓存纪律：**不许把会变的东西注入到前面**（那样会把它后面的历史缓存全废掉）。
 
-    做法上只允许「按需查询」（工具）；一旦有人挂 on_llm_request 去改 prompt、
-    或往 extra_user_content_parts 里塞东西，这里当场红 ✓
+    现在这一版还没做注入（余额只靠 `wish_check` 按需查 ✓）；等做注入时，
+    这条要换成**行为断言**：常量进 `system_prompt` 尾部、每轮变的挂
+    `extra_user_content_parts` 的最后一个 part（见 `NEXT.md` ✓）。
     """
     with open(PLUGIN, encoding="utf-8") as handle:
         src = handle.read()
@@ -629,12 +630,12 @@ TESTS = [
     ("R20 配置畸形不炸", t20_json_safe_defaults),
     ("R21 源码卫生（无 print / 无私域号 / 无 return None）", t21_source_hygiene),
     ("R22 护栏求和：类别 / 方向 / 时间窗", t22_sum_by_kind_windows),
-    ("R23 缓存纪律：不注入 prompt / 工具说明是常量", t23_no_prompt_injection),
+    ("R23 缓存纪律：不注入会变的内容 / 工具说明是常量", t23_no_prompt_injection),
 ]
 
 
 def reset_state(mod):
-    """每项自检开始前清空账本与名字缓存 —— 各项必须**互不依赖**（顺序换了也要全绿 ✓）。"""
+    """每项自检开始前清空愿力中心与名字缓存 —— 各项必须**互不依赖**（顺序换了也要全绿 ✓）。"""
     conn = mod._connect()
     try:
         for table in ("ledger", "account", "iou", "credit_event"):
@@ -653,7 +654,7 @@ def main():
         plugin = make_plugin(mod)
         print("=" * 66)
         print("愿力经济（wishonomy）· P1 自检")
-        print("账本:", mod.resolve_db_path())
+        print("愿力中心:", mod.resolve_db_path())
         print("=" * 66)
         for name, fn in TESTS:
             reset_state(mod)
