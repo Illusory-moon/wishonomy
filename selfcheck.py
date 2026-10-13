@@ -639,6 +639,13 @@ def t23_cache_placement(mod, plugin):
     if "12" not in hint:
         print("      提示里没有数字:", hint)
         return False
+    # ⚠️ 2026-10-13 真机教训：这行必须**写清是谁的**，否则她会拿别人的数字解释自己 ✗
+    if "跟你说话的那个人" not in hint:
+        print("      提示没写清「这是谁的余额」:", hint)
+        return False
+    if "跟你说话的那个人" not in mod.INJECT_TAIL and "不是你的" not in mod.INJECT_TAIL:
+        print("      常量段没说清「这不是你的账」:", mod.INJECT_TAIL[:60])
+        return False
     if "12" in req_a.system_prompt:
         print("      变动数字跑进 system_prompt 了（会废掉后面的缓存）:", req_a.system_prompt)
         return False
