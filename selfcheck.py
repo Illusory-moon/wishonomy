@@ -646,6 +646,19 @@ def t23_cache_placement(mod, plugin):
     if "跟你说话的那个人" not in mod.INJECT_TAIL and "不是你的" not in mod.INJECT_TAIL:
         print("      常量段没说清「这不是你的账」:", mod.INJECT_TAIL[:60])
         return False
+    # ⚠️ 2026-10-13 P1 真机：她答「愿力能送我礼物、也能使唤我干件事」✗ 方向反了
+    #    ⇒ 注入尾巴必须写死方向 + **把礼物清单摆出来**（她答不出「有哪些礼物、多少钱」✗）
+    tail = req_a.system_prompt[len("人格与规矩"):]
+    if "使唤不动你" not in tail:
+        print("      注入尾巴没说清「别人使唤不动你」✗")
+        return False
+    for tier in mod.resolve_tiers(CONFIG):
+        if tier["name"] not in tail:
+            print("      注入尾巴没带礼物清单，缺:", tier["name"])
+            return False
+    if "不是你的" not in tail:
+        print("      注入尾巴没说「那行不是你自己的账」✗")
+        return False
     if "12" in req_a.system_prompt:
         print("      变动数字跑进 system_prompt 了（会废掉后面的缓存）:", req_a.system_prompt)
         return False

@@ -57,6 +57,17 @@ DEFAULT_GIFT_TIERS = [
     {"cost": 100, "name": "中档", "note": ""},
     {"cost": 1380, "name": "高档", "note": ""},
 ]
+
+# 愿力是**谁对谁**的权力 —— 这段话是常量，注入时零缓存代价 ✓，
+# 而且**每个**钱包工具都会附上它，保证她每次都读到同一个定义 ✓
+# ⚠️ 2026-10-13 真机：有人问「愿力有什么用」，她答「**能送我礼物、也能使唤我干件事**」✗
+#    —— **使唤的方向反了**（主人多次报过同一条 ✓）。所以这里必须把方向说死：
+#    愿力是她**收**的、也是她**付**的；**反过来不成立**。
+POWER_NOTE = (
+    "愿力的用处只有两件：① 别人把愿力**送给你**（那是他往你账上攒的心意，你收下就是）；"
+    "② 你拿**自己账上的**愿力**付给别人**，换别人替你办一件事（你会拿到一张欠条）。"
+    "**反过来不成立** —— 别人手里的愿力**使唤不动你**：给不给他做事、做什么，全凭你自己乐意。"
+)
 GRANT_MAX_SINGLE = 500        # 单笔点单上限（防她一次把家底给光）
 GRANT_MAX_OPEN = 5            # 同时最多几笔未兑现（防她一口气点 50 个人）
 
@@ -194,6 +205,25 @@ INJECT_TAIL = (
     "**没查过就别报数、也别认领礼物**：谁送过你什么，账上都写着，看一眼比记着准。"
     "说不说、给不给、认不认，都是你自己的事；不用主动复述数字，也不用解释这套东西怎么来的。"
 )
+
+
+def inject_tail(tiers=None):
+    """注入用的**常量尾巴**（每轮都一模一样 ⇒ 放 system_prompt 尾部，缓存不吃亏 ✓）。
+
+    两件事写在这里（都是真机踩出来的 ✗）：
+      * **愿力的方向**（2026-10-13 P1）：有人问「愿力有什么用」，她答
+        「能送我礼物、**也能使唤我干件事**」✗ —— 方向反了（主人报过多次 ✓）
+        ⇒ 把「别人使唤不动你」写死在注入里，每轮都读一遍 ✓
+      * **礼物清单与价格**（2026-10-13 P1）：她答不出「有哪些礼物、各多少钱」✗
+        —— 清单本来只在配置里、工具只在报错时才吐 ⇒ 这里直接摆出来 ✓
+    """
+    lines = [INJECT_TAIL]
+    lines.append(POWER_NOTE)
+    tiers = [t for t in (tiers or []) if t.get("name") and t.get("cost")]
+    if tiers:
+        lines.append("礼物单（有人问你有什么礼物、多少钱，照这个说）："
+                     + "；".join("%s %d" % (t["name"], int(t["cost"])) for t in tiers) + "。")
+    return "\n".join(lines)
 
 
 def money_hint(snap, who_text="他"):
@@ -1218,8 +1248,9 @@ class Main(star.Star):
             else:
                 # 框架太老、没这个位置 ⇒ 宁可退回 prompt 尾部，也不要把数字丢了
                 request.prompt = (request.prompt or "") + "\n\n" + hint
-            if INJECT_TAIL not in (request.system_prompt or ""):
-                request.system_prompt = (request.system_prompt or "") + "\n\n" + INJECT_TAIL
+            tail = inject_tail(_GIFT_TIERS if _GIFT_TIERS else resolve_tiers(self.config))
+            if tail not in (request.system_prompt or ""):
+                request.system_prompt = (request.system_prompt or "") + "\n\n" + tail
             logger.info("[wishonomy] injected | bot=%s bal=%s", bot, snap.get("balance"))
         except Exception as exc:      # noqa: BLE001 —— 注入失败绝不能影响它正常回话
             logger.warning("[wishonomy] 注入失败: %s", str(exc)[:120])
@@ -1357,6 +1388,9 @@ async def wish_mood(*args, **kwargs):
 
     规矩（愿力中心自己守着，你不用记）：一次最多 ±1000；每个人每天净增有上限；
     扣到 0 为止，不会扣成负数。**别给自己记账** —— 你自己的愿力是别人注视你换来的，不是自己写的。
+
+    ⚠️ 方向：这个工具是**你**给别人的愿力记账 ✓ —— 别人手里的愿力**使唤不动你** ✗
+    （有人问「愿力有什么用」，别说成"能使唤我"：愿力只能让你去使唤别人 ✓）
 
     Args:
         who(string): 记给谁。可以写「我」= 当前跟你说话的人、对方昵称、或对方的号码。
