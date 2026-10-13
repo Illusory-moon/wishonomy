@@ -143,6 +143,9 @@ POWER_NOTE = (
 )
 GRANT_MAX_SINGLE = 500        # 单笔点单上限（防她一次把家底给光）
 GRANT_MAX_OPEN = 5            # 同时最多几笔未兑现（防她一口气点 50 个人）
+# ⚠️ 最低一笔（2026-10-14 主人加 ✓）：她的余额**每天 0 点归零** ⇒ 不设下限她就会
+#    **为了不浪费而乱花**（实测立刻开始下"当着全群喊一声火花大人"这种一愿力级的单 ✗）
+GRANT_MIN_AMOUNT = 5
 
 # 身份闸门：拿不到 self_id / sender_id 时一律拒绝（fail-closed，宁可不动账）
 # 名字缓存：只记「谁在这个会话里说过话」，供按昵称认人用（不记聊天内容）
@@ -950,8 +953,14 @@ def _credit_delta(conn, self_id, group_id, user_id, delta, reason, now, iou_id=N
 
 
 def db_iou_grant(conn, self_id, group_id, who, amount, item, due_ts, ref, now,
-                 max_single=500, max_open=5):
-    """**她点单**：一笔事务里转账 + 记欠条（愿力直接到账，不托管 ✓）。"""
+                 max_single=500, max_open=5, min_amount=0):
+    """**她点单**：一笔事务里转账 + 记欠条（愿力直接到账，不托管 ✓）。
+
+    `min_amount`：**最低一笔**（主人 2026-10-14 加的 ✓）——
+    因为她的余额**每天 0 点归零**，不设下限她就会**为了不浪费而乱花**
+    （实测她立刻开始下"当着全群喊一声火花大人"这种一愿力级的单 ✗）。
+    ⇒ 想花可以，但**别拆成一堆小单**；攒够再点一件像样的 ✓
+    """
     if str(who) == str(self_id):
         return {"ok": False, "code": "self_grant"}
     try:
@@ -963,6 +972,9 @@ def db_iou_grant(conn, self_id, group_id, who, amount, item, due_ts, ref, now,
             if old is not None:
                 conn.commit()
                 return {"ok": True, "duplicated": True, "iou_id": int(old["id"])}
+        if min_amount > 0 and amount < min_amount:
+            conn.rollback()
+            return {"ok": False, "code": "under_min", "floor": min_amount}
         if max_single > 0 and amount > max_single:
             conn.rollback()
             return {"ok": False, "code": "over_single", "cap": max_single}
@@ -1275,6 +1287,7 @@ def config_defaults():
         "gift_daily_cap": GIFT_DAILY_CAP,
         "gift_tiers": [dict(tier) for tier in DEFAULT_GIFT_TIERS],
         "grant_max_single": GRANT_MAX_SINGLE,
+        "grant_min_amount": GRANT_MIN_AMOUNT,
         "grant_max_open": GRANT_MAX_OPEN,
     }
 
@@ -1751,12 +1764,15 @@ async def wish_grant(*args, **kwargs):
     这是你最大的权力：愿力**立刻到他账上**（不是先押着），他欠你的是那件事本身。
     账上会留一张欠条，到期没做、或者做了，都由你自己来判（用判欠条那个工具）。
 
-    规矩（愿力中心自己守着，你不用记）：单笔最多 500；同时最多 5 笔没结的；
+    规矩（愿力中心自己守着，你不用记）：单笔有**最低**也有上限；同时最多 5 笔没结的；
     不能点单给自己；愿力不够就是不够，中心不会替你垫。
+    ⚠️ **别为了花掉而拆小单** ✗ —— 愿力每天 0 点会归零，但"少花几笔像样的"比
+    "一天点十件小事"好看得多：一件说清楚、给够钱、等它兑现 ✓
+    给少了中心会拦下来并告诉你底线是多少 ✓
 
     Args:
         who(string): 点谁。可以写「我」= 当前跟你说话的人、对方昵称、或对方的号码。
-        amount(int): 打给他多少愿力。
+        amount(int): 打给他多少愿力（给太少会被拦下来）。
         item(string): 你要他做的那件事 —— 写**你自己的原话**，越具体越好（这句会一直留着）。
         due(string): 期限。留空 = 不急；也可以写「3」= 三天内，或「2026-12-31」。
     """
@@ -1783,11 +1799,17 @@ async def wish_grant(*args, **kwargs):
     if amount > single:
         return "单笔最多 %s，别一次把家底给光 —— 想给更多就分开来。" % money_text(single)
     max_open = normalize_amount(_cfg(plugin.config, "grant_max_open", GRANT_MAX_OPEN)) or GRANT_MAX_OPEN
+    floor = _cfg(plugin.config, "grant_min_amount", GRANT_MIN_AMOUNT)
+    try:
+        floor = int(floor)
+    except (TypeError, ValueError):
+        floor = GRANT_MIN_AMOUNT
+    floor = max(0, floor)
     now = int(time.time())
     due_ts = parse_due(kwargs.get("due"), now)
     ref = "grant-%s-%s" % (now, uuid.uuid4().hex[:8])
     result = await run_db(with_conn, db_iou_grant, bot, group_id, user_id, amount, item,
-                          due_ts, ref, now, single, max_open)
+                          due_ts, ref, now, single, max_open, floor)
     if not result.get("ok"):
         return _grant_failure(result)
     name = await _display_name(plugin, event, bot, group_id, user_id)
@@ -2101,6 +2123,10 @@ def _grant_failure(result):
                 % money_text(result.get("balance", 0)))
     if code == "over_single":
         return "单笔最多 %s，分开来点吧。" % money_text(result.get("cap", 0))
+    if code == "under_min":
+        # 主人 2026-10-14：设了最低一笔 ⇒ 把话说透（别让她以为"花掉就行" ✓）
+        return ("小于 %s 的单**不值得你开口** —— 愿力攒着不丢人，攒够再点一件像样的；"
+                "要花也别拆成一堆小单，一件说清楚就够。" % money_text(result.get("floor", 0)))
     if code == "too_many_open":
         return ("你手上还有 %d 笔没结的欠条（上限 %d）—— 先把旧的清一清，再点新的。"
                 % (int(result.get("open", 0)), int(result.get("cap", 0))))

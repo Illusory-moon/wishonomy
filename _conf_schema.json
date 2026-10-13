@@ -64,6 +64,12 @@
     "default": 500,
     "hint": "一次点单最多打出去多少愿力（防它把家底一次给光）。"
   },
+  "grant_min_amount": {
+    "description": "点单：单笔最低",
+    "type": "int",
+    "default": 5,
+    "hint": "余额每天 0 点归零，不设下限它就会为了不浪费而乱花（实测立刻下一愿力级的单）。给少了会被拦下来。"
+  },
   "grant_max_open": {
     "description": "点单：同时最多几笔未兑现",
     "type": "int",

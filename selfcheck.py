@@ -780,13 +780,15 @@ def t27_audit_reports_issued(mod, plugin):
 
 
 def raw_grant(mod, who, amount, item="念一句台词", ref=None, now=None, due=None,
-              max_single=500, max_open=5):
+              max_single=500, max_open=5, min_amount=None):
     now = int(now if now is not None else time.time())
     ref = ref or ("grant-self-%s" % uuid.uuid4().hex[:8])
+    if min_amount is None:
+        min_amount = getattr(mod, "GRANT_MIN_AMOUNT", 0)
     conn = mod._connect()
     try:
         return mod.db_iou_grant(conn, BOT, GROUP, who, amount, item, due, ref, now,
-                                max_single, max_open)
+                                max_single, max_open, min_amount)
     finally:
         conn.close()
 
@@ -1336,6 +1338,29 @@ class _Req:
         self.extra_user_content_parts = []
 
 
+def t46_grant_floor(mod, plugin):
+    """点单**最低一笔**：为了不浪费而拆小单，会被拦下来 ✓
+
+    主人 2026-10-14 报的真现象：她的余额每天 0 点归零 ⇒ 一有愿力就急着花，
+    立刻下了「当着全群喊一声火花大人」这种一愿力级的单 ✗
+    """
+    seed_bot(mod, 500, "floor-seed")
+    floor = mod.GRANT_MIN_AMOUNT
+    low = raw_grant(mod, ALICE, max(1, floor - 1), item="一件特别小的事")
+    if low.get("code") != "under_min":
+        print("      低于下限没被拦:", low)
+        return False
+    if balance_of(mod, ALICE) != 0:
+        print("      被拦的那笔居然动账了:", balance_of(mod, ALICE))
+        return False
+    ok = raw_grant(mod, ALICE, floor, item="刚好到线的一件事")
+    if not ok.get("ok") or balance_of(mod, ALICE) != floor:
+        print("      到线的那笔该成功:", ok, balance_of(mod, ALICE))
+        return False
+    out = call(mod.wish_grant, plugin, Ev(), who="我", amount="1", item="再小一点")
+    return "不值得你开口" in out
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1382,6 +1407,7 @@ TESTS = [
     ("R43 心情标签真记账 + 标签不漏进回复", t43_mood_tag_records),
     ("R44 日结：只清她自己 + 负流水不删账", t44_settle_only_her),
     ("R45 被注视 +1（每条唤醒一次）", t45_attention_gain),
+    ("R46 点单最低一笔（拆小单会被拦）", t46_grant_floor),
 ]
 
 
