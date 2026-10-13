@@ -294,6 +294,38 @@ def t09_cli_entry(env, _unused):
     return data.get("available") is True
 
 
+def t10_open_browser_once(_env, _unused):
+    """`--open-browser` 只开一次、失败不炸（2026-10-13 真事故：cmd 的 start 会刷屏 ✗）"""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("panel2", PANEL)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["panel2"] = module
+    spec.loader.exec_module(module)
+    calls = []
+    import webbrowser
+    real = webbrowser.open
+    webbrowser.open = lambda url, new=0: (calls.append(url), True)[1]
+    try:
+        module.open_browser_once("http://127.0.0.1:9999/")
+        time.sleep(1.6)
+    finally:
+        webbrowser.open = real
+    if len(calls) != 1:
+        print("      浏览器被开了 %d 次（应当只有 1 次）✗" % len(calls))
+        return False
+    # 开不了也不许炸（比如没有浏览器）
+    webbrowser.open = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no browser"))
+    try:
+        module.open_browser_once("http://127.0.0.1:9999/")
+        time.sleep(1.6)
+    except Exception as exc:              # noqa: BLE001
+        print("      开不了浏览器时炸了:", exc)
+        return False
+    finally:
+        webbrowser.open = real
+    return True
+
+
 TESTS = [
     ("P01 只读连接写不了库", t01_readonly),
     ("P02 快照读得到发行/钱包/欠条/流水", t02_snapshot_content),
@@ -304,6 +336,7 @@ TESTS = [
     ("P07 库没建表时如实说", t07_empty_db),
     ("P08 面板源码卫生", t08_source_hygiene),
     ("P09 CLI 入口（--json 真跑一遍）", t09_cli_entry),
+    ("P10 开浏览器只开一次、失败不炸", t10_open_browser_once),
 ]
 
 

@@ -21,6 +21,7 @@ import json
 import os
 import sqlite3
 import sys
+import threading
 import time
 import types
 import urllib.parse
@@ -644,6 +645,25 @@ def serve(db_path, host="127.0.0.1", port=8765, quiet=True, refresh=False,
     return httpd
 
 
+def open_browser_once(url):
+    """开**一次**浏览器（就一次，绝不重试 ✓）。
+
+    ⚠️ 2026-10-13 真事故：`open_panel.bat` 里原本用 `start "" "http://…"` 让 cmd 开浏览器，
+       结果**一直弹新窗口**（cmd 解析 URL 的行为随引号/环境影响）✗
+       ⇒ 从此**不由 cmd 开**：交给 Python 的 `webbrowser`，并且**只调一次**、
+        放进守护线程、失败就算了（不会重试、不会连锁）✓
+    """
+    def _once():
+        try:
+            import webbrowser
+            webbrowser.open(url, new=2)
+        except Exception:            # noqa: BLE001 —— 开不了浏览器不算错，地址已经打出来了
+            pass
+    thread = threading.Timer(0.8, _once)
+    thread.daemon = True
+    thread.start()
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description="愿力中心 · 只读面板")
@@ -655,6 +675,8 @@ def main():
     parser.add_argument("--refresh", action="store_true",
                         help="打开「一键拉取」（POST /api/refresh 会去服务器取新副本）")
     parser.add_argument("--no-refresh", action="store_true", help="明确关掉一键拉取")
+    parser.add_argument("--open-browser", action="store_true",
+                        help="起来之后自己开一次浏览器（就一次 ✓）")
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
@@ -669,9 +691,12 @@ def main():
         print("  （面板照常起得来，页面上会写「还读不到账本」✓）")
     httpd = serve(db_path, args.host, args.port, quiet=not args.verbose,
                   refresh=allow_refresh)
-    print("愿力中心 · 只读面板：http://%s:%d/  （Ctrl+C 停）" % (args.host, args.port))
+    url = "http://%s:%d/" % (args.host, args.port)
+    print("愿力中心 · 只读面板：%s  （Ctrl+C 停）" % url)
     print("数据文件：%s" % db_path)
     print("一键拉取：%s" % ("开 ✓（页面上那个按钮）" if allow_refresh else "关（加 --refresh 打开）"))
+    if args.open_browser:
+        open_browser_once(url)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
