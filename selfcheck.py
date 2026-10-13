@@ -144,6 +144,7 @@ def make_plugin(mod):
         "enabled_self_ids": [BOT],
         "money_name": "愿力",
         "inject_money": True,
+        "attention_gain": True,
         "mood_max_delta": 1000,
         "mood_daily_gain": 3000,
         "issue_global_daily": 50000,
@@ -1264,6 +1265,77 @@ def t43_mood_tag_records(mod, plugin):
     return balance_of(mod, BOT) == 0
 
 
+def t44_settle_only_her(mod, _plugin):
+    """日结：**只清她自己**、记一笔负流水（不删账）、花粉的钱一分不动 ✓"""
+    now = int(time.time())
+    raw_mood(mod, ALICE, 40, "settle-a", now)
+    raw_mood(mod, BOT, 0, "settle-b", now)      # 这条会被拒（不许自记）⇒ 所以走送礼
+    raw_gift(mod, ALICE, 10, "settle-gift", now)   # 她收到 10
+    her_before = balance_of(mod, BOT)
+    if her_before <= 0:
+        print("      前置没造好（她账上应有 >0）:", her_before)
+        return False
+    conn = mod._connect()
+    try:
+        taken = mod.db_settle(conn, BOT, now)
+        rows = conn.execute("SELECT kind, from_id, to_id, amount FROM ledger "
+                            "WHERE self_id=? AND kind='settle'", (BOT,)).fetchall()
+    finally:
+        conn.close()
+    if taken != her_before or balance_of(mod, BOT) != 0:
+        print("      日结没生效：taken=%s 余额=%s" % (taken, balance_of(mod, BOT)))
+        return False
+    if len(rows) != 1 or int(rows[0]["amount"]) != her_before:
+        print("      日结没记成负流水:", [dict(r) for r in rows])
+        return False
+    if str(rows[0]["from_id"]) != str(BOT):
+        print("      日结流水的方向不对（应当 from=她自己）:", dict(rows[0]))
+        return False
+    if balance_of(mod, ALICE) != 30:
+        print("      花粉的钱被清了 ✗:", balance_of(mod, ALICE))
+        return False
+    # 再结一次 ⇒ 不该重复扣（余额已经是 0 ✓）
+    conn = mod._connect()
+    try:
+        again = mod.db_settle(conn, BOT, now)
+    finally:
+        conn.close()
+    return again == 0 and balance_of(mod, BOT) == 0
+
+
+def t45_attention_gain(mod, plugin):
+    """被注视 +1：每条唤醒一次、走 mood 那条记账、护栏照旧管着 ✓"""
+    before = balance_of(mod, BOT)
+    asyncio.run(plugin.inject_money(Ev(sender=ALICE), _Req()))       # 一条唤醒
+    one = balance_of(mod, BOT)
+    if one != before + 1:
+        print("      被注视没 +1：%s → %s" % (before, one))
+        return False
+    asyncio.run(plugin.inject_money(Ev(sender=BOB), _Req()))         # 再来一条
+    if balance_of(mod, BOT) != one + 1:
+        print("      第二次唤醒没 +1:", balance_of(mod, BOT))
+        return False
+    # 她自己在算的那一轮（sender == bot）不算"被注视" ✓
+    asyncio.run(plugin.inject_money(Ev(sender=BOT), _Req()))
+    if balance_of(mod, BOT) != one + 1:
+        print("      自己那一轮也被算了 ✗:", balance_of(mod, BOT))
+        return False
+    # 关掉开关 ⇒ 不再涨
+    CONFIG["attention_gain"] = False
+    try:
+        asyncio.run(plugin.inject_money(Ev(sender=ALICE), _Req()))
+    finally:
+        CONFIG["attention_gain"] = True
+    return balance_of(mod, BOT) == one + 1
+
+
+class _Req:
+    def __init__(self):
+        self.system_prompt = ""
+        self.prompt = ""
+        self.extra_user_content_parts = []
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1308,6 +1380,8 @@ TESTS = [
     ("R41 送礼份数：数字不当档位名 / count 生效", t41_gift_count),
     ("R42 心情标签：三写法/任何位置/不删正文", t42_mood_tag_parse),
     ("R43 心情标签真记账 + 标签不漏进回复", t43_mood_tag_records),
+    ("R44 日结：只清她自己 + 负流水不删账", t44_settle_only_her),
+    ("R45 被注视 +1（每条唤醒一次）", t45_attention_gain),
 ]
 
 

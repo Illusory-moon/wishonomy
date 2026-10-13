@@ -152,6 +152,7 @@ NAME_MAX = 3000
 _DB_PATH = ""                 # 由 resolve_db_path() 首次调用时确定
 _POOL = None
 _POOL_LOCK = threading.Lock()
+_SETTLE_STATE = {"day": ""}   # 进程内记住"今天已经日结过了"（跨天那一刻才真做一次 ✓）
 _NAMES = {}                   # "self_id|group_id|speaker_id" -> (name, ts)
 _NAMES_LOCK = threading.Lock()
 
@@ -268,6 +269,76 @@ def money_text(amount, name=None):
     return "%d %s" % (int(amount), name or MONEY_NAME)
 
 
+def _last_settle_day():
+    return _SETTLE_STATE.get("day") or ""
+
+
+def _mark_settle_day(day):
+    _SETTLE_STATE["day"] = str(day or "")
+
+
+def db_settle(conn, self_id, now):
+    """**日结**：把她账上的愿力收回去（只在跨天那一刻发生一次 ✓）。
+
+    ⚠️ 三条底线（本鱼自己定的，写在代码里防将来跑偏）：
+      1. **只清她自己** ✗ —— 花粉的余额是人家的钱，清了会出乱子 ✓
+      2. **绝不删流水** ✗ —— 记一笔 `settle` 负流水（账照样能回放、能对账 ✓）
+      3. **当天进当天出** —— `earned`/`spent` 统计**不动**（那是当日账，不是余额 ✓）
+    """
+    try:
+        _ensure(conn)
+        _ensure_account(conn, self_id, self_id, "", now)
+        row = conn.execute("SELECT balance FROM account WHERE self_id=? AND user_id=?",
+                           (str(self_id), str(self_id))).fetchone()
+        balance = int(row["balance"]) if row is not None else 0
+        if balance <= 0:
+            return 0
+        conn.execute("BEGIN IMMEDIATE")
+        _move(conn, self_id, "", self_id, ISSUE_SOURCE, balance, "settle",
+              "日结：昨天的愿力带不到今天", "settle-%s" % day_start(now), now)
+        conn.commit()
+        return balance
+    except sqlite3.Error as exc:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        logger.warning("[wishonomy] 日结失败: %s", str(exc)[:120])
+        return 0
+
+
+def db_attention(conn, self_id, now, amount=1, ref=None):
+    """**被注视 +1** —— 愿力的源头（设计稿 §1：愿力 = 想象力与注视的集合 ✓）。
+
+    主人 2026-10-13 裁定：**每条唤醒 +1**（不是每条消息 —— 群里没被唤醒的话她看不见 ✓），
+    且**先不设每日上限**（主人要看她一天能回多少 ✓）。
+
+    ⚠️ 它**不是** `mood`：`db_mood` 里那道 `who == self_id` 的硬闸门（防她自己给自己加 ✗）
+       会**正确地把这条路也拦掉** —— 而注视**本来就该**由系统发给她 ✓
+       ⇒ 所以单开一个 `kind='attention'`：`from=system → to=她`，语义更准、审计里也分得开 ✓
+    """
+    ref = ref or ("attention-%s-%s" % (day_start(now), uuid.uuid4().hex[:6]))
+    try:
+        _ensure(conn)
+        old = conn.execute("SELECT id FROM ledger WHERE kind='attention' AND ref=?",
+                           (str(ref),)).fetchone()
+        if old is not None:
+            return {"ok": True, "duplicated": True}
+        conn.execute("BEGIN IMMEDIATE")
+        _ensure_account(conn, self_id, self_id, "", now)
+        _move(conn, self_id, "", ISSUE_SOURCE, self_id, int(amount), "attention",
+              "被注视（今天有人来找她说话）", ref, now)
+        conn.commit()
+        return {"ok": True, "duplicated": False}
+    except sqlite3.Error as exc:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        logger.warning("[wishonomy] 注视进账失败: %s", str(exc)[:120])
+        return {"ok": False, "code": "db_error", "detail": str(exc)[:120]}
+
+
 # ─────────────────── 注入用的常量（**必须稳定**，见 §缓存纪律） ───────────────────
 
 # ⚠️ 这段是**常量**：它进 system_prompt 的**尾部**；因为它永远不变，
@@ -300,21 +371,35 @@ def inject_tail(tiers=None):
     return "\n".join(lines)
 
 
-def money_hint(snap, who_text="他"):
+def money_hint(snap, who_text="他", mine=None, reset_hint=False):
     """按需拼一行提示；**什么都没有就一个字都不注入**（省 token 也省缓存 ✓）。
 
-    ⚠️ 2026-10-13 真机教训（主人报的）：这行给的是**问话人自己**的余额，
-       但没写清"这是谁的" ⇒ 有人问「你（火花花）现在有多少愿力」时，
+    2026-10-13 主人裁定的两件事都落在这里：
+      * **她自己那一份**（`mine`）⇒ 她**每轮都看得见**手上有多少，不用被提醒 ✓
+      * **日结提示**：她的余额每天 0 点会被收走 ⇒ 得**告诉她**，让她今天就花出去 ✓
+        （只在她真有余额、且还没到点时才说；说多了她会烦，也白烧 token ✗）
+
+    ⚠️ 2026-10-13 真机教训（主人报的）：那行给的是**问话人自己**的余额，
+       起初没写清"这是谁的" ⇒ 有人问「你（火花花）现在有多少愿力」时，
        她手边只有**别人的数字**，于是**顺手拿来解释、还编了来源** ✗
        （实测：她把自己 30 愿力说对了 ✓，却把水梦送的礼物说成是问话人送的 ✗）
-       ⇒ 修：① 字样写死「跟你说话的人」② 末尾加一句「没查过就别报数、别认领礼物」
+       ⇒ 字样写死「跟你说话的人」，并**单列她自己那一项** ✓
     """
-    if not snap or not snap.get("exists"):
+    lines = []
+    if snap and snap.get("exists"):
+        lines.append("跟你说话的那个人：%s %d" % (MONEY_NAME, int(snap.get("balance") or 0)))
+        if snap.get("credit") is not None:
+            lines.append("%s %d" % (CREDIT_NAME, int(snap["credit"])))
+    mine = mine or {}
+    if mine.get("exists"):
+        lines.append("**你自己**：%s %d" % (MONEY_NAME, int(mine.get("balance") or 0)))
+    if not lines:
         return ""
-    lines = ["跟你说话的那个人现在的%s：%d" % (MONEY_NAME, int(snap.get("balance") or 0))]
-    if snap.get("credit") is not None:
-        lines.append("%s：%d" % (CREDIT_NAME, int(snap["credit"])))
-    return "（" + "，".join(lines) + "）"
+    hint = "（" + "，".join(lines) + "）"
+    if reset_hint and int(mine.get("balance") or 0) > 0:
+        hint += ("\n（提醒：你账上这些愿力**过了今天 0 点就归零**了 —— 愿力是当天注视攒出来的，"
+                 "带不到明天。想给谁就给谁、想点谁的单就点，别留到作废 ✓）")
+    return hint
 
 
 # ─────────────────────────── 库路径 / 线程池 ───────────────────────────
@@ -571,7 +656,7 @@ def _sum_issued(conn, self_id, since, now):
     """当日发行量 = 她记给人家的愿力 + 送礼进她账的愿力。"""
     row = conn.execute(
         "SELECT COALESCE(SUM(amount),0) AS s FROM ledger "
-        "WHERE self_id=? AND ts>=? AND ts<=? AND kind IN ('mood','gift','initial')",
+        "WHERE self_id=? AND ts>=? AND ts<=? AND kind IN ('mood','gift','initial','attention')",
         (self_id, int(since), int(now))).fetchone()
     return int(row["s"] or 0)
 
@@ -760,7 +845,7 @@ def db_mood(conn, self_id, group_id, who, delta, reason, ref, now, daily_cap,
             # 熔断只记日志、**不拦她**（她可以继续给 —— 主人看得到、能自己调护栏 ✓）
             rows = conn.execute(
                 "SELECT COALESCE(SUM(amount),0) AS s FROM ledger "
-                "WHERE self_id=? AND ts>=? AND ts<=? AND kind IN ('mood','gift','initial')",
+                "WHERE self_id=? AND ts>=? AND ts<=? AND kind IN ('mood','gift','initial','attention')",
                 (self_id, day_start(now), now)).fetchone()
         issued_today = int(rows["s"] or 0) if rows is not None else 0
         after_balance = int(after["balance"]) if after is not None else 0
@@ -1312,8 +1397,21 @@ class Main(star.Star):
                 return
             bot = ident[0]
             sender = str(event.get_sender_id() or "").strip()
+            # ① 先看跨天了没有 ⇒ 日结（收走昨天的愿力；**今天不清**：第一次记下当天就跳过 ✓）
+            today = datetime.fromtimestamp(int(time.time()), CN_TZ).strftime("%Y-%m-%d")
+            if _last_settle_day() != today:
+                taken = await run_db(with_conn, db_settle, bot, int(time.time()))
+                _mark_settle_day(today)
+                if taken:
+                    logger.info("[wishonomy] 日结 | 收回 %s %s（昨天的带不到今天）",
+                                taken, MONEY_NAME)
+            # ② 被注视 +1（每条唤醒一次 ✓ 主人 2026-10-13 裁定）
+            if bool(_cfg(self.config, "attention_gain", True)):
+                await run_db(with_conn, db_attention, bot, int(time.time()))
+            # ③ 拼提示：**别人的 + 她自己的**（她自己那份每轮可见 ✓）
             snap = await run_db(db_snapshot, bot, sender)
-            hint = money_hint(snap, "他")
+            mine = await run_db(db_snapshot, bot, bot)
+            hint = money_hint(snap, "他", mine=mine, reset_hint=True)
             if not hint:
                 return
             parts = getattr(request, "extra_user_content_parts", None)
