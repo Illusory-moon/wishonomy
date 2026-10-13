@@ -144,6 +144,7 @@ def make_plugin(mod):
         "inject_money": True,
         "mood_max_delta": 1000,
         "mood_daily_gain": 3000,
+        "issue_global_daily": 50000,
         "gift_daily_cap": 3000,
         "gift_tiers": TIERS,
     })
@@ -667,6 +668,73 @@ def t23_cache_placement(mod, plugin):
     return True
 
 
+def t24_issue_global_fuse(mod, plugin):
+    """全局日发行上限：**只记日志、不拦她**（设计稿 §2.1 的原话）。"""
+    seen = []
+    old_warning = mod.logger.warning
+    mod.logger.warning = lambda *a, **k: seen.append(" ".join(str(x) for x in a))
+    try:
+        CONFIG["issue_global_daily"] = 5
+        out = call(mod.wish_mood, plugin, Ev(), who="我", amount=4, reason="熔断自检")
+        if "记下了" not in out:
+            print("      第一笔记愿力就失败了:", out)
+            return False
+        out2 = call(mod.wish_mood, plugin, Ev(), who="我", amount=4, reason="熔断自检2")
+        if "记下了" not in out2:
+            print("      超上限**不该**拦她，但被拦了:", out2)
+            return False
+    finally:
+        mod.logger.warning = old_warning
+        CONFIG["issue_global_daily"] = 50000
+    if not any("发行超上限" in line for line in seen):
+        print("      超上限没记日志:", seen[:2])
+        return False
+    if balance_of(mod, ALICE) != 8:
+        print("      余额不对（说明真被拦了）:", balance_of(mod, ALICE))
+        return False
+    return True
+
+
+def t25_backup_whitelist(mod, _plugin):
+    """备份清单：主库 + WAL 边车都要在（少一个 = 恢复时可能丢最后几笔）。"""
+    paths = mod.data_paths()
+    names = [os.path.basename(p) for p in paths]
+    now = int(time.time())
+    raw_mood(mod, ALICE, 3, "bk-1", now)
+    return (len(paths) == 3 and names[0].endswith(".db")
+            and names[1].endswith("-wal") and names[2].endswith("-shm")
+            and os.path.exists(paths[0]))
+
+
+def t26_config_hot_reload(mod, plugin):
+    """配置改动**当轮就生效**（工具每次调用都读配置，不缓存）。"""
+    try:
+        CONFIG["mood_max_delta"] = 5
+        too_big = call(mod.wish_mood, plugin, Ev(), who="我", amount=50, reason="热载自检")
+        ok_small = call(mod.wish_mood, plugin, Ev(), who="我", amount=5, reason="热载自检")
+    finally:
+        CONFIG["mood_max_delta"] = 1000
+    again = call(mod.wish_mood, plugin, Ev(), who="我", amount=50, reason="热载自检")
+    if "最多" not in too_big:
+        print("      改小上限没生效:", too_big)
+        return False
+    if "记下了" not in ok_small:
+        print("      上限内的那笔该成功:", ok_small)
+        return False
+    if "记下了" not in again:
+        print("      改回上限后该重新放行:", again)
+        return False
+    return True
+
+
+def t27_audit_reports_issued(mod, plugin):
+    """审计口径里能看到当日发行量（主人对账要看的那一行）。"""
+    now = int(time.time())
+    raw_mood(mod, ALICE, 42, "audit-1", now)
+    out = call(mod.wish_audit, plugin, Ev())
+    return "收愿力 42" in out and "送礼" in out and "钱包" in out
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -691,6 +759,10 @@ TESTS = [
     ("R21 源码卫生（无 print / 无私域号 / 无 return None）", t21_source_hygiene),
     ("R22 护栏求和：类别 / 方向 / 时间窗", t22_sum_by_kind_windows),
     ("R23 缓存纪律：常量进尾部 / 变动挂用户消息之后", t23_cache_placement),
+    ("R24 全局日发行上限（只记日志、不拦她）", t24_issue_global_fuse),
+    ("R25 备份清单含 WAL 边车", t25_backup_whitelist),
+    ("R26 配置改动当轮生效", t26_config_hot_reload),
+    ("R27 审计能看到当日发行量", t27_audit_reports_issued),
 ]
 
 

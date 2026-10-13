@@ -219,6 +219,16 @@ def resolve_db_path(config=None):
     return _DB_PATH
 
 
+def data_paths(config=None):
+    """**备份白名单**用：愿力中心的数据文件清单（含 SQLite 的 WAL 边车文件）。
+
+    部署侧的自动备份脚本按这个清单挂上去；少备份一个边车文件 =
+    恢复时可能丢最后几笔（WAL 里还没落主库的）✗
+    """
+    base = resolve_db_path(config)
+    return [base, base + "-wal", base + "-shm"]
+
+
 def set_db_path(path):
     """给自检用：换一个数据文件（同时作废线程池，下次访问重开）。"""
     global _DB_PATH
@@ -448,11 +458,15 @@ def db_audit_totals(self_id, since, now):
 # ── 写 ──
 
 def db_mood(conn, self_id, group_id, who, delta, reason, ref, now, daily_cap,
-            name=""):
+            name="", issue_cap=0):
     """收愿力 / 分愿力 —— 记进 who 的账。
 
     语义（设计稿 §2）：愿力是**注视带出来的**，不是从别人身上划走的；
     所以这里**不检查 who 的余额**，只受「每人每日净增上限」约束。
+
+    全局日发行上限（`issue_cap`）：**只记日志、不拦她** ✓ ——
+    护栏拦的是"数量级"，不拦"她的意志"（设计稿 §2.1 原话）。
+
     ⚠️ 连接由调用方给（单线程池里共享一条），函数内**不再开连接** ——
        事务里再开连接会互相等锁（P1 当场踩过 ✓）。
     ⚠️ **who == self_id 一律拒绝**（硬保证）：她自己的愿力只能靠别人送礼进来，
@@ -485,9 +499,22 @@ def db_mood(conn, self_id, group_id, who, delta, reason, ref, now, daily_cap,
                                 reason, ref, now)
         after = conn.execute("SELECT balance FROM account WHERE self_id=? AND user_id=?",
                              (self_id, who)).fetchone()
+        rows = None
+        if issue_cap > 0:
+            # 熔断只记日志、**不拦她**（她可以继续给 —— 主人看得到、能自己调护栏 ✓）
+            rows = conn.execute(
+                "SELECT COALESCE(SUM(amount),0) AS s FROM ledger "
+                "WHERE self_id=? AND ts>=? AND ts<=? AND kind IN ('mood','gift','initial')",
+                (self_id, day_start(now), now)).fetchone()
+        issued_today = int(rows["s"] or 0) if rows is not None else 0
+        after_balance = int(after["balance"]) if after is not None else 0
         conn.commit()
+        if issue_cap > 0 and issued_today > issue_cap:
+            logger.warning("[wishonomy] 全局日发行超上限 | bot=%s 今天 %d / 上限 %d（只记日志，不拦）",
+                           self_id, issued_today, issue_cap)
         return {"ok": True, "duplicated": False, "ledger_id": ledger_id,
-                "balance": int(after["balance"]), "today_gain": gain + delta}
+                "balance": after_balance, "today_gain": gain + delta,
+                "issued_today": issued_today, "issue_cap": issue_cap}
     except sqlite3.Error as exc:
         try:
             conn.rollback()
@@ -847,10 +874,12 @@ async def wish_mood(*args, **kwargs):
         return await _deduct(plugin, bot, group_id, user_id, amount, reason,
                              "mood-", event)
     daily = normalize_amount(_cfg(plugin.config, "mood_daily_gain", MOOD_DAILY_GAIN)) or MOOD_DAILY_GAIN
+    issue_cap = normalize_amount(_cfg(plugin.config, "issue_global_daily",
+                                      ISSUE_GLOBAL_DAILY)) or 0
     now = int(time.time())
     ref = "%s%s-%s" % ("mood-", now, uuid.uuid4().hex[:8])
     result = await run_db(with_conn, db_mood, bot, group_id, user_id, amount, reason,
-                          ref, now, daily)
+                          ref, now, daily, "", issue_cap)
     if not result.get("ok"):
         return _mood_failure(result, daily)
     name = await _display_name(plugin, event, bot, group_id, user_id)
