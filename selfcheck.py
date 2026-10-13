@@ -898,6 +898,73 @@ def t32_ious_tool(mod, plugin):
     return "谁也不欠你什么" in empty
 
 
+def t33_credit_tool(mod, plugin):
+    """信誉分工具：正负都能记、超限拦住、理由必填、不许给自己写 ✓"""
+    now = int(time.time())
+    raw_mood(mod, ALICE, 5, "credit-seed", now)
+    up = call(mod.wish_credit, plugin, Ev(), who="我", delta=7, reason="他说话算数")
+    if "信誉分" not in up or credit_of(mod, ALICE) != 107:
+        print("      加分没生效:", up, credit_of(mod, ALICE))
+        return False
+    down = call(mod.wish_credit, plugin, Ev(), who="我", delta=-10, reason="满嘴跑火车")
+    if credit_of(mod, ALICE) != 97:
+        print("      扣分没生效:", down, credit_of(mod, ALICE))
+        return False
+    too_big = call(mod.wish_credit, plugin, Ev(), who="我", delta=999, reason="太多")
+    if "最多" not in too_big:
+        print("      上限没拦住:", too_big)
+        return False
+    no_reason = call(mod.wish_credit, plugin, Ev(), who="我", delta=5)
+    if "为什么" not in no_reason:
+        print("      缺理由没拦住:", no_reason)
+        return False
+    me = call(mod.wish_credit, plugin, Ev(), who="你", delta=5, reason="自吹")
+    if "不用自己写" not in me:
+        print("      给自己写没拦住:", me)
+        return False
+    return credit_of(mod, ALICE) == 97
+
+
+def t34_leaderboard(mod, plugin):
+    """排行：按愿力 / 按信誉分两种口径；空账本要如实说 ✓"""
+    now = int(time.time())
+    empty = call(mod.wish_leaderboard, plugin, Ev())
+    if "还没有别人" not in empty:
+        print("      空账本没说清:", empty)
+        return False
+    raw_mood(mod, ALICE, 300, "lb-a", now)
+    raw_mood(mod, BOB, 10, "lb-b", now)
+    call(mod.wish_credit, plugin, Ev(), who="20003", delta=30, reason="很守约")
+    by_money = call(mod.wish_leaderboard, plugin, Ev())
+    by_credit = call(mod.wish_leaderboard, plugin, Ev(), by="信誉", n=2)
+    if by_money.index(ALICE) > by_money.index(BOB):
+        print("      按愿力排的顺序不对:", by_money)
+        return False
+    if by_credit.index(BOB) > by_credit.index(ALICE):
+        print("      按信誉分排的顺序不对:", by_credit)
+        return False
+    if by_credit.count("\n") > 2:
+        print("      n 没生效:", by_credit)
+        return False
+    return "信誉分" in by_credit
+
+
+def t35_audit_detail(mod, plugin):
+    """对账细化：待结欠条 / 信誉分增减 / 按人合计都要有 ✓"""
+    now = int(time.time())
+    seed_bot(mod, 400, "audit-detail")
+    raw_mood(mod, ALICE, 60, "audit-detail-a", now)
+    g = raw_grant(mod, ALICE, 30, item="留一张欠条")
+    raw_settle(mod, g["iou_id"], "defaulted", "没做")
+    out = call(mod.wish_audit, plugin, Ev())
+    ok = ("还没兑现的欠条" in out and "收愿力" in out and "送礼" in out
+          and "钱包" in out and "动得最多的人" in out)
+    if not ok:
+        print("      对账缺字段:", out)
+        return False
+    return ("欠条 1 张" in out or "欠条 0 张" in out)
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -931,6 +998,9 @@ TESTS = [
     ("R30 判定：守约涨分 / 违约掉分 / 不许重复判", t30_settle_verdicts),
     ("R31 撤回：只在那笔没被动过时成功", t31_refund_rules),
     ("R32 欠条清单（列未结 / 全清后如实说）", t32_ious_tool),
+    ("R33 信誉分：加/减/上限/理由/不许自写", t33_credit_tool),
+    ("R34 排行：两种口径 + n 限制", t34_leaderboard),
+    ("R35 对账细化：欠条 / 信誉分 / 按人合计", t35_audit_detail),
 ]
 
 

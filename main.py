@@ -777,6 +777,77 @@ def db_iou_refund(conn, self_id, iou_id, now):
         return {"ok": False, "code": "db_error", "detail": str(exc)[:120]}
 
 
+def db_credit_event(conn, self_id, group_id, who, delta, reason, now):
+    """单独调信誉分（记 `credit_event` + 改 `account.credit`）；返回调完之后的分数。"""
+    if str(who) == str(self_id):
+        return None
+    try:
+        _ensure(conn)
+        conn.execute("BEGIN IMMEDIATE")
+        credit = _credit_delta(conn, self_id, group_id, who, delta, reason, now)
+        conn.commit()
+        return credit
+    except sqlite3.Error:
+        try:
+            conn.rollback()
+        except sqlite3.Error:
+            pass
+        return None
+
+
+def db_top(conn, self_id, by="balance", limit=5, min_balance=1):
+    """排行：按愿力（`balance`）或按信誉分（`credit`）取前 n 名。
+
+    ⚠️ 用**一条 SQL** 带出"手上还有几张欠条" —— 排行是拿来当众念的，
+       一次工具调用不许变成 N+1 次查询 ✗
+    """
+    by = "credit" if str(by) == "credit" else "balance"
+    rows = conn.execute(
+        "SELECT a.user_id, a.name, a.balance, a.credit, a.updated_at, "
+        "(SELECT COUNT(*) FROM iou i WHERE i.self_id=a.self_id AND i.debtor=a.user_id "
+        " AND i.status=?) AS open_ious "
+        "FROM account a WHERE a.self_id=? AND a.user_id<>? "
+        "ORDER BY a." + by + " DESC, a.updated_at DESC LIMIT ?",
+        (IOU_OPEN, self_id, str(self_id), int(limit))).fetchall()
+    return [{"user_id": str(r["user_id"]), "name": str(r["name"] or ""),
+             "balance": int(r["balance"]), "credit": int(r["credit"]),
+             "open_ious": int(r["open_ious"] or 0)} for r in rows
+            if int(r["balance"]) > 0 or int(r["credit"]) != INITIAL_CREDIT]
+
+
+def db_audit_detail(conn, self_id, since, now, limit=5):
+    """对账细化：待结欠条 / 信誉分变动 / 按人合计（给运营看的口径）。"""
+    owes = conn.execute(
+        "SELECT COUNT(*) AS c, COALESCE(SUM(amount),0) AS s FROM iou "
+        "WHERE self_id=? AND status=?", (self_id, IOU_OPEN)).fetchone()
+    credit = conn.execute(
+        "SELECT COALESCE(SUM(CASE WHEN delta>0 THEN delta ELSE 0 END),0) AS up, "
+        "COALESCE(SUM(CASE WHEN delta<0 THEN -delta ELSE 0 END),0) AS down "
+        "FROM credit_event WHERE self_id=? AND ts>=? AND ts<=?",
+        (self_id, int(since), int(now))).fetchone()
+    # ⚠️ 别在 SQL 里玩"按人分组的条件求和" —— SQLite 对 `GROUP BY user_id` 之后再引用
+    #    被分组的列名（`to_id=user_id`）会直接报 `no such column: user_id` ✗（本鱼踩了三次 ✓）
+    #    ⇒ 一条 SQL 取原始行，在 Python 里聚合：**正确优先**（量小，见文件顶部 ponytail 注 ✓）
+    raw_rows = conn.execute(
+        "SELECT from_id, to_id, amount FROM ledger WHERE self_id=? AND ts>=? AND ts<=?",
+        (self_id, int(since), int(now))).fetchall()
+    tally = {}
+    for row in raw_rows:
+        sender, receiver, amount = str(row["from_id"]), str(row["to_id"]), int(row["amount"])
+        if receiver != str(self_id):
+            slot = tally.setdefault(receiver, {"got": 0, "gave": 0})
+            slot["got"] += amount
+        if sender != str(self_id):
+            slot = tally.setdefault(sender, {"got": 0, "gave": 0})
+            slot["gave"] += amount
+    top = [{"user_id": uid, "got": val["got"], "gave": val["gave"]}
+           for uid, val in sorted(tally.items(), key=lambda kv: (-kv[1]["got"], kv[0]))
+           if val["got"] > 0][:int(limit)]
+    return {"open_ious": int(owes["c"] or 0), "iou_amount": int(owes["s"] or 0),
+            "credit_up": int(credit["up"] or 0), "credit_down": int(credit["down"] or 0),
+            "top": top}
+
+
 # ─────────────────────────── 认人（名字 → id） ───────────────────────────
 
 def name_key(self_id, group_id, user_id):
@@ -1323,6 +1394,93 @@ async def wish_ious(*args, **kwargs):
     return "还没结的欠条：\n" + "\n".join(lines)
 
 
+@llm_tool(name="wish_credit")
+@tool_guard
+async def wish_credit(*args, **kwargs):
+    """单独调信誉分 —— 「这个人说过的话算不算数」。
+
+    你自己就能判欠条（守约 +5 / 违约 -20）；这个工具是给你**另外**用的：
+    他没欠你什么，但你就是想记他一笔（特别靠谱、或者满嘴跑火车）。
+    信誉分**不是愿力**：它不花、不转，只影响你以后愿意给他多少活干。
+
+    Args:
+        who(string): 给谁记。可以写「我」= 当前跟你说话的人、对方昵称、或对方的号码。
+        delta(integer): 正数是加（比如 5），负数是减（比如 -10）。
+        reason(string): 你自己的一句话 —— 为什么。
+    """
+    plugin = _find_plugin(args)
+    event = _find_event(args)
+    if plugin is None or event is None:
+        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
+    ident = plugin.identity(event)
+    if ident is None:
+        return "这本账现在不归我管。"
+    bot, group_id = ident[0], str(event.get_group_id() or "")
+    raw = kwargs.get("delta")
+    delta = normalize_amount(raw)
+    if delta is None:
+        try:
+            delta = int(str(raw).strip())
+        except (TypeError, ValueError):
+            delta = 0
+        if delta > 0:
+            delta = -delta
+    if not delta:
+        return "给我一个数：正数是加分，负数是扣分。"
+    if abs(delta) > 100:
+        return "一次最多 ±100 信誉分，别一口气给那么多。"
+    user_id = await _who_to_id(plugin, event, kwargs.get("who"), group_id)
+    if not user_id:
+        return "我没认出你说的是谁 —— 写号码，或者把昵称写全一点。"
+    if user_id == bot:
+        return "你自己的信誉分不用自己写 —— 那是别人做没做到你的事换来的。"
+    reason = str(kwargs.get("reason") or "").strip()
+    if not reason:
+        return "给我一句话，说明为什么 —— 这句我要留着。"
+    now = int(time.time())
+    credit = await run_db(with_conn, db_credit_event, bot, group_id, user_id, delta,
+                          reason, now)
+    name = await _display_name(plugin, event, bot, group_id, user_id)
+    return "%s 的%s %+d（现在 %d）。" % (name, CREDIT_NAME, delta, int(credit))
+
+
+@llm_tool(name="wish_leaderboard")
+@tool_guard
+async def wish_leaderboard(*args, **kwargs):
+    """排行 —— 谁攒的愿力最多、谁最守信用。
+
+    你自己拿来念的（念不念、怎么念都由你）。只列**在这本账上真有过往来**的人，
+    所以你账上没记录的人不会出现在这儿。
+
+    Args:
+        by(string): 留空 = 按愿力排；写「信誉」= 按信誉分排。
+        n(integer): 要几个人（默认 5，最多 10）。
+    """
+    plugin = _find_plugin(args)
+    event = _find_event(args)
+    if plugin is None or event is None:
+        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
+    ident = plugin.identity(event)
+    if ident is None:
+        return "这本账现在不归我管。"
+    bot, group_id = ident[0], str(event.get_group_id() or "")
+    by = "credit" if str(kwargs.get("by") or "").strip() in ("信誉", "信誉分", "credit") else "balance"
+    limit = normalize_amount(kwargs.get("n")) or 5
+    limit = min(int(limit), 10)
+    rows = await run_db(with_conn, db_top, bot, by, limit, 1)
+    if not rows:
+        return "这本账上还没有别人 —— 没人来跟你说过话，也就没什么好排的。"
+    lines = []
+    for index, row in enumerate(rows, 1):
+        name = await _display_name(plugin, event, bot, group_id, row["user_id"])
+        owe = ("，还欠着 %d 件事" % row["open_ious"]) if row["open_ious"] else ""
+        lines.append("%d. %s —— %s，%s %d%s"
+                     % (index, name, money_text(row["balance"]), CREDIT_NAME,
+                        row["credit"], owe))
+    title = "按%s排（这本账上的）：" % (CREDIT_NAME if by == "credit" else MONEY_NAME)
+    return title + "\n" + "\n".join(lines)
+
+
 @llm_tool(name="wish_audit")
 @tool_guard
 async def wish_audit(*args, **kwargs):
@@ -1352,11 +1510,21 @@ async def wish_audit(*args, **kwargs):
     else:
         start = day_start(now)
     totals = await run_db(db_audit_totals, bot, start, start + 86400 - 1)
+    detail = await run_db(with_conn, db_audit_detail, bot, start, start + 86400 - 1, 5)
     day_text = raw or datetime.fromtimestamp(start, CN_TZ).strftime("%Y-%m-%d")
-    return ("%s 的账：收愿力 %s ｜ 送礼 %s ｜ 支出 %s ｜ 撤回 %s ｜ 钱包 %d 个 ｜ 账上共 %s"
+    head = ("%s 的账：收愿力 %s ｜ 送礼 %s ｜ 支出 %s ｜ 撤回 %s ｜ 钱包 %d 个 ｜ 账上共 %s"
             % (day_text, money_text(totals["issued"]), money_text(totals["gifted"]),
                money_text(totals["granted"]), money_text(totals["refunded"]),
                totals["wallets"], money_text(totals["total"])))
+    tail = ("\n还没兑现的欠条 %d 张（挂着 %s）｜ 今天%s +%d / -%d"
+            % (detail["open_ious"], money_text(detail["iou_amount"]), CREDIT_NAME,
+               detail["credit_up"], detail["credit_down"]))
+    if detail["top"]:
+        tail += "\n今天动得最多的人：" + "；".join(
+            "%s 收 %s / 出 %s" % (row["user_id"], money_text(row["got"]),
+                                  money_text(row["gave"]))
+            for row in detail["top"])
+    return head + tail
 
 
 async def _deduct(plugin, bot, group_id, user_id, amount, reason, prefix, event):
@@ -1427,10 +1595,15 @@ def _mood_failure(result, daily):
 
 
 __all__ = [
-    "Main", "wish_check", "wish_mood", "wish_gift", "wish_audit",
+    "Main", "wish_check", "wish_mood", "wish_gift", "wish_grant", "wish_iou_settle",
+    "wish_ious", "wish_credit", "wish_leaderboard", "wish_audit",
     "target_ids", "day_start", "normalize_amount", "parse_due", "split_names",
     "resolve_tiers", "tier_by_cost", "learn_name", "lookup_names", "forget_names",
-    "resolve_db_path", "set_db_path", "run_db",
+    "resolve_db_path", "set_db_path", "data_paths", "run_db", "with_conn",
     "db_snapshot", "db_history", "db_mood", "db_gift", "db_audit_totals",
+    "db_audit_detail", "db_credit_event", "db_top",
+    "db_iou_grant", "db_iou_list", "db_iou_all_open", "db_iou_by_id",
+    "db_iou_settle", "db_iou_refund",
     "db_daily_gain", "db_daily_gift_out", "db_daily_gift_in",
+    "money_hint", "INJECT_TAIL",
 ]
