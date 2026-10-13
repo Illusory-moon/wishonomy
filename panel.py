@@ -22,10 +22,68 @@ import os
 import sqlite3
 import sys
 import time
+import types
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+
+def _ensure_astrbot_stub():
+    """让面板能**独立跑**：本机没有 AstrBot 时，给 `import main` 铺一层最小桩。
+
+    （线上/容器里当然有真的 AstrBot，这个函数会立刻返回 ✓）
+    """
+    if "astrbot" in sys.modules or importlib_has_astrbot():
+        return
+    api = types.ModuleType("astrbot.api")
+    event_api = types.ModuleType("astrbot.api.event")
+    star_api = types.ModuleType("astrbot.api.star")
+    root = types.ModuleType("astrbot")
+    core = types.ModuleType("astrbot.core")
+    agent = types.ModuleType("astrbot.core.agent")
+    agent_message = types.ModuleType("astrbot.core.agent.message")
+
+    class TextPart:                     # 插件真的会用它，得是真类 ✓
+        def __init__(self, text):
+            self.text = text
+
+        def mark_as_temp(self):
+            return self
+
+    api.AstrBotConfig = dict
+    api.llm_tool = lambda *a, **k: (lambda fn: fn)
+    api.logger = types.SimpleNamespace(info=lambda *a, **k: None,
+                                       warning=lambda *a, **k: None,
+                                       error=lambda *a, **k: None)
+    api.star = star_api
+    star_api.Star = type("Star", (), {"__init__": lambda self, context=None: None})
+    star_api.Context = object
+    star_api.StarTools = types.SimpleNamespace(
+        get_data_dir=lambda name: os.path.join(os.path.expanduser("~"), ".astrbot", name))
+    event_api.AstrMessageEvent = object
+    event_api.filter = types.SimpleNamespace(
+        on_llm_request=lambda *a, **k: (lambda fn: fn),
+        on_llm_response=lambda *a, **k: (lambda fn: fn),
+        on_agent_done=lambda *a, **k: (lambda fn: fn))
+    agent_message.TextPart = TextPart
+    for name, module in {
+        "astrbot": root, "astrbot.api": api, "astrbot.api.event": event_api,
+        "astrbot.api.star": star_api, "astrbot.core": core,
+        "astrbot.core.agent": agent, "astrbot.core.agent.message": agent_message,
+    }.items():
+        sys.modules[name] = module
+
+
+def importlib_has_astrbot():
+    import importlib.util as _iu
+    try:
+        return _iu.find_spec("astrbot") is not None
+    except (ImportError, ValueError):
+        return False
+
+
+_ensure_astrbot_stub()
 
 import main as plugin                                  # noqa: E402 —— 复用同一套口径
 
@@ -123,7 +181,7 @@ def snapshot(path, now=None, self_id=None):
             bots.append({
                 "self_id": bot,
                 "day": datetime.fromtimestamp(start, CN_TZ).strftime("%Y-%m-%d"),
-                "today": plugin.db_audit_totals(bot, start, now),
+                "today": plugin.db_audit_totals(bot, start, now, conn=conn),
                 "today_detail": plugin.db_audit_detail(conn, bot, start, now, TOP_LIMIT),
                 "wallets": wallets_of(conn, bot),
                 "ious": ious_of(conn, bot),

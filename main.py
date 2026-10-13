@@ -556,9 +556,18 @@ def db_daily_gift_in(conn, self_id, user_id, since, now):
     return _sum_by_kind(conn, self_id, "to_id", user_id, "gift", since, now)
 
 
-def db_audit_totals(self_id, since, now):
-    """审计：当日发行量（所有正向入账）/ 送礼量 / 钱包数 / 总量。"""
-    conn = _connect()
+def db_audit_totals(self_id, since, now, conn=None):
+    """审计：当日发行量（所有正向入账）/ 送礼量 / 钱包数 / 总量。
+
+    ⚠️ 两条踩过的坑（2026-10-13 面板上真踩 ✓）：
+      1. **所有查询参数一律 `str()`** —— 库里 `self_id` 是**文本**，调用方给整数时
+         SQLite 的 `=` 不认它们是同一个值 ⇒ 全查成 0 ✗
+      2. **允许调用方给连接**（`conn=`）—— 原先它自己开连接，于是面板读**副本**时
+         它却去读**插件那份库**，结果永远是 0 ✗
+    """
+    self_id = str(self_id)
+    own = conn is None
+    conn = conn if conn is not None else _connect()
     try:
         _ensure(conn)
         def one(sql, args):
@@ -578,7 +587,8 @@ def db_audit_totals(self_id, since, now):
             "total": one("SELECT COALESCE(SUM(balance),0) FROM account WHERE self_id=?", (self_id,)),
         }
     finally:
-        conn.close()
+        if own:                       # ⚠️ 调用方给的连接**不许替它关**（关了后面全炸 ✗）
+            conn.close()
 
 
 # ── 写 ──
