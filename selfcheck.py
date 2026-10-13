@@ -1,0 +1,656 @@
+# -*- coding: utf-8 -*-
+"""愿力经济（wishonomy）· 自检 —— P1。
+
+口径（照项目习惯）：
+  * **失败就 exit 1**（真 `if` 分支，绝不"只打印不拦"）
+  * 没有断言框架、没有 fixture：一个函数一项，返回 True/False
+  * 拿**真库真事务**跑（临时目录），不是打桩模拟
+
+跑法（本机）：
+    D:\\smm-tempsparxie\\.venv\\Scripts\\python.exe D:\\sparxie\\wishonomy\\selfcheck.py
+"""
+import asyncio
+import importlib.util
+import os
+import sqlite3
+import sys
+import tempfile
+import time
+import types
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+PLUGIN = os.path.join(HERE, "main.py")
+
+BOT = "10001"          # 启用的 bot
+OTHER_BOT = "10002"    # 没启用的 bot
+ALICE = "20002"
+BOB = "20003"
+GROUP = "30001"
+GROUP2 = "30002"
+
+
+# ─────────────────────── 把 astrbot 顶层依赖打桩，再加载真模块 ───────────────────────
+
+def load_plugin_module(tmpdir):
+    api = types.ModuleType("astrbot.api")
+    event_api = types.ModuleType("astrbot.api.event")
+    star_api = types.ModuleType("astrbot.api.star")
+    root = types.ModuleType("astrbot")
+
+    class Star:
+        def __init__(self, context=None):
+            self.context = context
+
+    class _Log:
+        def info(self, *a, **k):
+            pass
+
+        def warning(self, *a, **k):
+            pass
+
+        def error(self, *a, **k):
+            pass
+
+    def llm_tool(name=None, **kwargs):
+        def deco(fn):
+            return fn
+        return deco
+
+    def hook(*a, **k):
+        return lambda fn: fn
+
+    api.AstrBotConfig = dict
+    api.logger = _Log()
+    api.star = star_api
+    api.llm_tool = llm_tool
+    star_api.Star = Star
+    star_api.Context = object
+    star_api.StarTools = types.SimpleNamespace(
+        get_data_dir=lambda name: os.path.join(tmpdir, name))
+    event_api.AstrMessageEvent = object
+    event_api.filter = types.SimpleNamespace(
+        on_llm_request=hook, on_llm_response=hook, on_agent_done=hook)
+
+    for name, mod in {
+        "astrbot": root, "astrbot.api": api, "astrbot.api.event": event_api,
+        "astrbot.api.star": star_api,
+    }.items():
+        sys.modules[name] = mod
+
+    spec = importlib.util.spec_from_file_location("wishonomy_main", PLUGIN)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["wishonomy_main"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+class Ev:
+    """最小的平台事件替身（只实现插件真的用到的那几个方法）。"""
+
+    def __init__(self, self_id=BOT, sender=ALICE, group=GROUP, name="", cron=False):
+        self._self = self_id
+        self._sender = sender
+        self._group = group
+        self._name = name
+        self._extras = {"cron_job": True} if cron else {}
+
+    def get_self_id(self):
+        return self._self
+
+    def get_sender_id(self):
+        return self._sender
+
+    def get_group_id(self):
+        return self._group
+
+    def get_sender_name(self):
+        return self._name
+
+    def get_extra(self, key=None, default=None):
+        if key is None:
+            return self._extras
+        return self._extras.get(key, default)
+
+
+CONFIG = {}
+
+TIERS = [{"cost": 1, "name": "甲档", "note": ""},
+         {"cost": 100, "name": "乙档", "note": ""},
+         {"cost": 1380, "name": "丙档", "note": ""}]
+
+
+def make_plugin(mod):
+    CONFIG.clear()
+    CONFIG.update({
+        "enabled": True,
+        "enabled_self_ids": [BOT],
+        "money_name": "愿力",
+        "mood_max_delta": 1000,
+        "mood_daily_gain": 3000,
+        "gift_daily_cap": 3000,
+        "gift_tiers": TIERS,
+    })
+    plugin = mod.Main(context=None, config=CONFIG)
+    return plugin
+
+
+def call(tool, plugin, event, **kwargs):
+    """按框架的方式调工具：插件实例与事件都当**位置参数**进 *args，参数走 kwargs。"""
+    return asyncio.run(tool(plugin, event, **kwargs))
+
+
+def call_raw(tool, plugin, event, *args):
+    return asyncio.run(tool(plugin, event, *args))
+
+
+def raw_mood(mod, user_id, delta, ref, now, cap=3000, group=GROUP, name=""):
+    conn = mod._connect()
+    try:
+        return mod.db_mood(conn, BOT, group, user_id, delta, "自检", ref, now, cap,
+                           name=name)
+    finally:
+        conn.close()
+
+
+def raw_gift(mod, giver, cost, ref, now, cap=3000, name="甲档"):
+    conn = mod._connect()
+    try:
+        return mod.db_gift(conn, BOT, GROUP, giver, cost, name, "", ref, now, cap)
+    finally:
+        conn.close()
+
+
+def try_parse(mod, src, fn_name, args):
+    """从源码里抠出一个纯函数来验（比另写一份模拟可信 ✓）。"""
+    import ast
+    tree = ast.parse(src)
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == fn_name:
+            mod_ast = ast.Module(body=[node], type_ignores=[])
+            namespace = {}
+            exec(compile(mod_ast, "<extract>", "exec"), namespace)   # noqa: S102
+            return namespace[fn_name](*args)
+    raise AssertionError("源码里找不到 %s" % fn_name)
+
+
+def ledger_of(mod, user_id, kind=None):
+    conn = mod._connect()
+    try:
+        if kind:
+            rows = conn.execute("SELECT * FROM ledger WHERE self_id=? AND from_id=? AND kind=?",
+                                (BOT, user_id, kind)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM ledger WHERE self_id=? AND (from_id=? OR to_id=?)",
+                                (BOT, user_id, user_id)).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def balance_of(mod, user_id):
+    return mod.db_snapshot(BOT, user_id)["balance"]
+
+
+# ─────────────────────────────── 各项自检 ───────────────────────────────
+
+def t01_schema(mod, _plugin):
+    """库结构：四张表 + user_version = 1 + WAL。"""
+    conn = mod._connect()
+    try:
+        names = {r["name"] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        journal = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        conn.close()
+    need = {"account", "ledger", "iou", "credit_event", "meta"}
+    if not need.issubset(names):
+        print("      缺表:", need - names)
+        return False
+    if version != 1 or str(journal).lower() != "wal":
+        print("      user_version=%s journal=%s" % (version, journal))
+        return False
+    return True
+
+
+def t02_migration_idempotent(mod, _plugin):
+    """迁移能在**已有数据**的库上反复跑，且不动数据。"""
+    now = int(time.time())
+    raw_mood(mod, ALICE, 7, "mig-1", now)
+    before = balance_of(mod, ALICE)
+    conn = mod._connect()
+    try:
+        mod._migrate(conn)          # 再跑一次
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+    finally:
+        conn.close()
+    return before == 7 and version == 1
+
+
+def t03_mood_duplicate_ref(mod, _plugin):
+    """同一笔（同 ref）不给第二次入账。"""
+    now = int(time.time())
+    n0 = len(ledger_of(mod, BOB))
+    raw_mood(mod, BOB, 5, "dup-1", now)
+    again = raw_mood(mod, BOB, 5, "dup-1", now)
+    return (again.get("duplicated") is True
+            and len(ledger_of(mod, BOB)) == n0 + 1
+            and balance_of(mod, BOB) == 5)
+
+
+def t04_daily_gain_cap(mod, _plugin):
+    """每人每日净增上限（按人算，不按群）。"""
+    now = int(time.time())
+    first = raw_mood(mod, ALICE, 900, "cap-a", now, cap=1000)
+    blocked = raw_mood(mod, ALICE, 200, "cap-b", now, cap=1000, group=GROUP2)
+    ok_small = raw_mood(mod, ALICE, 100, "cap-c", now, cap=1000, group=GROUP2)
+    over = raw_mood(mod, ALICE, 1, "cap-d", now, cap=1000)
+    return (first.get("ok") is True
+            and blocked.get("ok") is False and blocked.get("code") == "daily_gain_cap"
+            and ok_small.get("ok") is True
+            and over.get("ok") is False and balance_of(mod, ALICE) == 1000)
+
+
+def t05_negative_balance_impossible(mod, _plugin):
+    """能花光余额的动作只有一个（送礼）：花不起就失败，余额永远不为负。"""
+    now = int(time.time())
+    raw_mood(mod, BOB, 3, "neg-1", now)
+    result = raw_gift(mod, BOB, 500, "neg-2", now)
+    snap = mod.db_snapshot(BOT, BOB)
+    return (result.get("ok") is False and result.get("code") == "insufficient"
+            and snap["balance"] == 3 and snap["spent"] == 0)
+
+
+def t06_ref_collision_across_kind(mod, _plugin):
+    """幂等键按 (kind, ref) —— 不同类别的同名字符串互不影响。"""
+    now = int(time.time())
+    raw_mood(mod, ALICE, 1, "same-ref-seed", now)      # 先让她账上有 1，才送得起
+    gift = raw_gift(mod, ALICE, 1, "same-ref", now)
+    mood = raw_mood(mod, ALICE, 2, "same-ref", now)
+    return gift.get("ok") is True and mood.get("ok") is True
+
+
+def t07_tools_never_return_none_or_nonstr(mod, plugin):
+    """所有工具在「畸形输入 + 正常输入」下都返回非空字符串。"""
+    ev = Ev()
+    cases = [
+        (mod.wish_mood, {"who": "我", "amount": 5, "reason": "自检"}),
+        (mod.wish_mood, {"who": "我", "amount": -5, "reason": "自检"}),
+        (mod.wish_mood, {"who": "我", "amount": -5}),                 # 缺理由
+        (mod.wish_mood, {"who": "不存在的人", "amount": 5, "reason": "x"}),
+        (mod.wish_mood, {"who": "我", "amount": 99999, "reason": "x"}),  # 超上限
+        (mod.wish_mood, {"who": "我", "amount": "abc", "reason": "x"}),  # 非数字
+        (mod.wish_mood, {}),                                          # 空
+        (mod.wish_check, {}),
+        (mod.wish_check, {"who": "我"}),
+        (mod.wish_check, {"who": "查无此人"}),
+        (mod.wish_gift, {"who": "我", "tier": "甲档"}),
+        (mod.wish_gift, {"who": "我", "tier": "999"}),
+        (mod.wish_gift, {"who": "我"}),
+        (mod.wish_audit, {}),
+        (mod.wish_audit, {"day": "昨天"}),
+    ]
+    bad = []
+    for tool, kwargs in cases:
+        out = call(tool, plugin, ev, **kwargs)
+        if not isinstance(out, str) or not out.strip():
+            bad.append((tool.__name__, kwargs, repr(out)[:60]))
+    if bad:
+        for item in bad:
+            print("      返回不是非空字符串:", item)
+        return False
+    return True
+
+
+def t08_tool_guard_swallows_exceptions(mod, _plugin):
+    """兜底：抛异常 / 返回 None 都不会漏出去（框架对 None 有特殊语义）。"""
+    @mod.tool_guard
+    async def boom(*a, **k):
+        raise RuntimeError("炸了")
+
+    @mod.tool_guard
+    async def none_tool(*a, **k):
+        return None
+
+    out1 = asyncio.run(boom())
+    out2 = asyncio.run(none_tool())
+    return (isinstance(out1, str) and out1.strip()
+            and isinstance(out2, str) and out2.strip())
+
+
+def t09_identity_gate(mod, plugin):
+    """身份闸门：四条，任何一条不满足都当作「不是我管的账」。"""
+    cases = [
+        (Ev(self_id=OTHER_BOT), "别的 bot"),
+        (Ev(sender=BOT), "发送者就是 bot 自己"),
+        (Ev(sender=""), "拿不到发送者"),
+        (Ev(cron=True), "定时任务轮"),
+    ]
+    for ev, why in cases:
+        if plugin.identity(ev) is not None:
+            print("      闸门漏了:", why)
+            return False
+    return plugin.identity(Ev()) == (BOT, ALICE)
+
+
+def t10_self_mood_rejected(mod, plugin):
+    """她自己给自己记愿力 —— 工具与身份两道都要挡住。"""
+    ev = Ev()
+    before = balance_of(mod, BOT)
+    out = call(mod.wish_mood, plugin, ev, who="你", amount=100, reason="自检")
+    after = balance_of(mod, BOT)
+    if after != before:
+        print("      工具没拦住自记：%s → %s" % (before, after))
+        return False
+    if "不" not in out:
+        print("      工具没说清为什么不行:", out)
+        return False
+    # 连底层也拦：把 who 写成 bot 自己，账本**一分不许动**（自家钱包既不增也不减）
+    now = int(time.time())
+    res = raw_mood(mod, BOT, 50, "self-1", now)
+    conn = mod._connect()
+    try:
+        bot_balance = conn.execute(
+            "SELECT COALESCE(SUM(balance),0) AS s FROM account WHERE self_id=? AND user_id=?",
+            (BOT, BOT)).fetchone()["s"]
+        transfers = conn.execute(
+            "SELECT COUNT(*) AS c FROM ledger WHERE self_id=? AND kind='mood'",
+            (BOT,)).fetchone()["c"]
+    finally:
+        conn.close()
+    if int(bot_balance) != 0:
+        print("      自家钱包被写进了:", bot_balance)
+        return False
+    if balance_of(mod, BOT) != before:
+        print("      自家余额变了:", before, "→", balance_of(mod, BOT))
+        return False
+    if res.get("code") != "self_mood" or res.get("ok") is not False:
+        print("      底层没硬拦自记:", res)
+        return False
+    return True
+
+
+def t11_gift_flow(mod, plugin):
+    """送礼：愿力从送礼人进 bot 的账；不够就送不成；档位名要能认。"""
+    ev = Ev(sender=ALICE, name="小甲")
+    mod.learn_name(BOT, GROUP, ALICE, "小甲")
+    now = int(time.time())
+    raw_mood(mod, ALICE, 200, "gift-seed", now)
+    before_bot = balance_of(mod, BOT)
+    out_ok = call(mod.wish_gift, plugin, ev, who="小甲", tier="乙档")
+    out_poor = call(mod.wish_gift, plugin, ev, who="小甲", tier="丙档")
+    after_bot = balance_of(mod, BOT)
+    return (after_bot == before_bot + 100
+            and balance_of(mod, ALICE) == 100
+            and "收下" in out_ok
+            and "送不起" in out_poor)
+
+
+def t12_name_resolution(mod, plugin):
+    """认人：拼音名/号码都能找到；同名多人就不猜。"""
+    ev = Ev(sender=BOB, name="小乙")
+    mod.learn_name(BOT, GROUP, BOB, "小乙")
+    mod.learn_name(BOT, GROUP, ALICE, "小乙")     # 故意重名
+    ambiguous = asyncio.run(mod._who_to_id(plugin, ev, "小乙", GROUP))
+    exact = asyncio.run(mod._who_to_id(plugin, ev, str(BOB), GROUP))
+    me = asyncio.run(mod._who_to_id(plugin, ev, "我", GROUP))
+    you = asyncio.run(mod._who_to_id(plugin, ev, "你", GROUP))
+    mod.forget_names()
+    mod.learn_name(BOT, GROUP, BOB, "小乙")
+    single = asyncio.run(mod._who_to_id(plugin, ev, "小乙", GROUP))
+    return (ambiguous is None and exact == BOB and me == BOB and you == BOT
+            and single == BOB)
+
+
+def t13_audit_numbers(mod, plugin):
+    """审计口径：发行 / 送礼 / 钱包数 / 总量对得上。"""
+    out = call(mod.wish_audit, plugin, Ev())
+    conn = mod._connect()
+    try:
+        wallets = conn.execute("SELECT COUNT(*) AS c FROM account WHERE self_id=?",
+                               (BOT,)).fetchone()["c"]
+        total = conn.execute("SELECT COALESCE(SUM(balance),0) AS s FROM account WHERE self_id=?",
+                             (BOT,)).fetchone()["s"]
+        gifts = conn.execute("SELECT COALESCE(SUM(amount),0) AS s FROM ledger "
+                             "WHERE self_id=? AND kind='gift'", (BOT,)).fetchone()["s"]
+    finally:
+        conn.close()
+    return (str(wallets) in out and str(total) in out and str(gifts) in out
+            and "钱包" in out and "送礼" in out)
+
+
+def t14_db_history_readonly(mod, _plugin):
+    """流水查询：能读出条目；查一个没记录的人不建户（读不写库）。"""
+    now = int(time.time())
+    raw_mood(mod, ALICE, 3, "hist-1", now)
+    ghost = "29999"
+    lines = mod.db_history(BOT, ALICE, 3)
+    snap = mod.db_snapshot(BOT, ghost)
+    conn = mod._connect()
+    try:
+        exists = conn.execute("SELECT COUNT(*) AS c FROM account WHERE self_id=? AND user_id=?",
+                              (BOT, ghost)).fetchone()["c"]
+    finally:
+        conn.close()
+    return len(lines) >= 1 and snap["exists"] is False and exists == 0
+
+
+def t15_day_boundary_is_beijing(mod, _plugin):
+    """分日按北京时间（服务器是 UTC）—— 差 8 小时不能算错。"""
+    import datetime as dt
+    utc_midnight = dt.datetime(2026, 10, 13, 16, 30, tzinfo=dt.timezone.utc).timestamp()
+    start = mod.day_start(int(utc_midnight))
+    got = dt.datetime.fromtimestamp(start, dt.timezone(dt.timedelta(hours=8)))
+    return (got.year, got.month, got.day, got.hour, got.minute) == (2026, 10, 14, 0, 0)
+
+
+def t16_amount_and_due_parsing(mod, _plugin):
+    """数字归一与期限解析：畸形输入一律 None（不猜）。"""
+    good = (mod.normalize_amount(5) == 5 and mod.normalize_amount("12") == 12
+            and mod.normalize_amount(3.0) == 3)
+    bad = all(mod.normalize_amount(x) is None
+              for x in (0, -3, 2.5, "abc", "", None, True, "1e3"))
+    now = 1_700_000_000
+    due_days = mod.parse_due("3", now) == now + 3 * 86400
+    due_blank = mod.parse_due("", now) is None
+    due_junk = mod.parse_due("下周", now) is None
+    due_date = isinstance(mod.parse_due("2026-12-31", now), int)
+    return good and bad and due_days and due_blank and due_junk and due_date
+
+
+def t17_transaction_rollback(mod, _plugin):
+    """失败的分支不许留下半笔账（rollback 真的生效）。"""
+    now = int(time.time())
+    before = len(ledger_of(mod, BOB))
+    raw_mood(mod, BOB, 999999, "rollback-1", now)         # 余额不足
+    raw_mood(mod, BOB, 5000, "rollback-2", now, cap=100)  # 超日上限
+    return len(ledger_of(mod, BOB)) == before
+
+
+def t18_gift_daily_cap(mod, _plugin):
+    """送礼也有单人单日上限（防互相刷礼）。"""
+    now = int(time.time())
+    raw_mood(mod, BOB, 500, "giftcap-seed", now)
+    first = raw_gift(mod, BOB, 300, "giftcap-1", now, cap=300)
+    second = raw_gift(mod, BOB, 1, "giftcap-2", now, cap=300)
+    return (first.get("ok") is True and second.get("ok") is False
+            and second.get("code") == "daily_gift_cap")
+
+
+def t19_external_write_path_missing(mod, _plugin):
+    """写入口只走工具：模块不暴露任何「用户可直接调」的写函数名。"""
+    banned = [n for n in dir(mod) if n.startswith(("set_balance", "add_balance",
+                                                   "credit_user", "grant_"))
+              and callable(getattr(mod, n))]
+    return not banned
+
+
+def t20_json_safe_defaults(mod, _plugin):
+    """配置缺席/畸形时不能炸（默认值兜底）。"""
+    tiers = mod.resolve_tiers({"gift_tiers": "[{\"cost\": 7, \"name\": \"丁档\"}]"})
+    junk = mod.resolve_tiers({"gift_tiers": "不是 JSON"})
+    empty = mod.resolve_tiers({})
+    return (tiers == [{"cost": 7, "name": "丁档", "note": ""}]
+            and junk == [] and empty == [] and mod.tier_by_cost(tiers, 7)["name"] == "丁档")
+
+
+def t21_source_hygiene(mod, _plugin):
+    """源码卫生：没有打印调试残留、没有硬编码的 bot 号/群号、工具不 return None。"""
+    with open(PLUGIN, encoding="utf-8") as handle:
+        src = handle.read()
+    if any(line.strip().startswith("print(") for line in src.splitlines()):
+        print("      源码里有 print(")
+        return False
+    for token in ("2713420580", "1609770237", "1076751753", "870863632"):
+        if token in src:
+            print("      源码里出现私域号码:", token)
+            return False
+    # 只认「写在工具函数体里的 return None」（框架会把 None 当成「工具已直接发消息」⇒ 结束本轮）。
+    # ⚠️ 别的函数返回 None 是正常的（解析不出来就该返回空）—— 不许一刀切地禁掉 ✓
+    body = src.split("@llm_tool", 1)[-1]
+    for chunk in body.split("@llm_tool")[1:]:
+        head, _sep, _tail = chunk.partition("\n\n\n")
+        if "return None" in head:
+            print("      工具函数体里有 return None")
+            return False
+    for name in ("wish_check", "wish_mood", "wish_gift", "wish_audit"):
+        if "async def %s(" % name not in src:
+            print("      工具不见了:", name)
+            return False
+    return True
+
+
+def t22_sum_by_kind_windows(mod, _plugin):
+    """从源码里抠出护栏求和函数来验：类别 / 方向 / 时间窗都要分得清。"""
+    with open(PLUGIN, encoding="utf-8") as handle:
+        src = handle.read()
+    now = int(time.time())
+    raw_mood(mod, ALICE, 50, "sum-1", now)
+    conn = mod._connect()
+    try:
+        before = try_parse(mod, src, "_sum_by_kind",
+                           (conn, BOT, "to_id", ALICE, "mood", now - 86400, now))
+        after = try_parse(mod, src, "_sum_by_kind",
+                          (conn, BOT, "to_id", ALICE, "mood", now + 60, now + 120))
+        gift_side = try_parse(mod, src, "_sum_by_kind",
+                              (conn, BOT, "to_id", ALICE, "gift", now - 86400, now))
+        try:
+            try_parse(mod, src, "_sum_by_kind",
+                      (conn, BOT, "balance; DROP TABLE ledger", ALICE, "mood", 0, now))
+            print("      护栏求和没挡住拼接参数")
+            return False
+        except ValueError:
+            pass
+        return before == 50 and after == 0 and gift_side == 0
+    finally:
+        conn.close()
+
+
+def t23_no_prompt_injection(mod, _plugin):
+    """缓存纪律：账本**绝不往每轮请求里注入文本**（注入会把后面的历史缓存全废掉）。
+
+    做法上只允许「按需查询」（工具）；一旦有人挂 on_llm_request 去改 prompt、
+    或往 extra_user_content_parts 里塞东西，这里当场红 ✓
+    """
+    with open(PLUGIN, encoding="utf-8") as handle:
+        src = handle.read()
+    banned = ("on_llm_request", "extra_user_content_parts", "system_prompt",
+              "request.prompt", "req.prompt")
+    hits = [token for token in banned if token in src]
+    if hits:
+        print("      源码里出现注入相关写法:", hits)
+        return False
+    if "@filter" in src:
+        print("      源码里挂了 filter 钩子（P1 不该有）")
+        return False
+    # 工具说明必须是**常量**：docstring 里不许出现随轮次变化的内容
+    import ast
+    tree = ast.parse(src)
+    fn_by_name = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fn_by_name[node.name] = node
+    for name in ("wish_check", "wish_mood", "wish_gift", "wish_audit"):
+        node = fn_by_name.get(name)
+        if node is None:
+            print("      找不到工具:", name)
+            return False
+        doc = ast.get_docstring(node) or ""
+        if not doc.strip():
+            print("      工具没有说明（模型会看不懂）:", name)
+            return False
+        # docstring 里不许出现格式化占位（那就会变成每轮不同的文本）
+        if "%s" in doc or "{}" in doc or "{0}" in doc:
+            print("      工具说明里有格式化占位（会变成每轮不同的前缀）:", name)
+            return False
+    return True
+
+
+TESTS = [
+    ("R01 库结构 / user_version / WAL", t01_schema),
+    ("R02 迁移可重入（带数据）", t02_migration_idempotent),
+    ("R03 幂等：同 ref 不重复入账", t03_mood_duplicate_ref),
+    ("R04 每人每日净增上限（跨群同一个人）", t04_daily_gain_cap),
+    ("R05 余额永不为负", t05_negative_balance_impossible),
+    ("R06 幂等键按 (kind, ref)", t06_ref_collision_across_kind),
+    ("R07 工具一律返回非空字符串", t07_tools_never_return_none_or_nonstr),
+    ("R08 工具兜底吞异常 / 不吃 None", t08_tool_guard_swallows_exceptions),
+    ("R09 身份闸门四条", t09_identity_gate),
+    ("R10 不许给自己记愿力", t10_self_mood_rejected),
+    ("R11 送礼闭环 + 愿力不足", t11_gift_flow),
+    ("R12 认人：昵称 / 号码 / 重名", t12_name_resolution),
+    ("R13 审计口径对得上", t13_audit_numbers),
+    ("R14 查流水不建户（读不写库）", t14_db_history_readonly),
+    ("R15 分日按北京时间", t15_day_boundary_is_beijing),
+    ("R16 数字 / 期限解析不猜", t16_amount_and_due_parsing),
+    ("R17 失败分支真回滚", t17_transaction_rollback),
+    ("R18 送礼单人单日上限", t18_gift_daily_cap),
+    ("R19 没有对外写入口", t19_external_write_path_missing),
+    ("R20 配置畸形不炸", t20_json_safe_defaults),
+    ("R21 源码卫生（无 print / 无私域号 / 无 return None）", t21_source_hygiene),
+    ("R22 护栏求和：类别 / 方向 / 时间窗", t22_sum_by_kind_windows),
+    ("R23 缓存纪律：不注入 prompt / 工具说明是常量", t23_no_prompt_injection),
+]
+
+
+def reset_state(mod):
+    """每项自检开始前清空账本与名字缓存 —— 各项必须**互不依赖**（顺序换了也要全绿 ✓）。"""
+    conn = mod._connect()
+    try:
+        for table in ("ledger", "account", "iou", "credit_event"):
+            conn.execute("DELETE FROM %s" % table)
+    finally:
+        conn.close()
+    mod.forget_names()
+
+
+def main():
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    passed, failed = [], []
+    with tempfile.TemporaryDirectory(prefix="wishonomy-selfcheck-") as tmpdir:
+        mod = load_plugin_module(tmpdir)
+        mod.set_db_path(os.path.join(tmpdir, "ledger.db"))
+        plugin = make_plugin(mod)
+        print("=" * 66)
+        print("愿力经济（wishonomy）· P1 自检")
+        print("账本:", mod.resolve_db_path())
+        print("=" * 66)
+        for name, fn in TESTS:
+            reset_state(mod)
+            try:
+                ok = bool(fn(mod, plugin))
+            except Exception as exc:            # noqa: BLE001 —— 自检要报出崩在哪一项
+                ok = False
+                print("      异常: %r" % (exc,))
+            (passed if ok else failed).append(name)
+            print("  [%s] %s" % ("OK  " if ok else "FAIL", name))
+        print("-" * 66)
+        print("通过 %d 项 / 失败 %d 项" % (len(passed), len(failed)))
+        if failed:
+            print("失败项:", "; ".join(failed))
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

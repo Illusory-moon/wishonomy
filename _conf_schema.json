@@ -1,0 +1,55 @@
+{
+  "enabled": {
+    "description": "启用愿力经济",
+    "type": "bool",
+    "default": false
+  },
+  "enabled_self_ids": {
+    "description": "启用的 bot ID",
+    "type": "text",
+    "default": "",
+    "hint": "只填写明确启用的 bot ID，多个用逗号分隔；留空时任何 bot 都不会启用（工具是全局注册的，必须自己把门）。"
+  },
+  "money_name": {
+    "description": "这套账本里货币的叫法",
+    "type": "text",
+    "default": "愿力",
+    "hint": "只影响文案，不影响任何逻辑。给别的世界观用时改这里即可。"
+  },
+  "credit_name": {
+    "description": "信誉分的叫法",
+    "type": "text",
+    "default": "信誉分"
+  },
+  "db_path": {
+    "description": "账本文件路径（留空 = 插件数据目录下的 ledger.db）",
+    "type": "text",
+    "default": ""
+  },
+  "mood_max_delta": {
+    "description": "单次收/分愿力的绝对值上限",
+    "type": "int",
+    "default": 1000
+  },
+  "mood_daily_gain": {
+    "description": "每个人每日净增上限（按人算，不按群）",
+    "type": "int",
+    "default": 3000
+  },
+  "issue_global_daily": {
+    "description": "全局每日发行上限（0 = 不设；超了只记日志、不拦）",
+    "type": "int",
+    "default": 50000
+  },
+  "gift_daily_cap": {
+    "description": "送礼：单人单日上限",
+    "type": "int",
+    "default": 3000
+  },
+  "gift_tiers": {
+    "description": "礼物档位（JSON 数组）",
+    "type": "text",
+    "default": "[{\"cost\": 1, \"name\": \"低档\", \"note\": \"\"}, {\"cost\": 100, \"name\": \"中档\", \"note\": \"\"}, {\"cost\": 1380, \"name\": \"高档\", \"note\": \"\"}]",
+    "hint": "形如 [{\"cost\": 1, \"name\": \"某物\"}]。名字请按自己世界观填 —— 通用插件里不写具体作品的名词。"
+  }
+}
