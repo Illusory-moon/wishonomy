@@ -515,8 +515,15 @@ def brief_table(bot, folded=False):
 
     三层「展开」，全是**纯 CSS**（`:target` 控 display，零 JS ⇒ 不产生请求 ⇒ 不跳顶部 ✓）：
       · **再看被注视** —— 主人真正的痛点（「大多都是被注视」✗）：默认只显示有内容的 ✓
-      · **再看更早的** —— 每次放开 `BRIEF_STAGE` 行（服务端一次就读够了，所以也是**零请求** ✓）
-      · 真读到头时给一个 `?n=` 兜底（那是要重新查库的，只有这一条会刷新 ✓）
+      · **再看更早的** —— 每次放开 `BRIEF_STAGE` 行（服务端一次就读够 400 行 ⇒ 也是零请求 ✓）
+      · 真读到头时给一个 `?n=` 兜底（那要重新查库，只有这一条会刷新 ✓）
+
+    ⚠️ 2026-10-14 真机 bug（主人报「两个按钮同时出现，点完一个就不能点另一个」✗）：
+       原来是**把按钮放在整张表下面** ⇒ 但 `:target~tr` **只能管到后面的兄弟** ✗
+       （表后面啥也没有）⇒ 点第二个当然没反应；而按钮之间又互相看不到 ⇒ 两个一起显出来 ✗
+       ⇒ 修：**锚点与按钮夹在"批"与"批"之间** —— 点一次展开下一批、
+          **并把它自己收起来**（`#more-N:target~tr.anchor.a{n}` 隐藏 ✓），
+          所以同一个时刻永远只看得见一颗 ✓
     """
     groups = bot["brief"]
     if not groups:
@@ -525,30 +532,27 @@ def brief_table(bot, folded=False):
     total = bot.get("ledger_total") or 0
     shown = bot.get("brief_count", 0)
     stages = max(1, (len(groups) + BRIEF_STAGE - 1) // BRIEF_STAGE)
-    hidden_after = shown < total          # 库里还有更早的 ⇒ 最后一屏给 `?n=` 兜底 ✓
-    last = stages + (1 if hidden_after else 0)
+    hidden_after = shown < total          # 库里还有更早的 ⇒ 最后给 `?n=` 兜底 ✓
+    has_attention = any(g["kind"] == "attention" for g in groups)
 
     body = []
-    has_attention = False
     for index, group in enumerate(groups):
-        stage = index // BRIEF_STAGE + 1
+        if index and index % BRIEF_STAGE == 0:
+            stage = index // BRIEF_STAGE      # 第 stage 批**之前** ⇒ 放"开这一批"的按钮
+            body.append(
+                '<tr class="anchor a%d" id="more-%d"><td colspan="6">'
+                '<a class="btn" href="#more-%d">⬇ 再看更早的 %d 行</a>'
+                '<span class="mut">已看到第 %d 行 · 账上共 %d 笔 · 点一下原地展开 ✓</span>'
+                '</td></tr>' % (stage, stage, stage, BRIEF_STAGE, index, total))
         item = group["items"][0]
         quiet = group["kind"] == "attention"
-        has_attention = has_attention or quiet
         classes = []
         if quiet:
             classes.append("quiet")
-        if stage > 1:
+        if index >= BRIEF_STAGE:
             classes.append("stage")
-            classes.append("s%d" % stage)
+            classes.append("s%d" % (index // BRIEF_STAGE + 1))
         attr = ' class="%s"' % " ".join(classes) if classes else ""
-        # 每一屏前面插一个锚点 + 一颗按钮（点它 = 展开下一屏，**同页、不刷新** ✓）
-        if stage > 1 and index % BRIEF_STAGE == 0:
-            body.append('<tr class="anchor" id="more-%d"><td colspan="6">'
-                        '<a class="btn" href="#more-%d">⬇ 再看更早的 %d 行</a>'
-                        '<span class="mut">（已看到第 %d 行，账上共 %d 笔）</span>'
-                        '</td></tr>'
-                        % (stage, min(stage + 1, last), BRIEF_STAGE, index, total))
         if quiet and group["count"] > 1:
             inner = "".join(
                 '<tr class="sub">%s</tr>' % "".join(
@@ -570,7 +574,10 @@ def brief_table(bot, folded=False):
 
     foot = []
     if has_attention:
-        foot.append('<a class="btn" href="#attention" id="attention">👁 再看被注视</a>')
+        # ⚠️ 这个锚点必须在**开头**（`~tr.quiet` 只管后面 ✗）⇒ 放进表体第一行 ✓
+        body.insert(0, '<tr class="anchor" id="attention"><td colspan="6">'
+                       '<a class="btn ghost" href="#top">收起被注视</a></td></tr>')
+        foot.append('<a class="btn" href="#attention">👁 再看被注视</a>')
     foot.append('<span class="mut">已显示最近 <b>%d</b> 笔中的前 <b>%d</b> 笔'
                 '（账上共 <b>%d</b> 笔）</span>'
                 % (shown, min(shown, BRIEF_STAGE * stages), total))
@@ -578,23 +585,32 @@ def brief_table(bot, folded=False):
         nxt = min(int(bot.get("limit") or BRIEF_LIMIT) * 3, BRIEF_MAX)
         foot.append('<a class="btn ghost" href="?n=%d">读更早的（%d 行，会刷新一次）</a>'
                     % (nxt, nxt))
-    return ('<div class="tw"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
+    return ('<div class="tw" id="top"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
             '<div class="foot">%s</div>'
             % ("".join("<th%s>%s</th>" % (' class="num"' if i in (0, 4) else "", h)
                        for i, h in enumerate(head)), "".join(body), "".join(foot)))
 
 
 def stage_css(stages=6):
-    """「再看更早的 / 再看被注视」用的**纯 CSS 展开规则**（零 JS ⇒ 不刷新、不跳顶部 ✓）。
+    """展开用的**纯 CSS 规则**（零 JS ⇒ 不刷新、不跳顶部 ✓）。
 
-    原理：锚点 `#more-N:target` 之后的 `.stage` 行显示出来；`#attention:target` 之后
-    的 `.quiet`（被注视）行显示出来。都是 `display` 切换 ✓
+    ⚠️ 这里踩过一次真 bug（2026-10-14 主人报「两个按钮同时出现、点完一个另一个点不动」✗）：
+       第一版把按钮**放在整张表下面**，还用"自己藏自己"—— 而 `:target~tr` **只管后面的兄弟** ✗
+       ⇒ 表后面啥也没有 ⇒ 点第二颗没反应；而几颗按钮互相看不见 ⇒ 一起显出来 ✗
+       ⇒ 现在改成**链式**：第 n 颗按钮**夹在第 n 批之前**，
+          ① 默认全藏 ② 只有"点了第 n−1 颗"才冒出第 n 颗 ③ 点了自己就收起自己 ✓
+          ⇒ **同一时刻永远只看得见一颗** ✓
     """
-    rules = [".stage{display:none}", ".quiet{display:none}"]
-    for stage in range(2, stages + 1):
-        rules.append("#more-%d:target~tr.stage{display:table-row}" % stage)
-    for stage in range(2, stages):
-        rules.append("#more-%d:target~tr.s%d{display:none}" % (stage, stage + 1))
+    rules = [".stage{display:none}", ".quiet{display:none}", "tr.anchor{display:none}"]
+    for stage in range(1, stages + 1):
+        # 点了第 n 颗：第 n+1 批的行出现、第 n+1 颗按钮出现、这 n 颗自己收起来 ✓
+        rules.append("#more-%d:target~tr.s%d{display:table-row}" % (stage, stage + 1))
+        rules.append("#more-%d:target~tr.a%d{display:table-row}" % (stage, stage + 1))
+        rules.append("#more-%d:target~tr.a%d{display:none}" % (stage, stage))
+        rules.append("#more-%d:target~tr.a%d{display:none}" % (stage, stage - 1))
+    if stages < 1:
+        rules = rules[:3]
+    # 被注视：锚点在**表体第一行** ⇒ 后面的 .quiet 才管得到 ✓
     rules.append("#attention:target~tr.quiet{display:table-row}")
     rules.append('.anchor td,.foot{text-align:center;padding:10px 8px;background:var(--soft-bg);'
                  'border-top:1px solid var(--line)}')

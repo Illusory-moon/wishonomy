@@ -371,17 +371,25 @@ def t11_fold_attention(env, _unused):
     if html_out.count('<tr class="fold">') != 0:
         print("      还在用老的 fold 行（应当改用 quiet + CSS 展开）")
         return False
-    # 纯 CSS 展开规则：要有 .stage/.quiet 默认藏、:target 显示（**不许有 <script>** ✗）
+    # 纯 CSS 展开规则：批行与按钮**默认都藏**、`:target` 才放出来（**不许有 <script>** ✗）
+    # ⚠️ 2026-10-14 真 bug 的回归：按钮必须**链式**（第 n 颗只由"点了第 n−1 颗"放出，
+    #    点了自己就收起）⇒ 同一时刻**只看得见一颗** ✗（主人报过"两颗一起出现、点不动"✓）
     css = env.panel.stage_css(6)
     for token in (".stage{display:none}", ".quiet{display:none}",
-                  "#more-2:target~tr.stage", "#attention:target~tr.quiet"):
+                  "tr.anchor{display:none}",
+                  "#more-1:target~tr.s2", "#more-1:target~tr.a2",
+                  "#more-1:target~tr.a1{display:none}",
+                  "#more-2:target~tr.a2{display:none}",
+                  "#more-2:target~tr.a3{display:table-row}",
+                  "#attention:target~tr.quiet"):
         if token not in css:
             print("      CSS 规则缺 %r" % token)
             return False
     if "<script" in css or "onclick" in css:
         print("      展开用了 JS ✗（必须纯 CSS）")
         return False
-    # 分屏：够多行时要有「再看更早的」锚点按钮
+    # 分屏：够多行时要有「再看更早的」锚点按钮；**被注视的锚点必须在表体里**
+    # （`~` 只管后面的兄弟 ⇒ 放表尾就永远展开不了 ✗）
     many = [{"kind": "attention" if i % 2 else "mood", "count": 1, "sum": 1,
              "time": "10-14 21:00", "last_time": "10-14 21:00",
              "items": [{"time": "10-14 21:00", "kind": "attention", "from": "sys",
@@ -389,8 +397,11 @@ def t11_fold_attention(env, _unused):
             for i in range(130)]
     big = env.panel.brief_table({"brief": many, "brief_count": 130, "ledger_total": 130,
                                 "limit": 400})
-    if "再看更早的" not in big or 'id="more-2"' not in big:
+    if "再看更早的" not in big or 'id="more-1"' not in big:
         print("      没给分屏展开的锚点按钮")
+        return False
+    if '<tr class="anchor" id="attention">' not in big:
+        print("      被注视的锚点没在表体里（放表尾就展开不了 ✗）")
         return False
     if "<script" in big:
         print("      页面里出现了 <script> ✗")
