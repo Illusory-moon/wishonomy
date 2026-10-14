@@ -1529,6 +1529,56 @@ def t50_spend_wording(mod, _plugin):
     return True
 
 
+def t51_learn_names(mod, plugin):
+    """**按昵称认人**必须真的能用（主人 2026-10-15 让本鱼补的 ✓）
+
+    ⚠️ 病根：`learn_name()` 原来**一个调用点都没有** ✗ ⇒ 内存里的 `_NAMES` 永远是空的
+       ⇒ `lookup_names()` / `_who_to_id()`（把「花奈咪」解成 QQ 号）永远查不到 ✗
+       ⇒ 她说「给某某某 5 愿力」时那条路是**死的** ✗
+    ⇒ 这条自检**真走一遍注入钩子**（不是只调 `learn_name` 自证 ✓），
+      再真调工具那条路（`_display_name` 是所有工具共用的取名字口 ✓）
+    """
+    class Req:
+        def __init__(self):
+            self.system_prompt = "人格与规矩"
+            self.prompt = "本轮消息"
+            self.extra_user_content_parts = []
+
+    mod.forget_names()                                   # 自检之间别互相污染 ✓
+    now = int(time.time())
+    raw_mood(mod, ALICE, 20, "named-seed", now)
+    ev = Ev(sender=ALICE, name="小甲")
+    asyncio.run(plugin.inject_money(ev, Req()))          # 真走一轮注入 ⇒ 应顺手记下名字 ✓
+    if mod.lookup_names(BOT, GROUP, "小甲") != [(ALICE, "小甲")]:
+        print("      走完一轮注入，按昵称还是查不到:", mod.lookup_names(BOT, GROUP, "小甲"))
+        return False
+    if asyncio.run(mod._who_to_id(plugin, ev, "小甲", GROUP)) != ALICE:
+        print("      按昵称解不出 QQ 号:", asyncio.run(mod._who_to_id(plugin, ev, "小甲", GROUP)))
+        return False
+    if asyncio.run(mod._who_to_id(plugin, ev, ALICE, GROUP)) != ALICE:
+        print("      按号码解不出:", asyncio.run(mod._who_to_id(plugin, ev, ALICE, GROUP)))
+        return False
+    if asyncio.run(mod._who_to_id(plugin, ev, "我", GROUP)) != ALICE or \
+            asyncio.run(mod._who_to_id(plugin, ev, "你", GROUP)) != BOT:
+        print("      「我 / 你」解错了")
+        return False
+    if asyncio.run(mod._who_to_id(plugin, ev, "查无此人", GROUP)) is not None:
+        print("      不存在的名字居然解出了人 ✗")
+        return False
+    if mod.lookup_names(BOT, GROUP2, "小甲"):            # 名字缓存按会话隔离 ✓
+        print("      名字串群了 ✗")
+        return False
+    mod.forget_names()                                   # 工具那条路也要记名 ✓
+    mod_call = call(mod.wish_check, plugin, Ev(sender=ALICE, name="小甲"), who="我")
+    if "小甲" not in str(mod_call):
+        print("      工具取名字没取到:", str(mod_call)[:40])
+        return False
+    if not mod.lookup_names(BOT, GROUP, "小甲"):
+        print("      工具那条路没把名字记下 ✗")
+        return False
+    return True
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1580,6 +1630,7 @@ TESTS = [
     ("R48 她读得到的文本里没有装饰符号（日结口径也在里面）", t48_no_marks_in_visible_text),
     ("R49 日结口径：只清她自己 + 防通胀 + 单场收费", t49_settle_scope_wording),
     ("R50 花钱口径：收/分愿力是打分，只有点单花她自己的", t50_spend_wording),
+    ("R51 按昵称认人（注入与工具两条路都要记名）", t51_learn_names),
 ]
 
 

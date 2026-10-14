@@ -1523,6 +1523,10 @@ class Main(star.Star):
             #    这一轮正文里只有问题本身、没有名字 ⇒ 全靠这行钉住"现在是谁在跟你说话" ✓
             who_name = str(event.get_sender_name() or "").strip() or \
                 str(snap.get("name") or "").strip()
+            # ⚠️ 顺手把「名字 → QQ 号」记下来（主人 2026-10-15 让补的）——
+            #    这样她之后写「给某某某 5 愿力」时，`_who_to_id` 才认得出这个人 ✓
+            if who_name:
+                learn_name(bot, str(event.get_group_id() or ""), sender, who_name)
             hint = money_hint(snap, who_name=who_name, mine=mine, reset_hint=True)
             if not hint:
                 return
@@ -1639,17 +1643,21 @@ async def _who_to_id(plugin, event, who, group_id):
     return None
 
 
-    if re.fullmatch(r"[0-9]{5,12}", text):
-        return text
-    return None
-
-
 async def _display_name(plugin, event, bot, group_id, user_id):
+    """取一个人的显示名；**顺手把"名字 → QQ 号"记进记忆缓存** ✓（2026-10-15 主人让补的）。
+
+    ⚠️ 为什么要在这里记：`learn_name()` 原来**一个调用点都没有** ✗ ⇒ 内存里的 `_NAMES` 永远空
+       ⇒ `lookup_names()`（`_who_to_id` 用它把「花奈咪」解成 QQ 号）永远查不到 ✗
+       ⇒ 她说「给某某某 5 愿力」时那条路是**死的** ✗
+       `_display_name` 是**所有工具共用的取名字口** ⇒ 在这里记一次就全铺上了 ✓
+    """
     snap = await run_db(db_snapshot, bot, user_id)
-    if snap.get("name"):
-        return snap["name"]
-    if str(user_id) == str(event.get_sender_id() or ""):
-        return str(event.get_sender_name() or "").strip() or user_id
+    name = str(snap.get("name") or "").strip()
+    if not name and str(user_id) == str(event.get_sender_id() or ""):
+        name = str(event.get_sender_name() or "").strip()
+    if name:
+        learn_name(bot, group_id, user_id, name)
+        return name
     return user_id
 
 
