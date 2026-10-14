@@ -387,7 +387,7 @@ def inject_tail(tiers=None):
     return "\n".join(lines)
 
 
-def money_hint(snap, who_text="他", mine=None, reset_hint=False):
+def money_hint(snap, who_name="", mine=None, reset_hint=False):
     """按需拼一行提示；**什么都没有就一个字都不注入**（省 token 也省缓存 ✓）。
 
     2026-10-13 主人裁定的两件事都落在这里：
@@ -400,10 +400,22 @@ def money_hint(snap, who_text="他", mine=None, reset_hint=False):
        她手边只有**别人的数字**，于是**顺手拿来解释、还编了来源** ✗
        （实测：她把自己 30 愿力说对了 ✓，却把水梦送的礼物说成是问话人送的 ✗）
        ⇒ 字样写死「跟你说话的人」，并**单列她自己那一项** ✓
+
+    ⚠️ 2026-10-15 真机教训（主人报的「消息错位」）：那一行只写了「跟你说话的那个人」，
+       **没写人名** ✗ —— 而这一轮正文里也没有名字（实测 `request.prompt` 就 6 个字 = 只有问题本身 ✗）
+       ⇒ 三个说话人连着来时，她把**上一轮的对象**接了过来 ✗
+       （实测：花奈咪问「怎么获得愿力」，她回「…**水梦**，我账上那点愿力…」✗）
+       ⇒ 有名字就**把人名写进这一行** ✓（`who_name`，取不到就退回老字样 ✓）
     """
     lines = []
     if snap and snap.get("exists"):
-        lines.append("跟你说话的那个人：%s %d" % (MONEY_NAME, int(snap.get("balance") or 0)))
+        who = str(who_name or "").strip()
+        if who:
+            lines.append("**这一轮跟你说话的是「%s」**：%s %d"
+                         % (who, MONEY_NAME, int(snap.get("balance") or 0)))
+        else:
+            lines.append("跟你说话的那个人：%s %d"
+                         % (MONEY_NAME, int(snap.get("balance") or 0)))
         if snap.get("credit") is not None:
             lines.append("%s %d" % (CREDIT_NAME, int(snap["credit"])))
     mine = mine or {}
@@ -1492,7 +1504,11 @@ class Main(star.Star):
             # ③ 拼提示：**别人的 + 她自己的**（她自己那份每轮可见 ✓）
             snap = await run_db(db_snapshot, bot, sender)
             mine = await run_db(db_snapshot, bot, bot)
-            hint = money_hint(snap, "他", mine=mine, reset_hint=True)
+            # ⚠️ 2026-10-15：把**说话人的名字**写进那一行（主人报的"消息错位"✗）——
+            #    这一轮正文里只有问题本身、没有名字 ⇒ 全靠这行钉住"现在是谁在跟你说话" ✓
+            who_name = str(event.get_sender_name() or "").strip() or \
+                str(snap.get("name") or "").strip()
+            hint = money_hint(snap, who_name=who_name, mine=mine, reset_hint=True)
             if not hint:
                 return
             parts = getattr(request, "extra_user_content_parts", None)
@@ -1504,7 +1520,8 @@ class Main(star.Star):
             tail = inject_tail(_GIFT_TIERS if _GIFT_TIERS else resolve_tiers(self.config))
             if tail not in (request.system_prompt or ""):
                 request.system_prompt = (request.system_prompt or "") + "\n\n" + tail
-            logger.info("[wishonomy] injected | bot=%s bal=%s", bot, snap.get("balance"))
+            logger.info("[wishonomy] injected | bot=%s who=%s bal=%s",
+                        bot, who_name or sender, snap.get("balance"))
         except Exception as exc:      # noqa: BLE001 —— 注入失败绝不能影响它正常回话
             logger.warning("[wishonomy] 注入失败: %s", str(exc)[:120])
 

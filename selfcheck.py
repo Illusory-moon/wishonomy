@@ -1482,6 +1482,22 @@ def t49_settle_scope_wording(mod, _plugin):
                                      mine={"exists": True, "balance": 0}, reset_hint=True):
         print("      没余额时不该提日结（白烧 token ✗）")
         return False
+    # ⚠️ 2026-10-15 主人报的"消息错位"：那一行必须**写出人名** ✓
+    #    （实测：花奈咪问「怎么获得愿力」，她回「…水梦，我账上那点愿力…」✗ ——
+    #      因为当前这条正文里没有名字，她只能靠上下文猜 ✗）
+    named = mod.money_hint({"exists": True, "balance": 7, "credit": 100},
+                           who_name="花奈咪", mine={"exists": True, "balance": 5},
+                           reset_hint=False)
+    if "花奈咪" not in named:
+        print("      注入那行没写说话人的名字（她会认错人 ✗）:", named)
+        return False
+    if "跟你说话的那个人" in named:
+        print("      有名字时还在用模糊说法（应当直接写名字）✗:", named)
+        return False
+    unnamed = mod.money_hint({"exists": True, "balance": 7}, mine={"exists": True, "balance": 5})
+    if "跟你说话的那个人" not in unnamed:
+        print("      取不到名字时该退回老字样（不能变成空的）✗:", unnamed)
+        return False
     return True
 
 
