@@ -1361,6 +1361,42 @@ def t46_grant_floor(mod, plugin):
     return "不值得你开口" in out
 
 
+def t47_issued_net_of_deduct(mod, _plugin):
+    """「收愿力」必须是**净额**，而且扣款行**自带负号** ✓
+
+    ⚠️ 2026-10-14 真机对账发现的账目 bug（本鱼自己踩的 ✗）：
+      「扣你两分」在库里原来是 `kind='mood'` 且 `amount=+2`（方向只在调用方 ✗）
+      ⇒ `SUM(amount)` 把**扣出去的也算成发行** ⇒ 面板「收愿力」虚高 ✗
+      ⇒ 现在 `db_mood(delta<0)` 直接记**负数行** ⇒ 汇总天然是净额 ✓
+    """
+    now = int(time.time())
+    raw_mood(mod, ALICE, 30, "net-issued-a", now)          # 赏 ALICE 30
+    raw_mood(mod, BOB, 20, "net-issued-seed", now)         # 先给 BOB 20，好让他有得扣 ✓
+    conn = mod._connect()
+    try:
+        out = mod.db_mood(conn, BOT, GROUP, BOB, -12, "扣你两分意思一下", "net-issued-b",
+                          now, 0)
+        rows = conn.execute("SELECT amount FROM ledger WHERE kind='mood' AND amount<0"
+                            ).fetchall()
+        detail = mod.db_audit_detail(conn, BOT, mod.day_start(now), now)
+        totals = mod.db_audit_totals(BOT, mod.day_start(now), now, conn=conn)
+    finally:
+        conn.close()                     # ⚠️ 不关的话 Windows 上临时目录都删不掉 ✗
+    if not out.get("ok"):
+        print("      扣愿力没成功:", out)
+        return False
+    if len(rows) != 1 or int(rows[0]["amount"]) != -12:
+        print("      扣款行不是负数:", [dict(r) for r in rows])
+        return False
+    if detail.get("mood_down") != 12:
+        print("      没单独统计「分愿力」:", detail.get("mood_down"))
+        return False
+    if totals["issued"] != 38:            # ALICE+30、BOB+20、BOB−12 ⇒ 净 38（不是 62 ✗）
+        print("      收愿力不是净额：%s（应为 18）" % totals["issued"])
+        return False
+    return True
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1408,6 +1444,7 @@ TESTS = [
     ("R44 日结：只清她自己 + 负流水不删账", t44_settle_only_her),
     ("R45 被注视 +1（每条唤醒一次）", t45_attention_gain),
     ("R46 点单最低一笔（拆小单会被拦）", t46_grant_floor),
+    ("R47 收愿力是净额（扣人要减出去）", t47_issued_net_of_deduct),
 ]
 
 

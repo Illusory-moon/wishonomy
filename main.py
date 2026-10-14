@@ -657,12 +657,23 @@ def _sum_by_kind(conn, self_id, column, user_id, kind, since, now):
 
 
 def _sum_issued(conn, self_id, since, now):
-    """当日发行量 = 她记给人家的愿力 + 送礼进她账的愿力。"""
-    row = conn.execute(
-        "SELECT COALESCE(SUM(amount),0) AS s FROM ledger "
-        "WHERE self_id=? AND ts>=? AND ts<=? AND kind IN ('mood','gift','initial','attention')",
-        (self_id, int(since), int(now))).fetchone()
-    return int(row["s"] or 0)
+    """当日发行量 = 她**净给出去**的愿力 + 送礼进她账的 + 被注视进账的。
+
+    ⚠️ 2026-10-14 真机对账时发现的坑（本鱼自己踩的 ✗）：
+      "扣你两分"那类**分愿力**在库里是 `kind='mood'` 且 `amount=+2` ——
+      方向靠**调用方**（走 `_deduct`）区分，**行本身看不出正负** ✗
+      ⇒ 老口径 `SUM(amount)` 把**扣出去的也算成发行** ⇒ 面板「收愿力」虚高 ✗
+      ⇒ 现在按类分开算净额：`mood` 净、`gift`/`attention` 各算各的 ✓
+      （⚠️ 要真正分清正负，得给行加个方向字段 —— 那是**表结构改动**，
+        等主人点头再做 ✓ 现在先用"净额"把口径摆正 ✓）
+    """
+    def net(kind):
+        row = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) AS s FROM ledger "
+            "WHERE self_id=? AND ts>=? AND ts<=? AND kind=?",
+            (self_id, int(since), int(now), kind)).fetchone()
+        return int(row["s"] or 0)
+    return net("mood") + net("gift") + net("attention") + net("initial")
 
 
 def with_conn(fn, *args):
@@ -692,6 +703,15 @@ def _move(conn, self_id, group_id, frm, to, amount, kind, reason, ref, now):
         _ensure_account(conn, self_id, frm, "", now)
     else:
         frm = ISSUE_SOURCE
+        if int(amount) < 0:
+            # ⚠️ 2026-10-14：**分愿力**记负数行（行自带符号 ⇒ `SUM(amount)` 天然是净额 ✓）
+            #    负数 ⇒ 从 to 身上扣、写 spent；**发行侧不动**（不能说"她发行了 -2" ✗）
+            conn.execute(
+                "UPDATE account SET balance=balance-?, spent=spent+?, updated_at=? "
+                "WHERE self_id=? AND user_id=?",
+                (-int(amount), -int(amount), now, self_id, to))
+            return _insert_row(conn, now, self_id, group_id, frm, to, amount, kind,
+                               reason, ref)
     if frm != to:
         if kind != "mood":
             conn.execute(
@@ -700,6 +720,11 @@ def _move(conn, self_id, group_id, frm, to, amount, kind, reason, ref, now):
         conn.execute(
             "UPDATE account SET balance=balance+?, earned=earned+?, updated_at=? "
             "WHERE self_id=? AND user_id=?", (amount, amount, now, self_id, to))
+    return _insert_row(conn, now, self_id, group_id, frm, to, amount, kind, reason, ref)
+
+
+def _insert_row(conn, now, self_id, group_id, frm, to, amount, kind, reason, ref):
+    """写一条流水（**只有这一处 INSERT** ⇒ 格式不会长歪 ✓）"""
     cur = conn.execute(
         "INSERT INTO ledger (ts, self_id, group_id, from_id, to_id, amount, kind, reason, ref) "
         "VALUES (?,?,?,?,?,?,?,?,?)",
@@ -816,8 +841,18 @@ def db_mood(conn, self_id, group_id, who, delta, reason, ref, now, daily_cap,
        事务里再开连接会互相等锁（P1 当场踩过 ✓）。
     ⚠️ **who == self_id 一律拒绝**（硬保证）：她自己的愿力只能靠别人送礼进来，
        绝不能用这个入口凭空加给自己（主人 2026-10-13 亲口点名 ✓）。
+
+    ⚠️ 2026-10-14：**`delta < 0` = 分愿力（扣人）** —— 行里**记负数** ✓
+       （老版本记的是正数 2、靠调用方区分方向 ⇒ `SUM(amount)` 把扣出去的算成发行 ✗，
+        真机对账时发现：面板「收愿力」虚高）
+       ⇒ 现在**行自带符号**，`SUM(amount)` 天然就是净额 ✓
+       扣到 0 为止、不出负余额 ✓（`who == self_id` 那条闸门**只管正数**：
+       她自己账户的**流出**是合法的，流入才要拦 ✓）
     """
-    if str(who) == str(self_id):
+    delta = int(delta)
+    deduct = delta < 0
+    amount = -delta if deduct else delta
+    if str(who) == str(self_id) and not deduct:
         return {"ok": False, "code": "self_mood"}
     try:
         _ensure(conn)
@@ -837,11 +872,22 @@ def db_mood(conn, self_id, group_id, who, delta, reason, ref, now, daily_cap,
             return {"ok": False, "code": "daily_gain_cap", "today": gain, "cap": daily_cap}
         _ensure_account(conn, self_id, who, name, now)
         _ensure_account(conn, self_id, self_id, "", now)
-        # ⚠️ 这里**不检查 who 的余额**：记进账是「愿力被注视带出来」，不是从谁身上划走。
-        #    会花光别人余额的动作只有一个 —— 送礼（db_gift ✓）。
-        _touch(conn, self_id, who, now)
-        ledger_id, _dup = _move(conn, self_id, group_id, who, who, delta, "mood",
-                                reason, ref, now)
+        if not deduct:
+            # ⚠️ 这里**不检查 who 的余额**：记进账是「愿力被注视带出来」，不是从谁身上划走。
+            #    会花光别人余额的动作只有一个 —— 送礼（db_gift ✓）。
+            _touch(conn, self_id, who, now)
+            ledger_id, _dup = _move(conn, self_id, group_id, who, who, delta, "mood",
+                                    reason, ref, now)
+        else:
+            # 分愿力：**从 who 身上扣**，扣到 0 为止 ⇒ 记一条负数 mood 行 ✓
+            row = conn.execute("SELECT balance FROM account WHERE self_id=? AND user_id=?",
+                               (self_id, who)).fetchone()
+            have = int(row["balance"]) if row is not None else 0
+            if have <= 0:
+                conn.rollback()
+                return {"ok": False, "code": "insufficient", "balance": have}
+            ledger_id, _dup = _move(conn, self_id, group_id, ISSUE_SOURCE, who, -amount,
+                                    "mood", reason, ref, now)
         after = conn.execute("SELECT balance FROM account WHERE self_id=? AND user_id=?",
                              (self_id, who)).fetchone()
         rows = None
@@ -1168,7 +1214,7 @@ def db_top(conn, self_id, by="balance", limit=5, min_balance=1):
 
 
 def db_audit_detail(conn, self_id, since, now, limit=5):
-    """对账细化：待结欠条 / 信誉分变动 / 按人合计（给运营看的口径）。"""
+    """对账细化：待结欠条 / 信誉分变动 / **分出去多少** / 按人合计（给运营看的口径）。"""
     owes = conn.execute(
         "SELECT COUNT(*) AS c, COALESCE(SUM(amount),0) AS s FROM iou "
         "WHERE self_id=? AND status=?", (self_id, IOU_OPEN)).fetchone()
@@ -1176,6 +1222,13 @@ def db_audit_detail(conn, self_id, since, now, limit=5):
         "SELECT COALESCE(SUM(CASE WHEN delta>0 THEN delta ELSE 0 END),0) AS up, "
         "COALESCE(SUM(CASE WHEN delta<0 THEN -delta ELSE 0 END),0) AS down "
         "FROM credit_event WHERE self_id=? AND ts>=? AND ts<=?",
+        (self_id, int(since), int(now))).fetchone()
+    # ⚠️ **分愿力**和**收愿力**在库里长得一样（都是 `kind='mood'`、正数 ✗）——
+    #    行本身没有方向字段，只能靠她写的那句话认（`_deduct` 的判词里必带"扣"）✓
+    #    ⇒ 所以这里单独统计一笔「分出去」，免得运营把"扣人"看成"赏人" ✗
+    mood_down = conn.execute(
+        "SELECT COUNT(*) AS c, COALESCE(SUM(amount),0) AS s FROM ledger "
+        "WHERE self_id=? AND ts>=? AND ts<=? AND kind='mood' AND amount<0",
         (self_id, int(since), int(now))).fetchone()
     # ⚠️ 别在 SQL 里玩"按人分组的条件求和" —— SQLite 对 `GROUP BY user_id` 之后再引用
     #    被分组的列名（`to_id=user_id`）会直接报 `no such column: user_id` ✗（本鱼踩了三次 ✓）
@@ -1197,6 +1250,7 @@ def db_audit_detail(conn, self_id, since, now, limit=5):
            if val["got"] > 0][:int(limit)]
     return {"open_ious": int(owes["c"] or 0), "iou_amount": int(owes["s"] or 0),
             "credit_up": int(credit["up"] or 0), "credit_down": int(credit["down"] or 0),
+            "mood_down": -int(mood_down["s"] or 0), "mood_down_n": int(mood_down["c"] or 0),
             "top": top}
 
 
@@ -2095,10 +2149,13 @@ async def wish_audit(*args, **kwargs):
 
 
 async def _deduct(plugin, bot, group_id, user_id, amount, reason, prefix, event):
-    """扣愿力（分愿力）：扣到 0 为止，不会出现负余额。"""
+    """扣愿力（分愿力）：扣到 0 为止，不会出现负余额。
+
+    ⚠️ 2026-10-14：**传负数**（`db_mood` 现在按**符号**定方向，行也记负数 ✓）
+    """
     now = int(time.time())
     ref = "%s%s-%s" % (prefix, now, uuid.uuid4().hex[:8])
-    result = await run_db(with_conn, db_mood, bot, group_id, user_id, amount, reason,
+    result = await run_db(with_conn, db_mood, bot, group_id, user_id, -int(amount), reason,
                           ref, now, 0)
     if not result.get("ok"):
         code = result.get("code")

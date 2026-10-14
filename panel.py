@@ -647,7 +647,10 @@ def render(data, refresh_on=False, flash=""):
 
         # ① 当日概览 —— 指标卡
         metrics = "".join([
-            _metric("收愿力（发行）", plugin.money_text(today["issued"]), tone="good"),
+            _metric("收愿力（净）", plugin.money_text(today["issued"]), tone="good"),
+            _metric("分愿力（扣人）", plugin.money_text(detail.get("mood_down", 0)),
+                    sub="%d 笔" % detail.get("mood_down_n", 0),
+                    tone="warn" if detail.get("mood_down") else ""),
             _metric("送出（送礼）", plugin.money_text(today["gifted"])),
             _metric("支出（点单）", plugin.money_text(today["granted"]), tone="warn"),
             _metric("撤回", plugin.money_text(today["refunded"])),
