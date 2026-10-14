@@ -440,13 +440,18 @@ footer{{max-width:1240px;margin:0 auto;padding:0 var(--pad) 40px;
 
 KIND_LABEL = {"mood": "收愿力", "gift": "送礼", "grant": "点单", "refund": "撤回",
               "credit": "信誉"}
+# 页面上**显示**的名字（主人 2026-10-14：徽章原来直接吐英文 kind，跟上面的指标卡不一致 ✗）
+# ⚠️ 原始 kind 仍然留在 `title=` 里（悬停可见）⇒ 对着库查账时不会被这层显示名挡住 ✓
+KIND_TEXT = {"mood": "收愿力", "gift": "送礼", "grant": "点单", "refund": "撤回",
+             "credit": "信誉", "settle": "日结", "attention": "被注视", "initial": "初始"}
 
 
 def _badge(kind):
-    """流水类别小徽章（颜色按类别分 ✓）。"""
+    """流水类别小徽章（颜色按类别分 · **文字用中文名**，原始 kind 放 `title` ✓）。"""
     text = str(kind)
     cls = text if text in KIND_LABEL else "other"
-    return '<span class="pill p-%s">%s</span>' % (cls, html.escape(text))
+    return ('<span class="pill p-%s" title="%s">%s</span>'
+            % (cls, html.escape(text), html.escape(KIND_TEXT.get(text, text))))
 
 
 def _metric(label, value, sub="", tone=""):

@@ -366,6 +366,11 @@ def t11_expand_inplace(env, _unused):
         print("      批次划分不对: s2=%d s3=%d"
               % (html_out.count('class="stage s2"'), html_out.count('class="stage s3"')))
         return False
+    # ③b 徽章出**中文名**（主人 2026-10-14：原来直接吐英文 `mood`/`gift`，跟指标卡不一致 ✗），
+    #    原始 kind 必须留在 `title=` 里 ⇒ 对着库查账时不会被这层显示名挡住 ✓
+    if '<span class="pill p-mood" title="mood">收愿力</span>' not in html_out:
+        print("      徽章没出中文名，或原始 kind 没留在 title 里")
+        return False
     # ④ 库里还有更早的 ⇒ 才给 `?n=` 兜底（全页**唯一**会刷新的一颗 ✓）；给全了就不许再催
     more = env.panel.brief_table({"brief": entries, "brief_count": 130, "ledger_total": 999,
                                   "limit": 400}, "bX")
