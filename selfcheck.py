@@ -10,6 +10,7 @@
     D:\\smm-tempsparxie\\.venv\\Scripts\\python.exe D:\\sparxie\\wishonomy\\selfcheck.py
 """
 import asyncio
+import ast
 import importlib.util
 import json
 import os
@@ -1397,6 +1398,93 @@ def t47_issued_net_of_deduct(mod, _plugin):
     return True
 
 
+# 她读得到的文本里**不许出现**这些装饰符号（2026-10-14 主人定的 ✓）
+_MARKS = "✓✗⚠️★✅❌❗①②③④⑤⑥⑦⑧⑨⑩→←↑↓•·"
+
+
+def _visible_texts(mod):
+    """她会读到的那几段文本（**注入出去的 + 工具说明**）—— 别处（内部 docstring / 注释）不算 ✓"""
+    snap = {"exists": True, "balance": 7, "credit": 3}
+    return [
+        ("INJECT_TAIL", mod.INJECT_TAIL),
+        ("POWER_NOTE", mod.POWER_NOTE),
+        ("SETTLE_NOTE", mod.SETTLE_NOTE),
+        ("MOOD_NOTE", mod.MOOD_NOTE),
+        ("inject_tail()", mod.inject_tail([{"name": "甲档", "cost": 1, "note": "备注"}])),
+        ("money_hint(有余额)", mod.money_hint(snap, mine={"exists": True, "balance": 5},
+                                             reset_hint=True)),
+        ("money_hint(没余额)", mod.money_hint(snap, mine={"exists": True, "balance": 0},
+                                             reset_hint=True)),
+    ]
+
+
+def t48_no_marks_in_visible_text(mod, _plugin):
+    """**她读得到的文本里不许出现 ✓ / ✗ / ⚠️ / ① 这类符号** ✗（主人 2026-10-14 定的）
+
+    ⚠️ 起因：本鱼那个口径草稿里写了 `✓`，主人一句「**她会模仿**」✗ ——
+       注入文本与**工具说明**（`@llm_tool` 那个函数的 docstring 会被当成工具描述给她 ✓）
+       都是她读得到的东西 ⇒ 与其靠人记着，不如**代码硬保证**：
+       这里**真调那几个函数、真读每个工具的 docstring**，出现一个就红 ✓
+
+    ⚠️ 顺带守着"这条自检有没有偷懒"：扫到的工具数**必须 >= 10** ✗
+       （少一个都说明它没在看全部工具 —— 跟"词表缺了就静默算通过"是同一类病 ✗）
+    """
+    bad = []
+    for name, text in _visible_texts(mod):
+        hits = "".join(sorted({ch for ch in _MARKS if ch in str(text)}))
+        if hits:
+            bad.append("%s → %s" % (name, hits))
+    with open(PLUGIN, encoding="utf-8") as handle:
+        tree = ast.parse(handle.read())
+    tools = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if not any("llm_tool" in ast.dump(dec) for dec in node.decorator_list):
+            continue
+        tools += 1
+        doc = ast.get_docstring(node) or ""
+        hits = "".join(sorted({ch for ch in _MARKS if ch in doc}))
+        if hits:
+            bad.append("工具 %s 的说明 → %s" % (node.name, hits))
+    if tools < 10:
+        print("      只扫到 %d 个工具说明（应当 >= 10）⇒ 这条自检没覆盖全 ✗" % tools)
+        return False
+    if bad:
+        print("      她读得到的文本里有装饰符号（她会模仿 ✗）:", "；".join(bad))
+        return False
+    return True
+
+
+def t49_settle_scope_wording(mod, _plugin):
+    """**日结口径必须在她读得到的文本里说清**（主人 2026-10-14 追加的 ✓）
+
+    ⚠️ 起因：原来的注入只写「你账上过了 0 点归零」，**没说只清她自己那一栏** ✗
+       ⇒ 她有可能理解成"愿力这东西会被收走"、也可能跟花粉解释错 ✗
+    主人要的三件事，一件都不许少：
+      1. **只清你自己**（花粉的不动、礼物不退不收回）
+      2. 这是**防通胀**
+      3. 这是模拟真实直播的**单场收费**，**不是**剥夺财产
+    """
+    tail = mod.inject_tail([{"name": "甲档", "cost": 1, "note": "备注"}])
+    need = ["只清你自己", "花粉", "防通胀", "单场收费", "没收"]
+    missing = [word for word in need if word not in tail]
+    if missing:
+        print("      注入的常量尾巴里缺口径关键词:", missing)
+        return False
+    hint = mod.money_hint({"exists": True, "balance": 7}, mine={"exists": True, "balance": 5},
+                          reset_hint=True)
+    for word in ("只清你自己", "花粉"):
+        if word not in hint:
+            print("      每轮那句日结提醒没写清是谁的账:", word, "→", hint)
+            return False
+    if "只清你自己" in mod.money_hint({"exists": True, "balance": 7},
+                                     mine={"exists": True, "balance": 0}, reset_hint=True):
+        print("      没余额时不该提日结（白烧 token ✗）")
+        return False
+    return True
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1445,6 +1533,8 @@ TESTS = [
     ("R45 被注视 +1（每条唤醒一次）", t45_attention_gain),
     ("R46 点单最低一笔（拆小单会被拦）", t46_grant_floor),
     ("R47 收愿力是净额（扣人要减出去）", t47_issued_net_of_deduct),
+    ("R48 她读得到的文本里没有装饰符号（日结口径也在里面）", t48_no_marks_in_visible_text),
+    ("R49 日结口径：只清她自己 + 防通胀 + 单场收费", t49_settle_scope_wording),
 ]
 
 

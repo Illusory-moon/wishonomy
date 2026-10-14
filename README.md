@@ -108,13 +108,30 @@ python panel.py --json           # 不开服务，直接吐 JSON（部署后核�
 2. **只绑 `127.0.0.1`** —— 默认不对外；要对外请自己套反代
 3. **转义** —— 流水里的原话一律 `html.escape`（防 XSS ✓）
 
-自检：`python panelcheck.py`（12 项，含真 HTTP 冒烟 / 只读保证 / 转义 / 展开机制 / 被注视页 / CLI 入口）
+自检：`python panelcheck.py`（13 项，含真 HTTP 冒烟 / 只读保证 / 转义 / 展开机制 / 被注视页 / CLI 入口 /
+**真浏览器验收**）
+
+### 真浏览器验收（P13，2026-10-14 加）
+
+最后一轮面板 bug 的共同点是「**自检全绿、观感全错**」✗ —— 自检断言的是"CSS 规则在不在"，
+不是"页面**真的**怎么动" ✗ ⇒ P13 开**真 Chromium**、点**真两次**，量四件事：
+点一下 `scrollY` 一点不变 · 上方那行一点不动 · 批次**只增不减** · 同一时刻**只看得见一颗**按钮。
+
+要它跑得动，得先装一次（本机/CI 各一次）：
+
+```bash
+pip install playwright
+playwright install chromium          # 约 200 MB，装完就有 chrome-headless-shell ✓
+```
+
+- 想留一张现场截图：`PANEL_E2E_SHOT=D:\path\panel.png`
+- **确实不想装** ⇒ `PANEL_E2E=0`（**显式**跳过 —— 它会在输出里写一行"跳过"，不会假装跑过 ✓）
 
 ## 自检
 
 ```bash
-python selfcheck.py     # 工具、账本、护栏、注入、记账：47 项
-python panelcheck.py    # 只读面板：12 项
+python selfcheck.py     # 工具、账本、护栏、注入、记账：48 项
+python panelcheck.py    # 只读面板：13 项
 ```
 
 两个都**失败就 exit 1**；不依赖任何第三方库（只用标准库 + 临时目录里的真 SQLite 库）。
@@ -123,9 +140,9 @@ python panelcheck.py    # 只读面板：12 项
 
 ```
 main.py           插件本体（工具 + 愿力中心 + 闸门 + 注入 + 记账）
-selfcheck.py      自检（47 项，逐条真断言）
+selfcheck.py      自检（48 项，逐条真断言）
 panel.py          只读面板（两页：`/` 与 `/attention`；卡片式；零外链、零 <script>）
-panelcheck.py     面板自检（12 项）
+panelcheck.py     面板自检（13 项 · 含真浏览器验收 P13）
 refresh.py        一键拉取（把容器里的账本副本只读取回本机）
 open_panel.bat    Windows 一键开面板（找 Python → 起面板 → 自己开一次浏览器）
 tunnel.py         早期那份拉取脚本（保留，refresh.py 是现在用的那份）

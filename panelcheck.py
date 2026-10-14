@@ -495,6 +495,152 @@ def t12_attention_page(env, _unused):
     return True
 
 
+def t13_browser_no_jump(env, _unused):
+    """真浏览器验收（Chromium）：点「再看更早的」⇒ **零位移** + 批次只增不减 + 按钮恰好一颗
+
+    ⚠️ 为什么非要有这一条（2026-10-14 主人定的方向）：
+       面板那四轮真机 bug 的共同点是「**自检全绿、观感全错**」✗ ——
+       因为自检断言的是"我写的 CSS 规则在不在"，**不是"页面真的怎么动"** ✗
+       ⇒ 这条打开**真 Chromium**、点**真两次**，量四件事：
+         ① 点一下 `window.scrollY` **一点不变**（主人要的"整个页面不要有偏移" ✓）
+         ② 点击处**上方**那一行的位置一点不变（上面不跳 ✓）
+         ③ 可见流水行数 60 → 120 → 130（批次**累积**、点过的**不回收** ✓）
+         ④ 可见按钮**恰好一颗**（主人裁定的"乙" ✓）· a1 那一行**行高不塌** ✓
+       ⚠️ 点按钮用 `eval_on_selector(el => el.click())` —— **不能用 `page.click()`** ✗
+          （Playwright 的 click 会先把元素滚进视口 ⇒ 自己就把 scrollY 改了 ✗）
+    """
+    if os.environ.get("PANEL_E2E") == "0":
+        print("      （按 PANEL_E2E=0 显式跳过浏览器验收）")
+        return True
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("      没装 playwright ⇒ 真浏览器验收跑不了。装法："
+              "pip install playwright && playwright install chromium"
+              "（确实不想装就设 PANEL_E2E=0 **显式**跳过 ✓）")
+        return False
+
+    now = int(time.time())
+    for i in range(200):                     # 200 行 ⇒ 4 批（每批 BRIEF_STAGE=60）⇒ 点两次正好 +120 ✓
+        env.sc.raw_mood(env.mod, env.sc.ALICE, 5, "e2e-%d" % i, now + i)
+
+    httpd = env.panel.serve(env.db, "127.0.0.1", 0, quiet=True)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    # ⚠️ 选择器**必须锁在流水那张表里**（`#top`）—— 第一版写成 `tbody tr`，
+    #    把钱包 / 欠条 / 今日活跃那几张表的行也数进去了 ⇒ 数字全歪 ✗（2026-10-14 当场被这条自检抓住 ✓）
+    state_js = ("() => {"
+                "  const rows = [...document.querySelectorAll('#top tbody tr')];"
+                "  const vis = el => el.offsetHeight > 0;"
+                "  const data = rows.filter(r => !r.classList.contains('anchor'));"
+                "  const btns = [...document.querySelectorAll('#top tr.anchor label.btn')]"
+                "    .filter(el => getComputedStyle(el).visibility === 'visible' && vis(el));"
+                "  const a1 = document.querySelector('#top tr.anchor.a1');"
+                "  return {scrollY: window.scrollY,"
+                "          rows: data.filter(vis).length, total: data.length,"
+                "          btns: btns.length,"
+                "          a1h: a1 ? a1.getBoundingClientRect().height : -1,"
+                "          above: (a1 && a1.previousElementSibling)"
+                "                 ? a1.previousElementSibling.getBoundingClientRect().top : null};"
+                "}")
+    click_js = ("() => {const btns = [...document.querySelectorAll('#top tr.anchor label.btn')]"
+                "  .filter(el => getComputedStyle(el).visibility === 'visible' && el.offsetHeight > 0);"
+                "  if (!btns.length) return 'no-button'; btns[0].click(); return 'clicked';}")
+    errors = []
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            page = browser.new_page(viewport={"width": 1280, "height": 800})
+            page.on("pageerror", lambda exc: errors.append(str(exc)[:120]))
+            page.goto("http://127.0.0.1:%d/" % port, wait_until="load")
+
+            def to_frontier():
+                """把**最前沿那颗可见按钮**滚到视口中央（模拟"主人滚过去点它" ✓），
+                返回那一刻的状态 —— 这一步之后的 scrollY 才是"点击前"的基准 ✓
+                ⚠️ 必须这样：JS 点一颗**屏幕外**的按钮时，浏览器会把刚被聚焦的 checkbox
+                   滚进视野 ✗（真人做不到这一步）⇒ 不先滚过去，量到的是假跳 ✗
+                """
+                ok = page.evaluate(
+                    "() => {const b=[...document.querySelectorAll('#top tr.anchor label.btn')]"
+                    "  .filter(el=>getComputedStyle(el).visibility==='visible'"
+                    "          && el.offsetHeight>0);"
+                    "  if(!b.length) return false;"
+                    "  b[0].scrollIntoView({block:'center'}); return true;}")
+                if not ok:
+                    return None
+                page.wait_for_timeout(80)
+                return page.evaluate(state_js)
+
+            before = to_frontier()
+            if before is None:
+                print("      页面上没有可见的「再看更早的」按钮 ✗")
+                return False
+            if before["btns"] != 1 or before["rows"] < 60:
+                print("      初始态不对（可见按钮 %d 个 / 可见行 %d）" % (before["btns"],
+                                                                    before["rows"]))
+                return False
+            if page.evaluate(click_js) != "clicked":
+                print("      第一颗点不动 ✗")
+                return False
+            page.wait_for_timeout(150)
+            first = page.evaluate(state_js)          # ← 点完**立刻**量，不许先滚动 ✓
+            mid = to_frontier()                      # 第二颗要先滚过去（真人就是这么做的 ✓）
+            if mid is None or page.evaluate(click_js) != "clicked":
+                print("      第二颗点不动 ✗")
+                return False
+            page.wait_for_timeout(150)
+            second = page.evaluate(state_js)
+            if os.environ.get("PANEL_E2E_SHOT"):
+                page.screenshot(path=os.environ["PANEL_E2E_SHOT"], full_page=False)
+            att = browser.new_page()
+            att.on("pageerror", lambda exc: errors.append(str(exc)[:120]))
+            att.goto("http://127.0.0.1:%d/attention" % port, wait_until="load")
+            att_ok = att.inner_text("body").find("被注视次数") >= 0
+            browser.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    if errors:
+        print("      浏览器里报 JS 错:", errors)
+        return False
+    if not att_ok:
+        print("      被注视那一页没渲染出来 ✗")
+        return False
+    # ① 零位移（主人要的那一条）：两次点击之后，scrollY 都不许动
+    if first["scrollY"] != before["scrollY"]:
+        print("      点第一颗就跳了：scrollY %s → %s" % (before["scrollY"], first["scrollY"]))
+        return False
+    if second["scrollY"] != mid["scrollY"]:
+        print("      点第二颗跳了：scrollY %s → %s" % (mid["scrollY"], second["scrollY"]))
+        return False
+    # ② 点击处上方那一行一点不动
+    if before["above"] is None or abs(first["above"] - before["above"]) > 0.6:
+        print("      按钮**上方**的行动了：%s → %s" % (before["above"], first["above"]))
+        return False
+    # ③ 批次累积（第一颗点开后那 60 行**不许被收回**）+ ④ 行高不塌
+    if before["total"] < before["rows"] + 120:
+        print("      这个库的行数不够测两批（可见 %d / 共 %d）" % (before["rows"], before["total"]))
+        return False
+    if first["rows"] != before["rows"] + 60:
+        print("      第一批展开的行数不对：%d → %d（应 +60）" % (before["rows"], first["rows"]))
+        return False
+    if second["rows"] != before["rows"] + 120:
+        print("      点第二颗时**第一批被收回了** ✗（主人报过的那个 bug）：%d → %d"
+              % (first["rows"], second["rows"]))
+        return False
+    if abs(first["a1h"] - before["a1h"]) > 0.6:
+        print("      点过的那一行**塌了行高** ✗（上方内容会跟着跳）：%s → %s"
+              % (before["a1h"], first["a1h"]))
+        return False
+    # ⑤ 同一时刻**只看得见一颗**按钮（主人裁定的"乙"）
+    for name, snap in (("点前", before), ("点一次", first), ("点两次", second)):
+        if snap["btns"] != 1:
+            print("      %s 看得见 %d 颗按钮（应当是 1 颗）" % (name, snap["btns"]))
+            return False
+    return True
+
+
 TESTS = [
     ("P01 只读连接写不了库", t01_readonly),
     ("P02 快照读得到发行/钱包/欠条/流水", t02_snapshot_content),
@@ -508,6 +654,7 @@ TESTS = [
     ("P10 开浏览器只开一次、失败不炸", t10_open_browser_once),
     ("P11 流水就地展开（label+开关、不跳页）", t11_expand_inplace),
     ("P12 被注视单独一页（流水不含它）", t12_attention_page),
+    ("P13 真浏览器：点完不位移 / 批次不回收 / 只一颗按钮", t13_browser_no_jump),
 ]
 
 
