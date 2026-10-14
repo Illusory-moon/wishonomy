@@ -10,6 +10,7 @@
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -959,13 +960,29 @@ def t15_mood_gate_server(env, _unused):
             if token not in page:
                 print("      未授权时把运营该看的东西也弄没了 ✗", token)
                 return False
-        # 毛玻璃 + 口令框在页面上（好看那部分 ✓）
-        for token in ("gcell", "gblur", "backdrop-filter", "gform", "data-gate-pw"):
+        # 毛玻璃 + **全页唯一那个**口令框（主人 2026-10-15 当场指出的：一个框管整列 ✓）
+        for token in ("gcell", "gskel", "backdrop-filter", "gform", "data-gate-pw"):
             if token not in gate_dash_css(page):
                 print("      遮罩/口令框的样式或结构缺了:", token)
                 return False
-        if "gblur" not in page or 'action="/api/unlock"' not in page:
-            print("      未授权时页面上没有遮罩 / 解锁表单 ✗")
+        if "gcell" not in page or 'action="/api/unlock"' not in page:
+            print("      未授权时页面上没有毛玻璃 / 解锁表单 ✗")
+            return False
+        # ⚠️ 数的是**真的那个属性**（`data-gate-pw="1"`）—— 别数裸词 `data-gate-pw` ✗：
+        #    本鱼那段内联 JS 里也有 `querySelector('input[data-gate-pw]')` ⇒ 会多数一个 ✗
+        if len(re.findall(r'data-gate-pw="1"', page)) != 1:
+            print("      **口令框不是恰好一个**（主人要的是一次解锁整列 ✗ 不是逐条输 ✗）:",
+                  len(re.findall(r'data-gate-pw="1"', page)))
+            return False
+        if page.count('action="/api/unlock"') != 1:
+            print("      解锁表单不只一个 ✗:", page.count('action="/api/unlock"'))
+            return False
+        # ⚠️ 格子**不许再自带输入框**（一路一个框 = 主人报的那个毛病 ✗）
+        if page.count('class="gcell"') and 'name="sid"' in page:
+            print("      格子还带着自己的 sid 隐藏域 ⇒ 说明还是逐条的框 ✗")
+            return False
+        if page.count('class="gcell"') < 2:
+            print("      没有出现该盖住的格子（造数够吗？）:", page.count('class="gcell"'))
             return False
         # 深浅两套主题都要好看（两套底色 + 不支持毛玻璃时的退路 ✓）
         for token in ("prefers-color-scheme:dark", "--gate-wash", "@supports not"):
@@ -1069,13 +1086,31 @@ def t15_mood_gate_server(env, _unused):
     return True
 
 
+def page_cells(page):
+    """真浏览器里数：**每张流水表里还盖着几格**（按 `div.flows` 分段，返回一个列表 ✓）
+
+    ⚠️ **本鱼在这件事上踩了三轮** ✗（记账：以后数 DOM 一律用 Playwright 的 `locator.count()` /
+       `nth()`，别在 Python 里手拼 JS 表达式 ✗）：
+       · 第一版把 `!!(a && b)` 折成多行 ⇒ **少一个右括号** ⇒ 每行多带回一个字符串
+         ⇒ Python 侧解包把字符串当真值 ⇒ "A 自己 8 个" ✗（判据自己骗自己 ✓）
+       · 第二版想"一次求值返回两个数"，写了带**嵌套引号 + 三元**的长表达式
+         ⇒ 同一个查询在本鱼探针里给 4、在自检里给 8 ✗（哪一层出错都看不出来 ✓）
+       ⇒ 现在：分段 + `locator.count()`（Playwright 自己的 CSS 引擎在数）✓ 零解析、零拼串 ✓
+    """
+    blocks = page.locator("div.flows")
+    return [blocks.nth(i).locator("tbody tr td > div.gcell").count()
+            for i in range(blocks.count())]
+
+
 def t16_gate_browser(env, _unused):
-    """**真浏览器**：毛玻璃遮罩看得见、原话看不见；输对口令之后原话才出来 ✓
+    """**真浏览器**：整列一层毛玻璃、原话看不见；输对口令之后整列才出来 ✓
 
     ⚠️ 这条是主人「毛玻璃遮罩 + 深色主题也要好看」那句的**可验收版本** ✗：
        自检断言"我写的 CSS 在不在"是不够的（面板那四轮真机 bug 全是"自检全绿、观感全错" ✗）
-       ⇒ 真开 Chromium：量 `backdrop-filter` 真的生效、`Ctrl+A` 全选也选不到原话、
-         输口令 + 提交（**走真表单**，不靠 JS ✓）之后原话才出现 ✓
+       ⇒ 真开 Chromium：量 `backdrop-filter` 真的生效（而且盖在**整格**上 ✓）、
+         `Ctrl+A` 全选也选不到原话、全页**只有一个**口令框（输一次解锁整列 ✓）、
+         输口令 + 提交（**走真表单**，不靠 JS ✓）之后**整列**才出来 ✓
+    ⚠️ 主人 2026-10-15 当场指出的那条（**一路一个框** ✗）就由这里的 `n_pw == 1` 守着 ✓
     """
     if os.environ.get("PANEL_E2E") == "0":
         print("      （按 PANEL_E2E=0 显式跳过浏览器验收）")
@@ -1098,15 +1133,28 @@ def t16_gate_browser(env, _unused):
                                     color_scheme="dark")      # 深色主题也要好看 ✓
             page.on("pageerror", lambda exc: errors.append(str(exc)[:120]))
             page.goto("http://127.0.0.1:%d/" % port, wait_until="load")
-            # 遮罩真的在、真的糊（`backdrop-filter` 生效）
+            # ① 毛玻璃真的生效（而且是盖在**整格**上的那一层 ✓）
             blur = page.eval_on_selector(
-                ".gcell .gblur", "el => getComputedStyle(el).backdropFilter"
+                ".gcell", "el => getComputedStyle(el).backdropFilter"
                 " || getComputedStyle(el).webkitBackdropFilter || ''")
             if "blur" not in (blur or ""):
                 print("      深色主题下毛玻璃没生效:", repr(blur))
                 return False
-            if page.eval_on_selector(".gcell", "el => el.offsetHeight") < 20:
-                print("      遮罩那一格塌了 ✗")
+            boxes = page.eval_on_selector_all(
+                ".gcell", "els => els.map(e => Math.round(e.getBoundingClientRect().height))")
+            # ⚠️ 只看**可见**的那些 ✗：`P13` 先往库里塞了 420 行 ⇒ 遮罩格会有几百个，
+            #    其中**折叠批次**里的高度本来就是 0（还没展开 ✓ 那是设计 ✗不是塌）
+            shown = [h for h in boxes if h > 0]
+            if len(boxes) < 1 or not shown or min(shown) < 20:
+                print("      遮罩那一格塌了 ✗: 共 %d 个 / 可见的 %r" % (len(boxes), shown[:6]))
+                return False
+            # ② **全页只有一个口令框**（主人要的：输一次解锁整列 ✓）
+            n_pw = page.evaluate(
+                "() => document.querySelectorAll('input[data-gate-pw]').length")
+            n_form = page.evaluate(
+                "() => document.querySelectorAll('form[action=\"/api/unlock\"]').length")
+            if n_pw != 1 or n_form != 1:
+                print("      口令框/表单不是恰好一个（**逐条输**是主人否掉的 ✗）:", n_pw, n_form)
                 return False
             # 全选也选不到她的原话（不是"看不见"，是**不在 DOM 里** ✗）
             page.keyboard.press("Control+a")
@@ -1118,7 +1166,18 @@ def t16_gate_browser(env, _unused):
             if "原话A-0" in page.content():
                 print("      HTML 源码里就有她的原话 ✗")
                 return False
-            # 走**真表单**提交（不碰 JS 那条路 ✓）
+            # 记下"解锁前有多少格盖着"以及"A 自己占了几格"（下面解锁后要对账 ✓）
+            # ⚠️ **别用一段拼出来的 JS 去数**（本鱼为此白折腾了几轮 ✗）——
+            #    直接抓一份 `[从, 有没有遮罩]` 的现场数组、在 Python 里数 ✓
+            #    顺带这就是**证据**（判错时能直接打出来看 ✓）
+            # ⚠️ 判据：**A 那张表里的遮罩必须清零**，而**B 那张表一动不动** ✗
+            #    （B 没输口令 ⇒ 它的格子还盖着、票头那个框也还在 ✓ 别指望"全页一个都不剩" ✗）
+            #    分段数（`page_cells`）比"全页总数"干净得多：哪张表的问题一眼看得出来 ✓
+            before = page_cells(page)
+            if not before or max(before) < 1 or len(before) < 2:
+                print("      造数不对：各表遮罩数 = %s（该有两个 bot、各自都有盖着的 ✗）" % (before,))
+                return False
+            # 走**真表单**提交（不碰 JS 那条路 ✓）⇒ 断言的是**整列**都出来（不只一条 ✓）
             # ⚠️ 之后必须**等重载真的完成**再断言 ✗ —— 提交会先被那段内联 JS 接住、
             #    发完 `/api/unlock` 再自己 `location.reload()`；本鱼第一版只
             #    `wait_for_load_state('load') + 300ms` ⇒ 量到的是**旧那一页** ⇒ 假红 ✓
@@ -1129,8 +1188,23 @@ def t16_gate_browser(env, _unused):
                     "() => document.body.innerText.indexOf('原话A-0') >= 0", timeout=8000)
             except Exception:                     # noqa: BLE001 —— 等不到就走下面的断言报出来
                 pass
-            if "原话A-0" not in page.content():
-                print("      输了对口令、走了真表单，原话还是没出来 ✗")
+            body = page.content()
+            if "原话A-0" not in body or "原话A-1" not in body:
+                print("      输了对口令、走了真表单，原话**整列**还是没出来 ✗")
+                return False
+            # ⚠️ 判据要精确到**这一个 bot** ✗：另一个 bot（B）没输口令 ⇒ 它的格子**还在盖着**、
+            #    票头那个框也还在（因为还有东西盖着 ✓）—— 别指望"全页一个框都不剩" ✗
+            #    （本鱼第一版就是这么写错的，当场假红 ✓）
+            #    ⇒ 拿**解锁前**那份现场数组当基准，解锁后 A 的格子必须一个不剩 ✓
+            after = page_cells(page)
+            if len(after) != len(before):
+                print("      解锁前后表数变了 ✗：%s → %s" % (before, after))
+                return False
+            if after[0] != 0:
+                print("      **A 那张表里还剩 %d 个遮罩** ✗（输一次该把整列都换掉 ✓）" % after[0])
+                return False
+            if after[1:] != before[1:]:
+                print("      **B 那张表被连带动了** ✗：%s → %s" % (before, after))
                 return False
             if os.environ.get("PANEL_E2E_SHOT"):
                 page.screenshot(path=os.environ["PANEL_E2E_SHOT"], full_page=False)

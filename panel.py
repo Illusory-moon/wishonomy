@@ -341,6 +341,8 @@ def gate_state(self_id):
 
     四种：`open`（已解锁）· `locked`（有钥匙、还没开）· `missing`（哈希还没到本机）·
     `expired`（她今天还没被唤醒 / 上一把过期了）✓
+    ⚠️ 现在**票头那一个框**靠它决定"给不给框"（`gate_toolbar` ✓）——
+       格子那边只认 `applies/opened` 两个布尔（不带框了 ✗）
     """
     entry = gate_keys(Handler.db_path).get(str(self_id)) or {}
     if not entry:
@@ -351,13 +353,14 @@ def gate_state(self_id):
 
 
 def gate_cell(item, self_id, opened, applies=True):
-    """流水表里那一格：**授权了就原样给她写的原话，没授权就一个空格子** ✓
+    """流水表里那一格：**授权了就原样给她写的原话，没授权就一层毛玻璃** ✓
 
     ⚠️ 这一格是整件事的命门：未授权时这里**不出现任何 `reason` 文本** ✗
-       （模糊的只是一层"留白占位" —— 真正的文本压根没进 HTML ✓ 主人裁定的验收口径 ✓）
+       （毛玻璃背后只是一层"灰条骨架" —— 真正的文本压根没进 HTML ✓ 主人裁定的验收口径 ✓）
     ⚠️ `applies=False` ⇒ **这一格根本不归锁管**（没哈希 / 没配账本 / 功能关着 ⇒ 原样显示 ✓）
-    ⚠️ 毛玻璃那层是 `backdrop-filter` + 半透明底（深浅两套主题都好看 ✓ 见 CSS ✓），
-       老浏览器没有它 ⇒ 退回不透明底 + 一把小锁（**仍然好看、仍然什么字都没有** ✓）
+    ⚠️ **🔑 口令框不在这里**（主人 2026-10-15 当场指出：**一路一个框**太乱 ✗）——
+       全页只有**票头那一个框**，输一次解锁**整列** ✓（见 `gate_toolbar()` ✓）
+    ⚠️ 老浏览器没有 `backdrop-filter` ⇒ 退回不透明底 + 一把小锁（**仍然好看、仍然什么字都没有** ✓）
     """
     reason = str(item.get("reason") or "")
     kind = str(item.get("kind") or "")
@@ -365,23 +368,9 @@ def gate_cell(item, self_id, opened, applies=True):
         return {"v": reason or "—", "raw": False}
     if opened:
         return {"v": reason, "raw": False}
-    state, note = gate_state(self_id)
-    if state == "open":                       # 调用方先问过 ⇒ 这里只是兜一个底 ✓
-        return {"v": reason, "raw": False}
-    if state == "locked":
-        form = ('<form class="gform" method="post" action="/api/unlock">'
-                '<input type="hidden" name="sid" value="%s">'
-                '<input class="gpw" type="password" name="code" data-gate-pw="1" '
-                'autocomplete="off" placeholder="她的钥匙" aria-label="输入她的愿力面板口令">'
-                '<button class="gbtn" type="submit">解锁</button></form>'
-                % html.escape(str(self_id)))
-    else:                                     # 还没有哈希 / 已经过期 ⇒ 给框也没用，如实说 ✓
-        form = ""
-    return {"v": ('<div class="gcell" title="她写下的心情理由 —— 默认只有她自己看得到">'
-                  '<div class="gblur" aria-hidden="true">%s</div>%s'
-                  '<div class="gnote">%s</div></div>')
-                 % ("•" * 18, form, html.escape(note)),
-            "raw": True}
+    return {"v": '<div class="gcell" title="她写下的心情理由 —— 默认只有她自己看得到，'
+                 '要看就拿她的钥匙来开"><span class="gskel w1"></span>'
+                 '<span class="gskel w2"></span></div>', "raw": True}
 
 
 
@@ -807,34 +796,31 @@ GATE_CSS_MAIN = """
  }
  @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
   :root{--gate-wash:var(--soft-bg)}
-  .gblur{color:transparent;opacity:1}
   .gcell::after{content:"\\1F512";position:absolute;right:9px;top:4px;z-index:0;
    font-size:13px;opacity:.5}
  }
- /* 一格：毛玻璃遮罩 + 口令框（深浅两套主题都好看 ✓） */
+ /* 一格：一层毛玻璃（**背后只有灰条骨架，一个字都没有** ✗） */
  td.gcell-td{padding:6px 10px}
- .gcell{position:relative;min-height:32px;border-radius:8px;overflow:hidden;
+ .gcell{position:relative;min-height:30px;border-radius:8px;overflow:hidden;
   border:1px solid var(--line);background:var(--soft-bg);isolation:isolate;
-  padding:6px 9px 7px;display:flex;flex-direction:column;gap:5px}
- /* 那层"毛玻璃"：盖住整格（`inset:0` ✓）· 背后只有一串点，**没有一个字是真的** ✗ */
- .gblur{position:absolute;inset:0;z-index:0;background:var(--gate-wash);
+  padding:7px 9px;display:flex;flex-direction:column;gap:6px;justify-content:center;
   -webkit-backdrop-filter:blur(12px) saturate(150%);
-  backdrop-filter:blur(12px) saturate(150%);
-  color:var(--ink2);font-size:19px;letter-spacing:.42em;line-height:2.4;
-  white-space:nowrap;overflow:hidden;padding:4px 10px;user-select:none;
-  pointer-events:none;opacity:.85}
- .gform{position:relative;z-index:1;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
- .gpw{font:inherit;font-size:12.5px;width:9.5em;padding:4px 9px;border-radius:7px;
+  backdrop-filter:blur(12px) saturate(150%);background:var(--gate-wash)}
+ /* 骨架条：宽度错开一点 ⇒ 像一行被糊住的字，而不是三条整齐的杠 ✓ */
+ .gskel{display:block;height:6px;border-radius:3px;background:currentColor;opacity:.16}
+ .gskel.w1{width:88%}
+ .gskel.w2{width:54%}
+ /* 🔑 全页**只有这一个**口令框（在票头）—— 输一次解锁整列 ✓ 主人 2026-10-15 当场指出的 ✓ */
+ .gtbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+ .gpw{font:inherit;font-size:12.5px;width:10em;padding:4px 9px;border-radius:7px;
   border:1px solid var(--line);background:var(--card);color:var(--ink);letter-spacing:.16em}
  .gpw::placeholder{color:var(--mut);letter-spacing:0}
  .gbtn{font:inherit;font-size:12.5px;cursor:pointer;padding:4px 11px;border-radius:999px;
   border:1px solid transparent;background:var(--violet);color:#fff;font-weight:600}
  .gbtn:hover{filter:brightness(1.09)}
- .gnote{position:relative;z-index:1;font-size:11px;color:var(--mut)}
  .glock{position:relative;z-index:1;display:flex;gap:7px;align-items:baseline;
   font-size:12.5px;color:var(--ink2);font-weight:600}
- .gtbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
- .gtbar .gpw{width:10em}
+ .gnote{font-size:12px;color:var(--bad)}
 """
 
 
@@ -854,14 +840,17 @@ def page_html(title, nav, script, path, shown, refresh_chip, body, gate_css=GATE
 
 
 def gate_toolbar(data, opened, applies):
-    """票头那颗「心情那一列盖住了」+ **一个口令框**（一个框管所有 bot ✓）。
+    """票头那颗「心情那一列盖住了 N 条」+ **全页唯一的一个口令框** ✓
 
+    ⚠️ 主人 2026-10-15 当场指出的两件（本鱼原来做错了 ✗）：
+       · **一个框管整列** —— 原来是"每一条流水一个框" ⇒ 那一列被塞满、根本没法看 ✗
+       · 输了就对 ⇒ 整页重来（那一列全变成原话）✓
     ⚠️ 它就是一个**原生 `<form method="post">`** ⇒ **关掉 JS 也能解锁** ✓
        （有 JS 时被那段内联 JS 接管成"就地提交 + 自动刷一次"，见 `FLOW_JS` ✓）
+    ⚠️ 框里**不带 `sid`** ⇒ 服务端**挨个 bot 试**：A 的钥匙只开得了 A 的列 ✓（多 bot 也是输一次 ✓）
     ⚠️ 两个数**分开数**（别混 ✗）：
        · `hidden` = 真的有原话、而且**这一格归锁管**的行数（没哈希的行**不算被锁** ✓）
        · `ready`  = 本机已经有了**没过期**的哈希的 bot 数（一个都没有 ⇒ 不给框 ✓）
-    ⚠️ 这里**不显示口令对不对**：对了就整页重来（那一列变成原话），错了就红一句 ✓
     """
     if not gate_enabled():
         return ""
@@ -881,11 +870,11 @@ def gate_toolbar(data, opened, applies):
     if not hidden:
         return ""
     if ready:
-        form = ('<form method="post" action="/api/unlock">'
+        form = ('<form class="gform" method="post" action="/api/unlock">'
                 '<input class="gpw" type="password" name="code" data-gate-pw="1" '
                 'autocomplete="off" placeholder="她的钥匙" aria-label="输入她的愿力面板口令">'
                 '<button class="gbtn" type="submit">解锁</button></form>')
-        tail = "拿她的钥匙来开（一个框够了：A 的钥匙只开 A 的 ✓）"
+        tail = "输入一次就解锁整列（每把钥匙只开它自己那一列）"
     else:
         form = ""
         tail = "本机还没有钥匙的哈希 —— 去服务器点一次「⟳ 一键拉取新副本」"
@@ -1205,28 +1194,29 @@ FLOW_JS = """<script>
     ev.preventDefault();
     load(link.getAttribute('data-more'), true);
   });
-  // 心情那一列：解锁。**真发请求给服务端**（前端只管把口令送过去 ✓ 判对错的是服务端 ✓）
+  // 心情那一列：解锁。**全页只有票头那一个框**（输一次解锁整列 ✓ 主人 2026-10-15 指出的 ✓）
+  // 真发请求给服务端（前端只管把口令送过去 ✓ 判对错的是服务端 ✓）
   // ⚠️ 只许在这一段里做（整页刚好一段内联 JS ✗ 纪律见 P14）；关掉 JS 时它就是个
-  //    原生表单 POST ⇒ 照样能解锁 ✓
+  //    原生表单 POST ⇒ 照样能解锁（服务端回 303 + Set-Cookie ✓）
   document.addEventListener('submit', function (ev) {
-    var box = ev.target && ev.target.closest ? ev.target.closest('.gcell, .gtbar') : null;
+    var box = ev.target && ev.target.closest ? ev.target.closest('.gtbar') : null;
     if (!box) { return; }
     var pw = box.querySelector('input[data-gate-pw]');
-    var sid = box.querySelector('input[name=sid]');
     if (!pw || !pw.value) { return; }
     ev.preventDefault();
     var body = new URLSearchParams();
     body.set('code', pw.value);
-    body.set('sid', sid ? sid.value : '');
     fetch('/api/unlock', {method: 'POST', body: body,
                           headers: {'Content-Type': 'application/x-www-form-urlencoded',
                                     'X-Panel-Unlock': '1'}})
       .then(function (resp) { return resp.json().catch(function () { return {}; }); })
       .then(function (info) {
         if (info && info.ok) { location.reload(); return; }
-        var note = box.querySelector('.gnote');
-        if (note) { note.textContent = (info && info.error) || '口令不对'; }
+        var note = box.querySelector('.gnote') || box.appendChild(document.createElement('span'));
+        note.className = 'gnote';
+        note.textContent = (info && info.error) || '口令不对';
         pw.value = '';
+        pw.focus();
       });
   });
 })();
