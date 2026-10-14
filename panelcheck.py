@@ -15,8 +15,11 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timedelta
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 PANEL = os.path.join(HERE, "panel.py")
@@ -109,7 +112,73 @@ class Env:
         return now
 
 
-# ─────────────────────────────── 各项 ───────────────────────────────
+def gate_dash_css(page):
+    """把整页 + **面板源码**拼起来给自检扫（本页只有一个 `<style>`，但源码里有别段 CSS ✗）
+
+    ⚠️ 两个口径分开数（`page.count` 守着"内联只有一段" ✓）；这里只管
+       "两条主题规则在不在、注释说了什么" —— 源码一起看 ✓
+    """
+    try:
+        with open(PANEL, encoding="utf-8") as handle:
+            return page + handle.read()
+    except OSError:
+        return page
+
+
+def gate_write_keys(env, codes, rotated="", ttl_hours=24):
+    """给自检造一份**本机哈希文件**（口径与插件写出来的逐字一致 ✓）
+
+    ⚠️ 必须调**插件自己的** `gate_hash()` 来算 —— 自己另写一份哈希就等于
+       "自测自己"，面板与插件之间那点契约就没人守了 ✗（R53 也走同一条路 ✓）
+    """
+    mod = env.mod
+    rotated = rotated or time.strftime("%Y-%m-%d %H:%M:%S")
+    stamp = datetime.strptime(rotated, "%Y-%m-%d %H:%M:%S")
+    expiry = (stamp + timedelta(hours=ttl_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    data = {}
+    for sid, code in codes.items():
+        data[str(sid)] = {"day": rotated[:10],
+                          "hash": mod.gate_hash(code, expiry, rotated),
+                          "rotated": rotated}
+    path = os.path.join(os.path.dirname(env.db), env.panel.GATE_FILE)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=1)
+    return path
+
+
+def gate_codes(env, count=3):
+    """给两个 bot 各造一把合规口令 + 一份哈希文件，并各写几条带原话的心情流水 ✓"""
+    now = int(time.time())
+    good_a = env.mod.gate_generate()
+    good_b = env.mod.gate_generate()
+    while good_b == good_a:
+        good_b = env.mod.gate_generate()
+    for index in range(count):
+        env.sc.raw_mood(env.mod, env.sc.ALICE, 5, "gate-a-%d" % index, now + index)
+        env.sc.raw_mood(env.mod, env.sc.ALICE, 5, "gate-b-%d" % index, now + index,
+                        group=env.sc.GROUP2, bot=env.sc.OTHER_BOT)
+    # ⚠️ 面板/自检造数走的是 `db_mood`（reason 写死「自检」）⇒ 这里**照真机那样**再写几条
+    #    带真原话的（面板要挡的正是这一列 ✗）。
+    #    ⚠️ 但是**别按 `ref` 去认行** —— `db_mood` 落库的 ref 不是传进去那个（P14 上栽过一次 ✗）
+    #       ⇒ 按「这个 bot 最近几条 mood」认，一次一条、从最新往后排 ✓
+    conn = env.mod._connect()
+    try:
+        for sid, marks in ((env.sc.BOT, ("原话A-0", "原话A-1")),
+                           (env.sc.OTHER_BOT, ("原话B-0", "原话B-1"))):
+            rows = conn.execute(
+                "SELECT id FROM ledger WHERE self_id=? AND kind='mood' "
+                "ORDER BY id DESC LIMIT ?", (sid, len(marks))).fetchall()
+            # ⚠️ 认行必须**钉死这个 bot 自己**的行（`self_id=?` 这个条件别省 ✗）——
+            #    本鱼第一版只按 id 倒序、把标记盖到了另一个 bot 的行上 ⇒ P15 当场报"原话泄漏" ✓
+            for row, mark in zip(rows, marks):
+                conn.execute("UPDATE ledger SET reason=? WHERE id=? AND self_id=?",
+                             (mark, row["id"], sid))
+        conn.commit()
+    finally:
+        conn.close()
+    path = gate_write_keys(env, {env.sc.BOT: good_a, env.sc.OTHER_BOT: good_b})
+    return good_a, good_b, path
+
 
 def t01_readonly(env, _unused):
     """面板的连接**写不了库**（SQLite `mode=ro` 直接拒）✓"""
@@ -827,6 +896,265 @@ def t14_day_and_kind_filter(env, _unused):
     return True
 
 
+def t15_mood_gate_server(env, _unused):
+    """**心情隐私锁**（主人 2026-10-15 让做的 ✓）：`canon/_29` §6 那五条，一条不许少 ✓
+
+    1. **未授权 ⇒ DOM 里翻不到任何一条 mood 的 reason** —— 不是"看不见"，是**不存在** ✗
+       （只用 CSS 模糊 ⇒ F12 / `Ctrl+A` 就全看到了 ✗ = 窗帘不是锁 ✗ 主人实测点名的坑 ✓）
+    2. **错口令 ⇒ 拒绝**，而且**限次生效**（5 次锁 30 分钟 ✓）
+    3. **对口令 ⇒ 才发得下来** ✓
+    4. **两种状态下，金额 / 方向 / 点数照旧可见**（不许把运营一起锁瞎 ✗ 命门 ✓）
+    5. **多 bot：A 的钥匙开不了 B 的遮罩** ✓
+
+    ⚠️ 还有一条只有自检能守的：**片段模式**（那段内联 JS 用的 `div.flows`）也必须带锁 ——
+       不然"换个日期"就把她的原话又吐出来了 ✗
+    """
+    good_a, good_b, keys = gate_codes(env)
+    bot_a, bot_b = str(env.sc.BOT), str(env.sc.OTHER_BOT)
+    if not keys or not os.path.isfile(keys):
+        print("      哈希文件没造出来:", keys)
+        return False
+
+    httpd = env.panel.serve(env.db, "127.0.0.1", 0, quiet=True)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            """⚠️ 不许 urllib 自动跟 303 —— 那样就看不到那条跳转和 Set-Cookie 了 ✗
+            （本鱼第一版就吃了这个：它把 303 跟完了、交回一个**已授权页面**的 200/HTML ✓）"""
+
+            def redirect_request(self, *args, **kwargs):
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect)
+
+        def fetch(path, data=None, headers=None, cookie=""):
+            # ⚠️ **不传 `headers`** 时**不加** `X-Panel-Unlock` —— 那条头就是"这是那段内联 JS
+            #    发来的"的记号 ⇒ 不加它才走**原生表单**那条路（关掉 JS 的人走的就是它 ✓）
+            head = dict(headers) if headers is not None else {"X-Panel-Unlock": "1"}
+            if cookie:
+                head["Cookie"] = cookie
+            body = urllib.parse.urlencode(data).encode() if data is not None else None
+            if body is not None:
+                head.setdefault("Content-Type", "application/x-www-form-urlencoded")
+            req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path),
+                                         data=body, headers=head)
+            try:
+                with opener.open(req, timeout=10) as resp:
+                    return resp.status, resp.read().decode("utf-8"), dict(resp.headers)
+            except urllib.error.HTTPError as exc:
+                return exc.code, exc.read().decode("utf-8"), dict(exc.headers)
+
+        # ── ① 未授权：DOM 里找不到任何原话 ──
+        code, page, _head = fetch("/")
+        if code != 200:
+            print("      未授权那次页面没起来:", code)
+            return False
+        for mark in ("原话A-0", "原话A-1", "原话B-0", "原话B-1"):
+            if mark in page:
+                print("      **未授权就能在 HTML 里搜到她的原话** ✗（CSS 模糊 = 窗帘 ✗）:", mark)
+                return False
+        # ── ④ 金额 / 方向 / 点数照旧可见（命门：不许把运营一起锁瞎 ✗）──
+        for token in ("+5", "收愿力", "数额", "钱包一览", "未结欠条"):
+            if token not in page:
+                print("      未授权时把运营该看的东西也弄没了 ✗", token)
+                return False
+        # 毛玻璃 + 口令框在页面上（好看那部分 ✓）
+        for token in ("gcell", "gblur", "backdrop-filter", "gform", "data-gate-pw"):
+            if token not in gate_dash_css(page):
+                print("      遮罩/口令框的样式或结构缺了:", token)
+                return False
+        if "gblur" not in page or 'action="/api/unlock"' not in page:
+            print("      未授权时页面上没有遮罩 / 解锁表单 ✗")
+            return False
+        # 深浅两套主题都要好看（两套底色 + 不支持毛玻璃时的退路 ✓）
+        for token in ("prefers-color-scheme:dark", "--gate-wash", "@supports not"):
+            if token not in gate_dash_css(page):
+                print("      主题那部分缺了:", token)
+                return False
+        if page.count("<script") != 1:
+            # ⚠️ 只数 `<script>`（主人 2026-10-14 定的那条：**恰好一段内联 JS** ✓）——
+            #    `<style>` 本来就还有第二段（每张表的展开规则 `stage_css` ✓ 一直如此）
+            #    ⇒ 别在这里顺手加严 ✗（本鱼自己加过一次，当场被自己绊了一下 ✓）
+            print("      解锁逻辑必须并进**那一段**内联 JS（不许第二段 ✗）:",
+                  page.count("<script"))
+            return False
+        # 片段模式（换日期走的那条路）也必须带锁 ✗
+        code, frag, _head = fetch("/?day=", {"X-Panel-Partial": "1"} if False else None,
+                                  {"X-Panel-Partial": "1"})
+        if code != 200 or "原话A-0" in frag or "gcell" not in frag:
+            print("      片段模式把锁漏了（换个日期就露出来了 ✗）:", code)
+            return False
+
+        # ── ② 错口令 ⇒ 拒绝 ──
+        code, body, _head = fetch("/api/unlock", {"sid": bot_a, "code": "WRONG1"},
+                                  {"X-Panel-Unlock": "1"})
+        if code != 200 or json.loads(body).get("ok"):
+            print("      错口令居然过了:", code, body[:80])
+            return False
+        # ── ⑤ A 的钥匙开不了 B 的遮罩 ──
+        code, body, head = fetch("/api/unlock", {"sid": bot_a, "code": good_a},
+                                 {"X-Panel-Unlock": "1"})
+        info = json.loads(body)
+        if code != 200 or not info.get("ok"):
+            print("      **对口令反而被拒**（那这把锁就白做了 ✗）:", code, body[:120])
+            return False
+        cookie = (head.get("Set-Cookie") or "").split(";")[0]
+        if not cookie.startswith(env.panel.GATE_COOKIE + "="):
+            print("      没发 session cookie:", head.get("Set-Cookie"))
+            return False
+        code, page_a, _head = fetch("/", cookie=cookie)
+        if "原话A-0" not in page_a:
+            print("      授权之后**A 的原话还是下不来** ✗")
+            return False
+        if "原话B-0" in page_a:
+            print("      **A 的钥匙把 B 的遮罩也开了** ✗（每 bot 一把是主人的硬要求）")
+            return False
+        if "原话A-0" not in fetch("/?day=", None, {"X-Panel-Partial": "1"}, cookie)[1]:
+            print("      授权之后片段模式反而没解锁 ✗")
+            return False
+        # ── ③ 对口令 ⇒ 才发得下来（B 那把同样只开 B 自己）──
+        code, body, head = fetch("/api/unlock", {"sid": bot_b, "code": good_b},
+                                 {"X-Panel-Unlock": "1"})
+        cookie_b = (head.get("Set-Cookie") or "").split(";")[0]
+        if not json.loads(body).get("ok") or not cookie_b:
+            print("      B 的对口令没通过:", body[:120])
+            return False
+        page_b = fetch("/", cookie=cookie_b)[1]
+        if "原话B-0" not in page_b or "原话A-0" in page_b:
+            print("      B 的钥匙开错了范围 ✗")
+            return False
+        # 票据头那颗框（不带 sid）也要能开：它**挨个试**，只会开中口令对的那个 ✓
+        code, body, head = fetch("/api/unlock", {"code": good_a}, {"X-Panel-Unlock": "1"})
+        if not json.loads(body).get("ok"):
+            print("      票头那颗框（不带 sid）开不了:", body[:120])
+            return False
+        code, body, _head = fetch("/api/unlock", {"code": "ZZZZZZ"}, {"X-Panel-Unlock": "1"})
+        if json.loads(body).get("ok"):
+            print("      票头那颗框拿着错口令也开了 ✗")
+            return False
+        # ── ② 限次：错到第 5 次就锁（**在服务端** ✓ 直接打接口也挡得住 ✓）──
+        seen = []
+        for _ in range(6):
+            code, body, _head = fetch("/api/unlock", {"sid": bot_a, "code": "WRONG1"},
+                                      {"X-Panel-Unlock": "1"})
+            seen.append(json.loads(body).get("error") or "")
+        if not any("锁" in text for text in seen):
+            print("      连错 6 次都没锁 ✗:", seen)
+            return False
+        code, body, _head = fetch("/api/unlock", {"sid": bot_a, "code": good_a},
+                                  {"X-Panel-Unlock": "1"})
+        if json.loads(body).get("ok"):
+            print("      **锁着的时候对口令也放行** ✗（限次等于没有）")
+            return False
+        # ── 原生表单那条路（关掉 JS 也能解锁 ✓）：303 + Set-Cookie ──
+        env.panel._gate_tries.clear()            # 解开刚才那把锁（只动内存 ✓）
+        code, body, head = fetch("/api/unlock", {"sid": bot_b, "code": good_b},
+                                 headers={"Referer": "http://127.0.0.1:%d/" % port})
+        if code != 303 or not (head.get("Set-Cookie") or ""):
+            print("      关掉 JS 的那条路（原生表单）走不通:", code, head.get("Set-Cookie"))
+            return False
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+    # ── 反向对照：把「锁」关掉 ⇒ 原话立刻回到 DOM 里（证明上面那些断言真的在看锁 ✓）──
+    plain = env.panel.render(env.panel.snapshot(env.db))
+    if "原话A-0" not in plain:
+        print("      反向对照失败：没标记「该盖住」的渲染里本来就没有原话（那这条自检没在起作用）✗")
+        return False
+    if "原话A-0" in env.panel.render(env.panel.snapshot(env.db), gated=[bot_a]):
+        print("      反向对照失败：标了「该盖住」却还是把原话发下来了 ✗")
+        return False
+    return True
+
+
+def t16_gate_browser(env, _unused):
+    """**真浏览器**：毛玻璃遮罩看得见、原话看不见；输对口令之后原话才出来 ✓
+
+    ⚠️ 这条是主人「毛玻璃遮罩 + 深色主题也要好看」那句的**可验收版本** ✗：
+       自检断言"我写的 CSS 在不在"是不够的（面板那四轮真机 bug 全是"自检全绿、观感全错" ✗）
+       ⇒ 真开 Chromium：量 `backdrop-filter` 真的生效、`Ctrl+A` 全选也选不到原话、
+         输口令 + 提交（**走真表单**，不靠 JS ✓）之后原话才出现 ✓
+    """
+    if os.environ.get("PANEL_E2E") == "0":
+        print("      （按 PANEL_E2E=0 显式跳过浏览器验收）")
+        return True
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        print("      没装 playwright ⇒ 真浏览器验收跑不了（PANEL_E2E=0 可显式跳过 ✓）")
+        return False
+    good_a, _good_b, _keys = gate_codes(env)
+    bot_a = str(env.sc.BOT)
+    httpd = env.panel.serve(env.db, "127.0.0.1", 0, quiet=True)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    errors = []
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch()
+            page = browser.new_page(viewport={"width": 1280, "height": 800},
+                                    color_scheme="dark")      # 深色主题也要好看 ✓
+            page.on("pageerror", lambda exc: errors.append(str(exc)[:120]))
+            page.goto("http://127.0.0.1:%d/" % port, wait_until="load")
+            # 遮罩真的在、真的糊（`backdrop-filter` 生效）
+            blur = page.eval_on_selector(
+                ".gcell .gblur", "el => getComputedStyle(el).backdropFilter"
+                " || getComputedStyle(el).webkitBackdropFilter || ''")
+            if "blur" not in (blur or ""):
+                print("      深色主题下毛玻璃没生效:", repr(blur))
+                return False
+            if page.eval_on_selector(".gcell", "el => el.offsetHeight") < 20:
+                print("      遮罩那一格塌了 ✗")
+                return False
+            # 全选也选不到她的原话（不是"看不见"，是**不在 DOM 里** ✗）
+            page.keyboard.press("Control+a")
+            selected = page.evaluate("() => String(window.getSelection())")
+            for mark in ("原话A-0", "原话A-1"):
+                if mark in selected:
+                    print("      **Ctrl+A 就选出了她的原话** ✗（这正是主人点名的坑）:", mark)
+                    return False
+            if "原话A-0" in page.content():
+                print("      HTML 源码里就有她的原话 ✗")
+                return False
+            # 走**真表单**提交（不碰 JS 那条路 ✓）
+            # ⚠️ 之后必须**等重载真的完成**再断言 ✗ —— 提交会先被那段内联 JS 接住、
+            #    发完 `/api/unlock` 再自己 `location.reload()`；本鱼第一版只
+            #    `wait_for_load_state('load') + 300ms` ⇒ 量到的是**旧那一页** ⇒ 假红 ✓
+            page.fill("input[data-gate-pw]", good_a)
+            page.keyboard.press("Enter")
+            try:
+                page.wait_for_function(
+                    "() => document.body.innerText.indexOf('原话A-0') >= 0", timeout=8000)
+            except Exception:                     # noqa: BLE001 —— 等不到就走下面的断言报出来
+                pass
+            if "原话A-0" not in page.content():
+                print("      输了对口令、走了真表单，原话还是没出来 ✗")
+                return False
+            if os.environ.get("PANEL_E2E_SHOT"):
+                page.screenshot(path=os.environ["PANEL_E2E_SHOT"], full_page=False)
+            # 再来一张**未授权**的：深浅两套主题都拍给人看 ✓
+            shot2 = os.environ.get("PANEL_E2E_SHOT2")
+            if shot2:
+                fresh = browser.new_page(viewport={"width": 1280, "height": 800},
+                                         color_scheme="light")
+                fresh.goto("http://127.0.0.1:%d/" % port, wait_until="load")
+                box = fresh.query_selector(".gcell")
+                if box:
+                    box.scroll_into_view_if_needed()
+                    fresh.wait_for_timeout(120)
+                fresh.screenshot(path=shot2, full_page=False)
+            browser.close()
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+    if errors:
+        print("      浏览器里报 JS 错:", errors)
+        return False
+    return True
+
+
 TESTS = [
     ("P01 只读连接写不了库", t01_readonly),
     ("P02 快照读得到发行/钱包/欠条/流水", t02_snapshot_content),
@@ -842,6 +1170,8 @@ TESTS = [
     ("P12 被注视单独一页（流水不含它）", t12_attention_page),
     ("P13 真浏览器：点完不位移 / 批次不回收 / 只一颗按钮", t13_browser_no_jump),
     ("P14 按日检索 + 类别筛选（默认本日）+ JS 纪律", t14_day_and_kind_filter),
+    ("P15 心情锁（服务端扣住 / 限次 / 多 bot / 片段模式）", t15_mood_gate_server),
+    ("P16 真浏览器：毛玻璃生效 · Ctrl+A 也选不到原话 · 输口令才出来", t16_gate_browser),
 ]
 
 

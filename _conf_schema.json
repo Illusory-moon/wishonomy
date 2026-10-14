@@ -81,5 +81,23 @@
     "type": "text",
     "default": "[{\"cost\": 1, \"name\": \"低档\", \"note\": \"\"}, {\"cost\": 100, \"name\": \"中档\", \"note\": \"\"}, {\"cost\": 1380, \"name\": \"高档\", \"note\": \"\"}]",
     "hint": "形如 [{\"cost\": 1, \"name\": \"某物\"}]。名字请按自己世界观填 —— 通用插件里不写具体作品的名词。"
+  },
+  "notes_path": {
+    "description": "各 bot 的笔记文件路径（JSON 对象，键是 bot ID）",
+    "type": "text",
+    "default": "{}",
+    "hint": "形如 {\"123456\": \"/opt/astrbot/data/xxx_notes.md\"}。留空 = 心情隐私锁整套关着。相对路径按本插件的数据目录解析。"
+  },
+  "mood_gate": {
+    "description": "心情隐私锁：每天给一把口令，写进它自己的笔记",
+    "type": "bool",
+    "default": true,
+    "hint": "面板上「她写下的心情理由」那一列默认盖住，要看就得拿她笔记里那把口令来开。要配 notes_path 才有意义（没配就是关着的）。"
+  },
+  "mood_gate_ask_from": {
+    "description": "哪些人问「钥匙」时才提醒它（留空 = 私聊里谁问都提醒）",
+    "type": "text",
+    "default": "",
+    "hint": "只对私聊生效（群里刷一句不会惊动它）。填了名单就只认名单里的人；触发词见 README。"
   }
 }

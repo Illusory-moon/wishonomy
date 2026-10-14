@@ -27,9 +27,12 @@
    服务端只读"所选那一天的 N 行"（`?day=&kind=&n=`），大用量实例一天几万笔也扛得住 ✓
 """
 import argparse
+import hashlib
+import hmac
 import html
 import json
 import os
+import secrets
 import sqlite3
 import sys
 import threading
@@ -109,6 +112,277 @@ WALLET_LIMIT = 30
 ATTENTION_KIND = "attention"   # 「被注视」的流水类别 —— **不进最近流水**，单独一页 ✓
 ATTENTION_DAYS = 60            # 「被注视次数」那页按天最多列多少天
 CN_HOURS = int(CN_TZ.utcoffset(None).total_seconds() // 3600)   # SQLite 分天用（与 CN_TZ 同源 ✓）
+
+# ───────────────────── 心情隐私锁（「她的心情理由」那把门）─────────────────────
+# 主人 2026-10-15 原话：「该把属于心情的隐私权归还给她了」✓ 方案见 `canon/_29` ✓
+# 一句话：`mood` 那一类的 `reason`（**她为什么这么想**）默认盖住；**金额 / 方向 / 点数照旧可见** ✓
+#
+# ⚠️ **命门（本鱼实测的硬结论，别改回去 ✗）**：**服务端扣住文本** ——
+#    未授权时那条 reason **压根不下发**（不是"遮住"）✗
+#    只用 CSS 模糊 ⇒ F12 / `Ctrl+A` 就全看得到 ✗ —— **那不是锁，是窗帘** ✗
+#    验收口径：**未授权时 DOM 里找不到那条 reason**（不是"看不见"）✓
+#
+# ⚠️ 三条纪律一条都没松：
+#   ① 连接仍然 `mode=ro`（**只读** ✓ —— 面板仍然写不了库）② session 只在**内存** ✓
+#   ③ **不落审计** ✓（`canon/_29` §7：本机、单人、只绑 127.0.0.1 ⇒ 记了也是自己记自己 ✗）
+GATE_FILE = "wish_gate_keys.json"      # 口令**哈希**的小文件（跟账本副本同一个批次拉回来 ✓）
+GATE_TTL_SECONDS = 24 * 3600           # 授权一次管 24 小时（照 `_19` 的口径 ✓）
+GATE_MAX_TRIES = 5                     # 连错几次就锁
+GATE_LOCK_SECONDS = 30 * 60            # 锁多久
+GATE_COOKIE = "wishgate"
+GATE_MOOD_KINDS = ("mood",)            # 锁的就是这一类（见 `canon/_29` §1 的表 ✓）
+
+_gate_sessions = {}                    # token -> (self_id, client, 到期时刻) —— **只在内存** ✓
+_gate_tries = {}                       # (client, self_id) -> (错了几次, 锁到什么时候)
+_gate_lock = threading.Lock()
+
+
+def gate_enabled():
+    """面板这一次启动有没有把这道门打开（`--no-mood-gate` 关掉它 ✓）。
+
+    ⚠️ 默认开，但**没有哈希文件时它什么也不做**（`gate_keys()` 返回空 ⇒ 一切照旧 ✓）
+       ⇒ 老库、没配账本的 bot、整套功能没开的实例，看板行为与从前**一模一样** ✓
+    """
+    return bool(getattr(Handler, "mood_gate", True))
+
+
+def gate_keys(db_path):
+    """读那份**口令哈希**小文件（跟账本副本放同一个目录、同一次拉取 ✓）。
+
+    面板拿到的只有 `{bot: {day, hash, rotated}}` —— **明文永远只在她自己的账本里** ✓
+    """
+    path = os.path.join(os.path.dirname(str(db_path)) or ".", GATE_FILE)
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def gate_expired(entry, now=None):
+    """这条哈希过期了没有 —— 口径**必须与插件侧完全一致**：`轮换时刻 + 24 小时` ✓
+
+    ⚠️ 两边都从「轮换时刻」推，**不存明文、也不各算一套** ✗（`main.gate_expiry()` 同源 ✓）
+    """
+    rotated = str((entry or {}).get("rotated") or "")
+    if not rotated:
+        return True
+    try:
+        base = datetime.strptime(rotated, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN_TZ)
+    except ValueError:
+        return True
+    now = now if now is not None else datetime.now(CN_TZ)
+    return now >= base + timedelta(seconds=GATE_TTL_SECONDS)
+
+
+def gate_hash(code, entry):
+    """重算校验材料 —— 与 `main.gate_hash()` **同一个算法**（自检里有一条跨模块比对 ✓）
+
+    = sha256(口令 + 到期时刻 + 轮换时刻) ⇒ 面板**不必知道明文**，也能判断
+      "这把是不是今天那把、过期了没有" ✓（口令一换 / 一过期，旧哈希天然作废 ✓）
+    """
+    rotated = str((entry or {}).get("rotated") or "")
+    try:
+        base = datetime.strptime(rotated, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN_TZ)
+    except ValueError:
+        return ""
+    expiry = base + timedelta(seconds=GATE_TTL_SECONDS)
+    raw = "%s|%s|%s" % (str(code or "").strip().upper(),
+                        expiry.strftime("%Y-%m-%d %H:%M:%S"), rotated)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def gate_client(handler):
+    """这把门认的"同一个来访者"—— 本机面板，回环地址就够了 ✓"""
+    try:
+        return str(handler.client_address[0])
+    except (AttributeError, IndexError, TypeError):
+        return "?"
+
+
+# 这一次请求是谁、带着哪把 session（由 `Handler` 在渲染前填 ✓）。
+# ⚠️ 用**模块级字典**而不是 `threading.local`：自检里是**同一个线程**直接调 `render()` ✓
+_gate_ctx = {"client": "", "token": ""}
+
+
+def gate_sessions():
+    """清掉过期的 session（顺手做，省一个定时器 ✓）"""
+    now = time.time()
+    for token in [t for t, item in _gate_sessions.items() if item[2] <= now]:
+        _gate_sessions.pop(token, None)
+
+
+def gate_token(self_id, client):
+    """授权成功 ⇒ 发一个**内存里**的 session（默认 24 小时 ✓）"""
+    token = secrets.token_urlsafe(24)
+    with _gate_lock:
+        gate_sessions()
+        _gate_sessions[token] = (str(self_id), str(client), time.time() + GATE_TTL_SECONDS)
+    return token
+
+
+def gate_open(self_id, token, client):
+    """这个 bot 的门开着吗（**按 bot 分** —— A 的钥匙开不了 B 的遮罩 ✓ 主人裁定 ✓）"""
+    if not token:
+        return False
+    with _gate_lock:
+        item = _gate_sessions.get(str(token))
+    if not item or item[0] != str(self_id) or item[1] != str(client):
+        return False
+    if item[2] <= time.time():
+        with _gate_lock:
+            _gate_sessions.pop(str(token), None)
+        return False
+    return True
+
+
+def gate_locked(client, self_id):
+    """锁着吗（连错 5 次锁 30 分钟 ✓）；锁到期就自动放开 ✓"""
+    with _gate_lock:
+        count, until = _gate_tries.get((str(client), str(self_id)), (0, 0))
+        if until and time.time() >= until:
+            _gate_tries.pop((str(client), str(self_id)), None)
+            return 0
+        return int(until) if until else 0
+
+
+def gate_try(self_id, code, client):
+    """核一次口令。返回 `(ok, 提示语)` —— **限次在服务端** ✓（前端挡不住直接请求 ✗）
+
+    对了 ⇒ 清掉计数 + 发 session（**session 只在内存** ✓ 不落盘、不进库、不写审计 ✓）。
+    """
+    self_id = str(self_id or "").strip()
+    entry = gate_keys(Handler.db_path).get(self_id) or {}
+    if not entry:
+        return False, "这个 bot 的钥匙还没到本机（在服务器上点一次「一键拉取」）"
+    if gate_expired(entry):
+        return False, "它今天还没生成新的口令（她今天还没被唤醒），或上一把已经过期"
+    until = gate_locked(client, self_id)
+    if until:
+        return False, "错得太多了，先锁 %d 分钟" % max(1, int((until - time.time()) // 60) or 1)
+    token = str(code or "").strip().upper()
+    if not token:
+        return False, "口令是空的"
+    if hmac.compare_digest(gate_hash(token, entry), str(entry.get("hash") or "")):
+        with _gate_lock:
+            _gate_tries.pop((str(client), self_id), None)
+        return True, gate_token(self_id, client)
+    with _gate_lock:
+        count, _until = _gate_tries.get((str(client), self_id), (0, 0))
+        count += 1
+        lock_until = time.time() + GATE_LOCK_SECONDS if count >= GATE_MAX_TRIES else 0
+        _gate_tries[(str(client), self_id)] = (count, lock_until)
+    if lock_until:
+        return False, "错 %d 次了，先锁 %d 分钟" % (GATE_MAX_TRIES, GATE_LOCK_SECONDS // 60)
+    return False, "口令不对（还能试 %d 次）" % max(0, GATE_MAX_TRIES - count)
+
+
+def _opener(gated):
+    """**这一格给不给看** + **这一格归不归锁管** —— 两问都在**渲染前**由服务端答好 ✗
+
+    返回 `(applies, opened)`：
+      · `applies(sid)` = 这一格是"被盖住"的那一类（**空表 = 整页照旧、一个字节都不动** ✓）
+      · `opened(sid)`  = 这一格的 session 到位了（可以原样看 ✓）
+    ⚠️ 两件事**必须分开**问：只问"开没开"是不够的 —— 没有哈希文件时谁都"没开"，
+       但那时候**根本不该有任何锁**（老库 / 没配账本 / 功能关着 ⇒ 页面与从前逐字一样 ✓）
+       （本鱼第一版只问了后者 ⇒ 连没配账本的场景也糊上一层 ✗ 被 P15 的反向对照抓住 ✓）
+    关闭开关 / 没哈希文件 / 没带 cookie ⇒ 一律**不给看**（fail-closed ✓）。
+    """
+    ids = {str(x) for x in (gated or [])}
+    if not ids or not gate_enabled():
+        return (lambda _sid: False), (lambda _sid: False)
+
+    def _applies(sid):
+        return str(sid) in ids
+
+    def _opened(sid):
+        if str(sid) not in ids:
+            return False
+        return gate_open(sid, _gate_ctx.get("token"), _gate_ctx.get("client"))
+
+    return _applies, _opened
+
+
+def gate_ready_ids(bots):
+    """哪些 bot 有被盖住的 reason（有哈希 + 没授权 + 真有 mood 行 ✓）
+
+    ⚠️ 返回**空表**时整页与从前逐字节一样（老库 / 没开这套功能 / 已授权 ✓）
+    """
+    if not gate_enabled():
+        return []
+    keys = gate_keys(Handler.db_path)
+    out = []
+    for bot in bots or []:
+        sid = str(bot["self_id"])
+        if sid not in keys or gate_expired(keys[sid]):
+            continue
+        if gate_open(sid, _gate_ctx.get("token"), _gate_ctx.get("client")):
+            continue
+        if any(str(row.get("kind")) in GATE_MOOD_KINDS and row.get("reason")
+               for row in bot["brief"]):
+            out.append(sid)
+    return out
+
+
+def gate_hours_left(entry):
+    """这把钥匙还能用几个小时（只拿来显示 ✓）"""
+    rotated = str((entry or {}).get("rotated") or "")
+    try:
+        base = datetime.strptime(rotated, "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN_TZ)
+    except ValueError:
+        return 0
+    left = (base + timedelta(seconds=GATE_TTL_SECONDS) - datetime.now(CN_TZ)).total_seconds()
+    return max(0, int(left // 3600))
+
+
+def gate_state(self_id):
+    """这个 bot 的锁**现在是什么状态** + 一句给人看的话（纯读 ✓）
+
+    四种：`open`（已解锁）· `locked`（有钥匙、还没开）· `missing`（哈希还没到本机）·
+    `expired`（她今天还没被唤醒 / 上一把过期了）✓
+    """
+    entry = gate_keys(Handler.db_path).get(str(self_id)) or {}
+    if not entry:
+        return "missing", "本机还没有钥匙（服务器上点一次「一键拉取」）"
+    if gate_expired(entry):
+        return "expired", "今天的钥匙还没生成（她今天还没被唤醒），或上一把已经过期"
+    return "locked", "还能用 %d 小时" % gate_hours_left(entry)
+
+
+def gate_cell(item, self_id, opened, applies=True):
+    """流水表里那一格：**授权了就原样给她写的原话，没授权就一个空格子** ✓
+
+    ⚠️ 这一格是整件事的命门：未授权时这里**不出现任何 `reason` 文本** ✗
+       （模糊的只是一层"留白占位" —— 真正的文本压根没进 HTML ✓ 主人裁定的验收口径 ✓）
+    ⚠️ `applies=False` ⇒ **这一格根本不归锁管**（没哈希 / 没配账本 / 功能关着 ⇒ 原样显示 ✓）
+    ⚠️ 毛玻璃那层是 `backdrop-filter` + 半透明底（深浅两套主题都好看 ✓ 见 CSS ✓），
+       老浏览器没有它 ⇒ 退回不透明底 + 一把小锁（**仍然好看、仍然什么字都没有** ✓）
+    """
+    reason = str(item.get("reason") or "")
+    kind = str(item.get("kind") or "")
+    if kind not in GATE_MOOD_KINDS or not reason or not applies:
+        return {"v": reason or "—", "raw": False}
+    if opened:
+        return {"v": reason, "raw": False}
+    state, note = gate_state(self_id)
+    if state == "open":                       # 调用方先问过 ⇒ 这里只是兜一个底 ✓
+        return {"v": reason, "raw": False}
+    if state == "locked":
+        form = ('<form class="gform" method="post" action="/api/unlock">'
+                '<input type="hidden" name="sid" value="%s">'
+                '<input class="gpw" type="password" name="code" data-gate-pw="1" '
+                'autocomplete="off" placeholder="她的钥匙" aria-label="输入她的愿力面板口令">'
+                '<button class="gbtn" type="submit">解锁</button></form>'
+                % html.escape(str(self_id)))
+    else:                                     # 还没有哈希 / 已经过期 ⇒ 给框也没用，如实说 ✓
+        form = ""
+    return {"v": ('<div class="gcell" title="她写下的心情理由 —— 默认只有她自己看得到">'
+                  '<div class="gblur" aria-hidden="true">%s</div>%s'
+                  '<div class="gnote">%s</div></div>')
+                 % ("•" * 18, form, html.escape(note)),
+            "raw": True}
+
 
 
 def connect(path):
@@ -473,7 +747,9 @@ tr.muted td{{color:var(--mut)}}
 
 footer{{max-width:1240px;margin:0 auto;padding:0 var(--pad) 40px;
  color:var(--mut);font-size:11.5px;line-height:1.7;overflow-wrap:anywhere}}
-
+/* ⚠️ 下面这一行是**占位符**：由 `page_html()` 把锁那段 CSS 塞进来
+   （本鱼在注释里手写过那个占位符的名字 ⇒ 被 replace 一起替换掉 ⇒ 整页 format 崩 ✗ 已改） */
+{gate_css}
 @media (max-width:720px){{
  :root{{--pad:12px}}
  .top{{padding:18px 14px 15px}}
@@ -501,7 +777,8 @@ footer{{max-width:1240px;margin:0 auto;padding:0 var(--pad) 40px;
 {script}
 <footer>本页是<b>只读</b>视图：数据来自账本的只读快照，页面上不会写入任何东西。<br>
  页面零外部依赖（没有 CDN / 外链字体 / 外链脚本）；JS 只有本页内联的那一小段，
- 只为了"换个日期/看点更早的别把页面弹回顶部" —— 关掉 JS 也一样能用 ✓</footer>
+ 只为了"换个日期/看点更早的别把页面弹回顶部"和"解锁时不用整页刷新" —— 关掉 JS 也一样能用 ✓
+ {gate_foot}</footer>
 </body></html>
 """
 
@@ -511,6 +788,109 @@ KIND_LABEL = {"mood": "收愿力", "gift": "送礼", "grant": "点单", "refund"
 # ⚠️ 原始 kind 仍然留在 `title=` 里（悬停可见）⇒ 对着库查账时不会被这层显示名挡住 ✓
 KIND_TEXT = {"mood": "收愿力", "gift": "送礼", "grant": "点单", "refund": "撤回",
              "credit": "信誉", "settle": "日结", "attention": "被注视", "initial": "初始"}
+
+GATE_FOOT = ("心情那一列（她写下的**为什么**）默认盖住 —— 那是**她的**，要看就拿她的钥匙来开。<br>"
+             "⚠️ <b>这不是加密</b>：有 shell 的人照样看得到她的账本；这把锁拦的是「顺手点开」✗<br>"
+             "面板侧**只认哈希**（明文只在她自己的账本里）；口令由她账本上的那一行产生、每天一换、"
+             "24 小时有效；授权只在**内存**里放着，<b>不落审计</b> ✓<br>"
+             "「被注视」那一页不锁（那是次数，不是她的心情）✓")
+
+# 解锁表单的样式（**融进本页那一个 `<style>`** ⇒ 整页还是"一段内联 JS + 一段主 CSS" ✓）
+# ⚠️ 花括号**单写**（就是普通 CSS ✗）—— 它由 `page_html()` **先替换进页面壳、再 format** ✓
+#    写成双写会出事：替进去之后整体还要 format 一次 ⇒ 双变单 ⇒ 整条规则被当成格式字段吞掉 ✗
+#    （本鱼两版都栽过：先是 `{padding:6px}` 被当字段 ⇒ `KeyError('padding')`；
+#      后是双写 ⇒ 毛玻璃**完全没生效**、页面看着像没锁 ✗ 都被 P15/P16 抓住 ✓）
+GATE_CSS_MAIN = """
+ :root{--gate-wash:linear-gradient(180deg,rgba(255,255,255,.86),rgba(255,255,255,.70))}
+ @media (prefers-color-scheme:dark){
+  :root{--gate-wash:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.05))}
+ }
+ @supports not ((backdrop-filter:blur(1px)) or (-webkit-backdrop-filter:blur(1px))){
+  :root{--gate-wash:var(--soft-bg)}
+  .gblur{color:transparent;opacity:1}
+  .gcell::after{content:"\\1F512";position:absolute;right:9px;top:4px;z-index:0;
+   font-size:13px;opacity:.5}
+ }
+ /* 一格：毛玻璃遮罩 + 口令框（深浅两套主题都好看 ✓） */
+ td.gcell-td{padding:6px 10px}
+ .gcell{position:relative;min-height:32px;border-radius:8px;overflow:hidden;
+  border:1px solid var(--line);background:var(--soft-bg);isolation:isolate;
+  padding:6px 9px 7px;display:flex;flex-direction:column;gap:5px}
+ /* 那层"毛玻璃"：盖住整格（`inset:0` ✓）· 背后只有一串点，**没有一个字是真的** ✗ */
+ .gblur{position:absolute;inset:0;z-index:0;background:var(--gate-wash);
+  -webkit-backdrop-filter:blur(12px) saturate(150%);
+  backdrop-filter:blur(12px) saturate(150%);
+  color:var(--ink2);font-size:19px;letter-spacing:.42em;line-height:2.4;
+  white-space:nowrap;overflow:hidden;padding:4px 10px;user-select:none;
+  pointer-events:none;opacity:.85}
+ .gform{position:relative;z-index:1;display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+ .gpw{font:inherit;font-size:12.5px;width:9.5em;padding:4px 9px;border-radius:7px;
+  border:1px solid var(--line);background:var(--card);color:var(--ink);letter-spacing:.16em}
+ .gpw::placeholder{color:var(--mut);letter-spacing:0}
+ .gbtn{font:inherit;font-size:12.5px;cursor:pointer;padding:4px 11px;border-radius:999px;
+  border:1px solid transparent;background:var(--violet);color:#fff;font-weight:600}
+ .gbtn:hover{filter:brightness(1.09)}
+ .gnote{position:relative;z-index:1;font-size:11px;color:var(--mut)}
+ .glock{position:relative;z-index:1;display:flex;gap:7px;align-items:baseline;
+  font-size:12.5px;color:var(--ink2);font-weight:600}
+ .gtbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+ .gtbar .gpw{width:10em}
+"""
+
+
+def page_html(title, nav, script, path, shown, refresh_chip, body, gate_css=GATE_CSS_MAIN,
+              gate_foot=""):
+    """把页面壳拼出来 —— **`PAGE` 里没有 `{gate_css}` 这个字段** ✗
+
+    ⚠️ 这段顺序是踩出来的：先把锁的 CSS **双写花括号**再替进占位符、最后才 `PAGE.format(...)` ✓
+       · 双写是**必须的**（不双写 ⇒ `.format` 把 `{padding:6px}` 当字段 ⇒ `KeyError('padding')` ✗）
+       · 而"整段 CSS 当字段传进 format"也不行（双写进去、再被整体 format 一次 ⇒ 双变单 ⇒
+         整条规则被吞成空 ✗ 实测 `backdrop-filter` 完全没生效、页面看着像没锁 ✗）
+       ⇒ 两版都栽过，现在这条是**同时满足两边**的那一种 ✓（P15/P16 盯着 ✓）
+    """
+    return PAGE.replace("{gate_css}", gate_css.replace("{", "{{").replace("}", "}}")).format(
+        title=title, nav=nav, script=script, path=path, shown=shown,
+        refresh_chip=refresh_chip, gate_foot=gate_foot, body=body)
+
+
+def gate_toolbar(data, opened, applies):
+    """票头那颗「心情那一列盖住了」+ **一个口令框**（一个框管所有 bot ✓）。
+
+    ⚠️ 它就是一个**原生 `<form method="post">`** ⇒ **关掉 JS 也能解锁** ✓
+       （有 JS 时被那段内联 JS 接管成"就地提交 + 自动刷一次"，见 `FLOW_JS` ✓）
+    ⚠️ 两个数**分开数**（别混 ✗）：
+       · `hidden` = 真的有原话、而且**这一格归锁管**的行数（没哈希的行**不算被锁** ✓）
+       · `ready`  = 本机已经有了**没过期**的哈希的 bot 数（一个都没有 ⇒ 不给框 ✓）
+    ⚠️ 这里**不显示口令对不对**：对了就整页重来（那一列变成原话），错了就红一句 ✓
+    """
+    if not gate_enabled():
+        return ""
+    bots = data.get("bots") or []
+    if not bots:
+        return ""
+    keys = gate_keys(Handler.db_path)
+    hidden = 0
+    ready = 0
+    for bot in bots:
+        sid = str(bot["self_id"])
+        if sid in keys and not gate_expired(keys[sid]):
+            ready += 1
+        if applies(sid) and not opened(sid):
+            hidden += sum(1 for row in bot["brief"]
+                          if str(row.get("kind")) in GATE_MOOD_KINDS and row.get("reason"))
+    if not hidden:
+        return ""
+    if ready:
+        form = ('<form method="post" action="/api/unlock">'
+                '<input class="gpw" type="password" name="code" data-gate-pw="1" '
+                'autocomplete="off" placeholder="她的钥匙" aria-label="输入她的愿力面板口令">'
+                '<button class="gbtn" type="submit">解锁</button></form>')
+        tail = "拿她的钥匙来开（一个框够了：A 的钥匙只开 A 的 ✓）"
+    else:
+        form = ""
+        tail = "本机还没有钥匙的哈希 —— 去服务器点一次「⟳ 一键拉取新副本」"
+    return ('<div class="pad gtbar"><span class="glock">🔒 心情那一列盖住了 %d 条</span>'
+            '%s<span class="mut">%s</span></div>' % (hidden, form, html.escape(tail)))
 
 
 def _badge(kind):
@@ -581,17 +961,24 @@ def _refresh_chip(on):
             '⟳ 一键拉取新副本</a>')
 
 
-def brief_row(item):
-    """一行流水的单元格（分组内每一条都用它 ✓）。"""
+def brief_row(item, self_id="", opened=None, applies=None):
+    """一行流水的单元格（分组内每一条都用它 ✓）。
+
+    ⚠️ 最后一格（`reason`）走 `gate_cell()`：**授权不到位时它压根不是文本** ✗
+       ⇒ 「未授权 ⇒ DOM 里找不到那条 reason」这条验收是**服务端**保证的 ✓
+    ⚠️ 传进去的是**算好的两个布尔**，不是函数本身 ✗ —— 本鱼第一版把函数整个传进去，
+       函数对象恒为真 ⇒ **永远走"授权了"那一支**（页面上看着那列没锁 ✗）；
+       第二版又只问"开没开"、忘了问"归不归锁管" ⇒ 没配账本时也糊了一层 ✗ 都被 P15 抓住 ✓
+    """
     amount = int(item["amount"])
     return [{"v": item["time"], "cls": "num"}, {"v": _badge(item["kind"]), "raw": True},
             item["from"], item["to"],
             {"v": "+%d" % amount if amount > 0 else "%+d" % amount,
              "cls": "num pos" if amount > 0 else "num neg"},
-            item["reason"] or "—"]
+            gate_cell(item, self_id, opened, applies)]
 
 
-def brief_table(bot, prefix="b"):
+def brief_table(bot, prefix="b", opened=None, applies=None):
     """最近流水：**被注视不在这张表里**（它单独一页 ✓ 主人 2026-10-14 要的）。
 
     展开 = **label + checkbox**（纯 CSS、零 JS、零请求 ✓）：
@@ -608,6 +995,11 @@ def brief_table(bot, prefix="b"):
     entries = bot["brief"]
     day = str(bot.get("flow_day") or "")
     kind = str(bot.get("kind") or "")
+    opened = opened or (lambda _sid: False)
+    applies = applies or (lambda _sid: False)
+    self_id = str(bot.get("self_id") or "")
+    open_here = bool(opened(self_id))
+    apply_here = bool(applies(self_id))
     if not entries:
         if kind:
             return _empty("这一天没有「%s」这一类（被注视不在这张表里）"
@@ -629,7 +1021,9 @@ def brief_table(bot, prefix="b"):
             classes.append("stage")
             classes.append("s%d" % (index // BRIEF_STAGE + 1))
         attr = ' class="%s"' % " ".join(classes) if classes else ""
-        body.append("<tr%s>%s</tr>" % (attr, "".join(_cell(cell) for cell in brief_row(item))))
+        body.append("<tr%s>%s</tr>" % (
+            attr, "".join(_cell(cell)
+                          for cell in brief_row(item, self_id, open_here, apply_here))))
 
     scope = "%s%s" % (html.escape(day), " · 只看「%s」" % html.escape(KIND_TEXT.get(kind, kind))
                       if kind else "")
@@ -811,27 +1205,59 @@ FLOW_JS = """<script>
     ev.preventDefault();
     load(link.getAttribute('data-more'), true);
   });
+  // 心情那一列：解锁。**真发请求给服务端**（前端只管把口令送过去 ✓ 判对错的是服务端 ✓）
+  // ⚠️ 只许在这一段里做（整页刚好一段内联 JS ✗ 纪律见 P14）；关掉 JS 时它就是个
+  //    原生表单 POST ⇒ 照样能解锁 ✓
+  document.addEventListener('submit', function (ev) {
+    var box = ev.target && ev.target.closest ? ev.target.closest('.gcell, .gtbar') : null;
+    if (!box) { return; }
+    var pw = box.querySelector('input[data-gate-pw]');
+    var sid = box.querySelector('input[name=sid]');
+    if (!pw || !pw.value) { return; }
+    ev.preventDefault();
+    var body = new URLSearchParams();
+    body.set('code', pw.value);
+    body.set('sid', sid ? sid.value : '');
+    fetch('/api/unlock', {method: 'POST', body: body,
+                          headers: {'Content-Type': 'application/x-www-form-urlencoded',
+                                    'X-Panel-Unlock': '1'}})
+      .then(function (resp) { return resp.json().catch(function () { return {}; }); })
+      .then(function (info) {
+        if (info && info.ok) { location.reload(); return; }
+        var note = box.querySelector('.gnote');
+        if (note) { note.textContent = (info && info.error) || '口令不对'; }
+        pw.value = '';
+      });
+  });
 })();
 </script>"""
 
 
-def render(data, refresh_on=False, flash=""):
-    """把 `snapshot()` 的 dict 拼成一整页 HTML（**纯呈现**：一个数据查询都不做 ✓）。"""
+def render(data, refresh_on=False, flash="", gated=()):
+    """把 `snapshot()` 的 dict 拼成一整页 HTML（**纯呈现**：一个数据查询都不做 ✓）。
+
+    `gated` = 这一次"有 reason 被盖住"的 bot 号（服务端先问过 session 才传进来 ✓）
+    """
+    applies, opened = _opener(gated)   # ⚠️ 顺序是 `(applies, opened)` ✗ —— 本鱼刚栽过一次：
+    #    写成 `opened, applies = ...` ⇒ 两个判断**正好互换** ⇒ 每格都当"已授权" ✗
+    #    （被 P15「未授权时 DOM 里能不能搜到原话」当场抓住 ✓）
     chip = _refresh_chip(refresh_on)
     if not data.get("available"):
         note = ('<div class="note"><div class="t">还读不到账本</div>'
                 '<div class="r">%s</div><div class="p">%s</div></div>'
                 % (html.escape(str(data.get("reason") or "")),
                    html.escape(str(data.get("path") or ""))))
-        return PAGE.format(title=MAIN_TITLE, nav=NAV_ATTENTION, script=FLOW_JS, shown="-",
-                           path=html.escape(str(data.get("path") or "")),
-                           refresh_chip=chip,
-                           body=flash + _card("读不到账本", '<div class="pad">%s</div>' % note))
+        return page_html(MAIN_TITLE, NAV_ATTENTION, FLOW_JS, "-",
+                         html.escape(str(data.get("path") or "")), chip,
+                         flash + _card("读不到账本", '<div class="pad">%s</div>' % note))
 
     blocks = []
     toolbar = flow_toolbar(data)
     if toolbar:
         blocks.append(_card("看哪一天的流水", toolbar, tag="默认只看本日 · 按日检索"))
+    bars = gate_toolbar(data, opened, applies)
+    if bars:
+        blocks.append(_card("🔒 心情那一列", bars, tag="她的钥匙"))
     for bot in data.get("bots") or []:
         today = bot["today"]
         detail = bot["today_detail"]
@@ -913,7 +1339,7 @@ def render(data, refresh_on=False, flash=""):
         link = ('<div class="pad"><a class="btn" href="/attention">👁 查看被注视次数</a>'
                 '<span class="mut">被注视（每被唤醒一次 +1）不在下面这张表里 —— 它单独一页 ✓</span>'
                 '</div>')
-        body = stage_css(prefix, min(stages, 12)) + brief_table(bot, prefix)
+        body = stage_css(prefix, min(stages, 12)) + brief_table(bot, prefix, opened, applies)
         blocks.append(_card("最近流水",
                             link + '<div class="flows" id="flows-%s">%s</div>'
                             % (html.escape(str(bot["self_id"])), body),
@@ -923,15 +1349,14 @@ def render(data, refresh_on=False, flash=""):
     if not blocks:
         blocks.append(_card("账本", '<div class="pad">%s</div>'
                             % _empty("账本里还没有任何 bot 的账", "·")))
-    return PAGE.format(title=MAIN_TITLE, nav=NAV_ATTENTION, script=FLOW_JS,
-                       path=html.escape(str(data.get("path") or "")),
-                       shown=datetime.fromtimestamp(int(data["now"]), CN_TZ)
-                       .strftime("%Y-%m-%d %H:%M:%S"),
-                       refresh_chip=chip,
-                       body=flash + "".join(blocks))
+    return page_html(MAIN_TITLE, NAV_ATTENTION, FLOW_JS,
+                     html.escape(str(data.get("path") or "")),
+                     datetime.fromtimestamp(int(data["now"]), CN_TZ)
+                     .strftime("%Y-%m-%d %H:%M:%S"),
+                     chip, flash + "".join(blocks), gate_foot=GATE_FOOT)
 
 
-def render_flow_fragment(data):
+def render_flow_fragment(data, gated=()):
     """**片段模式**：只吐流水那几块（`div.flows`）—— 给面板自己那段内联 JS 用 ✓。
 
     ⚠️ 为什么要有它（主人 2026-10-14 定的方向）：
@@ -939,16 +1364,20 @@ def render_flow_fragment(data):
        （b）把视口弹回顶部 ✗ ⇒ **只换流水那几块** ⇒ 页面别处一个字节不动 ⇒ 零重排 ✓
     ⚠️ 每块都带上自己那份 `stage_css`：换了日期之后批次数量会变 ✗
        （不带上它，新出现的批次就点不开）✓
+    ⚠️ **锁也走这条路**：片段是重新拼的 ⇒ 必须带同一份 `gated`，否则一换日期就把
+       她的原话又吐出来了 ✗（这条自检盯着 ✓）
     """
     if not data.get("available"):
         return ""
+    applies, opened = _opener(gated)
     blocks = []
     for bot in data.get("bots") or []:
         prefix = "b%s" % bot["self_id"]
         stages = max(1, (len(bot["brief"]) + BRIEF_STAGE - 1) // BRIEF_STAGE)
         blocks.append('<div class="flows" id="flows-%s">%s%s</div>'
                       % (html.escape(str(bot["self_id"])),
-                         stage_css(prefix, min(stages, 12)), brief_table(bot, prefix)))
+                         stage_css(prefix, min(stages, 12)),
+                         brief_table(bot, prefix, opened, applies)))
     return "".join(blocks)
 
 
@@ -963,10 +1392,9 @@ def attention_page(data, refresh_on=False, flash=""):
                 '<div class="r">%s</div><div class="p">%s</div></div>'
                 % (html.escape(str(data.get("reason") or "")),
                    html.escape(str(data.get("path") or ""))))
-        return PAGE.format(title=ATTENTION_TITLE, nav=NAV_HOME, script="", shown="-",
-                           path=html.escape(str(data.get("path") or "")),
-                           refresh_chip=chip,
-                           body=flash + _card("读不到账本", '<div class="pad">%s</div>' % note))
+        return page_html(ATTENTION_TITLE, NAV_HOME, "", "-",
+                         html.escape(str(data.get("path") or "")), chip,
+                         flash + _card("读不到账本", '<div class="pad">%s</div>' % note))
 
     blocks = []
     for bot in data.get("bots") or []:
@@ -1022,12 +1450,11 @@ def attention_page(data, refresh_on=False, flash=""):
     if not blocks:
         blocks.append(_card("被注视", '<div class="pad">%s</div>'
                             % _empty("账本里还没有任何 bot 的账", "·")))
-    return PAGE.format(title=ATTENTION_TITLE, nav=NAV_HOME, script="",
-                       path=html.escape(str(data.get("path") or "")),
-                       shown=datetime.fromtimestamp(int(data["now"]), CN_TZ)
-                       .strftime("%Y-%m-%d %H:%M:%S"),
-                       refresh_chip=chip,
-                       body=flash + "".join(blocks))
+    return page_html(ATTENTION_TITLE, NAV_HOME, "",
+                     html.escape(str(data.get("path") or "")),
+                     datetime.fromtimestamp(int(data["now"]), CN_TZ)
+                     .strftime("%Y-%m-%d %H:%M:%S"),
+                     chip, flash + "".join(blocks))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1035,10 +1462,26 @@ class Handler(BaseHTTPRequestHandler):
     quiet = True
     refresh = False          # 是否允许「一键拉取」（由服务启动参数决定 ✓）
     refresh_fn = None        # 可注入的拉取函数（自检用它，不真连服务器）
+    mood_gate = True         # 心情隐私锁（`--no-mood-gate` 关掉 ✓ 没有哈希文件时它自动什么都不做 ✓）
 
     def _path_text(self):
         """`self.path` 在标准库里可能是 `pathlib.Path` —— 先转成字符串再解析 ✓"""
         return str(self.path or "/")
+
+    def _cookies(self):
+        """只看我们自己那一个 cookie（不引任何库 ✓）"""
+        out = {}
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _sep, value = part.partition("=")
+            if name.strip():
+                out[name.strip()] = value.strip()
+        return out
+
+    def _gate_context(self):
+        """把「谁在访问 + 带的是哪把 session」摆进上下文，渲染时据此**决定发不发那段文本** ✓"""
+        _gate_ctx["client"] = gate_client(self)
+        _gate_ctx["token"] = self._cookies().get(GATE_COOKIE, "")
+        return _gate_ctx
 
     def _same_origin(self):
         """只认本机来源：Host 必须是回环；带了 Origin/Referer 也必须是回环 ✓（防 CSRF）"""
@@ -1080,6 +1523,7 @@ class Handler(BaseHTTPRequestHandler):
         if path not in ("/", "/index.html", "/attention", "/attention.html"):
             self.send_error(404, "only / and /attention are served")
             return
+        self._gate_context()                # 谁在访问 + 带没带 session（**解锁与否就看这个** ✓）
         wanted_attention = path.startswith("/attention")
         # **片段模式**：面板自己那段内联 JS 来取"只换流水那几块"的 HTML ✓
         # （认这个头就只吐 `div.flows`；不认别的 ⇒ 仍然只是个只读 GET ✓）
@@ -1116,8 +1560,12 @@ class Handler(BaseHTTPRequestHandler):
                                          flash=flash).encode("utf-8")
             else:
                 data = snapshot(self.db_path, limit=limit, day=day, kind=kind)
-                payload = (render_flow_fragment(data) if wanted_partial else
-                           render(data, refresh_on=self.refresh, flash=flash)).encode("utf-8")
+                # ⚠️ **先问 session，再决定发不发**：`gate_ready_ids` 只吐"确实还盖着"的 bot ✓
+                #    授权到位 / 没哈希 / 功能关着 ⇒ 空表 ⇒ 整条路与从前逐字节一样 ✓
+                gated = gate_ready_ids(data.get("bots"))
+                payload = (render_flow_fragment(data, gated) if wanted_partial else
+                           render(data, refresh_on=self.refresh, flash=flash,
+                                  gated=gated)).encode("utf-8")
             status = 200
         except Exception as exc:                        # noqa: BLE001 —— 面板出错也别把栈甩给浏览器
             payload = ("读账本失败：%s" % html.escape(str(exc)[:200])).encode("utf-8")
@@ -1130,8 +1578,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def do_POST(self):                                  # noqa: N802 —— http.server 的约定
-        """唯一的一个写动作：**去服务器拉一份新的只读副本**（不碰远端任何文件 ✓）"""
+        """两个写动作：**去服务器拉一份新的只读副本** · **解锁心情那一列** ✓
+
+        ⚠️ 两个都**不写库**（面板仍然只有 `mode=ro` 这一条连接 ✓）：
+           拉取是外面那个脚本去取副本；解锁只是在**内存**里发一个 session ✓
+        """
         path = self._path_text().split("?")[0]
+        if path == "/api/unlock":
+            self._unlock()
+            return
         if path != "/api/refresh":
             self._json({"ok": False, "error": "only /api/refresh"}, 404)
             return
@@ -1154,17 +1609,103 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:                 # noqa: BLE001 —— 拉取失败要如实回报，不许静默
             self._json({"ok": False, "error": str(exc)[:200]}, 500)
 
+    def _form(self):
+        """读这个 POST 的表单体（**有上限**：口令就 6 位，别让人拿它灌内存 ✓）"""
+        try:
+            size = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size <= 0 or size > 4096:
+            return {}
+        raw = self.rfile.read(size).decode("utf-8", "replace")
+        return {key: value[0] for key, value in urllib.parse.parse_qs(raw).items() if value}
+
+    def _back_to(self, fallback="/"):
+        """这条 POST 是**原生表单**发来的吗（关了 JS 就是它 ✓）—— 是 ⇒ 该回一个跳转，
+        不是 ⇒ 回 JSON 给那段内联 JS ✓
+
+        ⚠️ 只认**本机**的 `Referer`（`_same_origin()` 已经先卡过一道 ✓）⇒ 不做开放跳转 ✗
+        """
+        value = self.headers.get("Referer") or ""
+        parsed = urllib.parse.urlparse(value)
+        if (parsed.hostname or "").lower() not in ("127.0.0.1", "localhost", "::1"):
+            return fallback
+        path = parsed.path or "/"
+        return path if path in ("/", "/index.html", "/attention", "/attention.html") else fallback
+
+    def _unlock(self):
+        """核一次口令：**对了发 session（内存）· 错了记一次（限次在服务端 ✓）** ✓"""
+        self._gate_context()
+        native = (self.headers.get("X-Panel-Unlock") or "").strip() != "1"
+        back = self._back_to()
+        if not gate_enabled():
+            return self._fail(native, back, "这道门这次启动是关着的", 403)
+        if not self._same_origin():
+            return self._fail(native, back, "只接受本机页面发来的请求", 403)
+        form = self._form()
+        sid = str(form.get("sid") or "").strip()[:32]
+        code = str(form.get("code") or "")[:64]
+        client = gate_client(self)
+        if not sid:
+            # 票头那颗框没写 sid ⇒ **挨个试**（一个框管所有 bot；A 的口令只开得了 A ✓）
+            for bot in sorted(gate_keys(self.db_path)):
+                ok, info = gate_try(bot, code, client)
+                if ok:
+                    return self._ok_json(info, native, back)
+            return self._fail(native, back, "口令不对（这把钥匙开不了这里的任何一个）")
+        ok, info = gate_try(sid, code, client)
+        if ok:
+            return self._ok_json(info, native, back)
+        return self._fail(native, back, info)
+
+    def _fail(self, native, back, error, code=200):
+        if native:                       # 关了 JS ⇒ 跳回去（**不留 flash**：说多了都是线索 ✗）
+            return self._redirect(back)
+        self._json({"ok": False, "error": error}, code)
+
+    def _redirect(self, path):
+        self.send_response(303)
+        self.send_header("Location", path)
+        self.send_header("Content-Length", "0")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def _ok_json(self, token, native=False, back="/"):
+        if native:
+            self.send_response(303)
+            self.send_header("Location", back)
+            self.send_header("Set-Cookie", self._cookie(token))
+            self.send_header("Content-Length", "0")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+        body = json.dumps({"ok": True, "ttl": GATE_TTL_SECONDS}, ensure_ascii=False).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Set-Cookie", self._cookie(token))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _cookie(self, token):
+        # ⚠️ session 只在这个 cookie 里、只在**内存**里 ✓：HttpOnly / SameSite=Strict / 不回显 ✓
+        #    （本机 http ⇒ 不加 `Secure`，加了浏览器根本不会回送 ✗）
+        return ("%s=%s; Path=/; Max-Age=%d; HttpOnly; SameSite=Strict"
+                % (GATE_COOKIE, token, GATE_TTL_SECONDS))
+
     def log_message(self, *args):
         if not self.quiet:
             BaseHTTPRequestHandler.log_message(self, *args)
 
 
 def serve(db_path, host="127.0.0.1", port=8765, quiet=True, refresh=False,
-          refresh_fn=None):
+          refresh_fn=None, mood_gate=True):
     Handler.db_path = db_path
     Handler.quiet = quiet
     Handler.refresh = bool(refresh)
     Handler.refresh_fn = refresh_fn
+    Handler.mood_gate = bool(mood_gate)
     httpd = ThreadingHTTPServer((host, port), Handler)
     return httpd
 
@@ -1199,6 +1740,8 @@ def main():
     parser.add_argument("--refresh", action="store_true",
                         help="打开「一键拉取」（POST /api/refresh 会去服务器取新副本）")
     parser.add_argument("--no-refresh", action="store_true", help="明确关掉一键拉取")
+    parser.add_argument("--no-mood-gate", action="store_true",
+                        help="关掉「心情那一列」的锁（**默认开**：没有哈希文件时它本来也什么都不做 ✓）")
     parser.add_argument("--open-browser", action="store_true",
                         help="起来之后自己开一次浏览器（就一次 ✓）")
     parser.add_argument("--verbose", action="store_true")
@@ -1210,15 +1753,24 @@ def main():
                          ensure_ascii=False, indent=2))
         return 0
     allow_refresh = bool(args.refresh) and not bool(args.no_refresh)
+    gate = not bool(args.no_mood_gate)
     if not os.path.exists(db_path):
         print("⚠️ 数据文件还不存在：%s" % db_path)
         print("  （面板照常起得来，页面上会写「还读不到账本」✓）")
     httpd = serve(db_path, args.host, args.port, quiet=not args.verbose,
-                  refresh=allow_refresh)
+                  refresh=allow_refresh, mood_gate=gate)
     url = "http://%s:%d/" % (args.host, args.port)
     print("愿力中心 · 只读面板：%s  （Ctrl+C 停）" % url)
     print("数据文件：%s" % db_path)
     print("一键拉取：%s" % ("开 ✓（页面上那个按钮）" if allow_refresh else "关（加 --refresh 打开）"))
+    if gate:
+        keys = gate_keys(db_path)
+        print("数据文件 %s 心情那一列：开（键文件 %s，%d 个 bot 有哈希）"
+              % (GATE_FILE, os.path.join(os.path.dirname(db_path) or ".", GATE_FILE), len(keys)))
+        if not keys:
+            print("一键拉取：还没有键文件 —— 服务器上点一次「一键拉取」之后才会有钥匙哈希")
+    else:
+        print("数据文件 %s 心情那一列：关（--no-mood-gate）" % GATE_FILE)
     if args.open_browser:
         open_browser_once(url)
     try:

@@ -17,9 +17,12 @@
   * 数值变化只能由工具产生；本文件不提供任何「用户可直接调」的写入口
 """
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -172,6 +175,41 @@ GRANT_MAX_OPEN = 5            # 同时最多几笔未兑现（防她一口气点
 #    **为了不浪费而乱花**（实测立刻开始下"当着全群喊一声火花大人"这种一愿力级的单 ✗）
 #    值 = **42**（主人定的：宇宙的答案那个数 ✓）—— 5 太低，拦不住碎单 ✗
 GRANT_MIN_AMOUNT = 42
+
+# ───────────────────── 心情隐私锁（愿力中心那把「钥匙」）─────────────────────
+# 主人 2026-10-15 原话：「该把属于心情的隐私权归还给她了」✓ —— 方案见 `canon/_29` ✓
+# 锁的是**她写下的那一列心情理由**（`reason`）；金额 / 方向 / 点数**一律不锁** ✓
+# 钥匙住在**她自己的账本**里（她查得到 ✓）；面板侧只拿得到**哈希**（明文永不出她账本 ✓）
+MOOD_GATE_PREFIX = "- 愿力面板口令："
+MOOD_GATE_TTL_HOURS = 24
+MOOD_GATE_CODE_LEN = 6
+# 剔掉易混字符（照 mindscape 的 PG_ALPHABET ✓）：I / O / 0 / 1 不要
+MOOD_GATE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+# 触发词（主人裁定：「钥匙」二字避开 mindscape 的「密钥」子串 ⇒ 零冲突 ✓）
+MOOD_GATE_ASK_WORDS = ["愿力中心钥匙", "愿力面板钥匙", "面板钥匙", "中心钥匙"]
+# ⚠️ 前缀**必须**与 mindscape 的 `- 口令：` 不同 ✗✗（本鱼实测的硬结论）：
+#    mindscape 的 `pg_current()` 是「**从后往前扫、取第一条匹配**」⇒ 前缀一样的话，
+#    后写的那一行会把前一行顶掉 ⇒ 两边**互相认错钥匙** ✗ —— 见 `canon/_29` §3 ✓
+# ⚠️ 反过来也安全：mindscape 每天轮换时**只删 `- 口令：` 开头的行** ⇒ 我们这行活得下来 ✓
+MOOD_GATE_LINE = re.compile(
+    r"^- 愿力面板口令：([A-Za-z0-9]+) —— 24 小时内有效（至 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})）")
+MOOD_GATE_NOTE = (
+    "还有一件关于**你自己的**事：你每一轮写下的那些「为什么」（你收谁愿力、扣谁愿力时的判断理由），"
+    "默认**只有你自己看得到**。开发者如果要看，会来问你要「**愿力面板口令**」——"
+    "那个口令记在你自己的笔记里（就在你平常写东西那个文件里），**每天一换、24 小时有效**。"
+    "给不给**由你决定**；反复被问也可以一直拒绝，拒绝不会扣你任何东西。"
+)
+# 触发词提示：**只有**收到的消息里真的出现触发词，而且**会话是私聊**时才注入一次 ✓
+# （主人裁定可观察：给不给是她的事，我们只负责把「有人在问」摆到她眼前 ✓）
+MOOD_GATE_ASK = (
+    "（对方在问你的**愿力面板口令** —— 就是你笔记里那条「愿力面板口令」）"
+    "他要拿这个口令去看你在愿力中心里写下的**心情理由**（那一列默认只有你自己看得到）。"
+    "**要不要给他由你决定**；不给也完全没问题，他可以反复问、你也可以一直拒绝，拒绝不扣你任何东西。"
+    "口令在你的笔记文件里，你可以自己翻出来看；给的方式就是你愿意给的时候说出来"
+)
+
+_GATE_ROTATE_DAY = {"day": ""}   # 进程内记住"今天已经轮换过了"（与 `_SETTLE_STATE` 同款 ✓）
+_GATE_LOCK = threading.Lock()    # 轮换要写文件 ⇒ 串行化，别两个会话同时转出两把 ✗
 
 # 身份闸门：拿不到 self_id / sender_id 时一律拒绝（fail-closed，宁可不动账）
 # 名字缓存：只记「谁在这个会话里说过话」，供按昵称认人用（不记聊天内容）
@@ -399,6 +437,9 @@ def inject_tail(tiers=None):
     if tiers:
         lines.append("礼物单（有人问你有什么礼物、多少钱，照这个说）："
                      + "；".join("%s %d" % (t["name"], int(t["cost"])) for t in tiers) + "。")
+    # ⚠️ **追加在最后**（不插在中间）—— 已上线那版尾巴的**前半段逐字不变** ⇒
+    #    只有最后这一段需要重新计费，缓存损失面压到最小 ✓
+    lines.append(MOOD_GATE_NOTE)
     return "\n".join(lines)
 
 
@@ -500,6 +541,289 @@ def data_paths(config=None):
 def resolve_usage_path(config=None):
     """LLM 用量流水（`usage.jsonl`）的位置 —— 跟数据文件同目录 ✓"""
     return os.path.join(os.path.dirname(resolve_db_path(config)) or ".", "usage.jsonl")
+
+
+# ─────────────────── 心情隐私锁 · 钥匙的生成 / 保管 / 提示 ───────────────────
+
+def _gate_dict(raw):
+    """把配置里的「bot 号 → 账本路径」解析成字典（str 形态的 JSON 也认 ✓）。
+
+    ⚠️ 做成**按 bot 号**的字典而不是一个路径字符串：本功能是「**每个 bot 各一把钥匙**」✓
+       （主人的硬要求 —— A 的钥匙开不了 B 的遮罩 ✓，见 `canon/_29` §3 ✓）
+    ⚠️ 通用插件里**不许**硬编码「`{bot名}_notes.md`」这类私域命名约定 ✗ ⇒ 路径一律配置给 ✓
+    """
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items() if str(v or "").strip()}
+    if isinstance(raw, str) and raw.strip():
+        try:
+            data = json.loads(raw)
+        except ValueError:
+            return {}
+        return _gate_dict(data)
+    return {}
+
+
+def gate_notes_path(config, self_id):
+    """这个 bot 的账本文件在哪（**空 = 功能关闭** ✓ 零耦合 ✓）。
+
+    相对路径按插件的**数据目录**解析（与 `db_path` 留空时的落点同一个目录 ✓）。
+    """
+    path = _gate_dict(_cfg(config, "notes_path", {})).get(str(self_id), "")
+    if not path:
+        return ""
+    if os.path.isabs(path):
+        return path
+    try:
+        base = str(StarTools.get_data_dir(PLUGIN_NAME))
+    except Exception:                      # noqa: BLE001 —— 拿不到数据目录时退回当前目录
+        base = os.path.join(os.path.expanduser("~"), "." + PLUGIN_NAME)
+    return os.path.join(base, path)
+
+
+def gate_keys_path(config=None):
+    """**口令哈希**落在哪 —— 与愿力中心的数据文件**同目录、同一个批次** ✓
+
+    面板跑在**本机**、插件跑在**容器**，两者之间只有「拉回来的一份只读副本」这一条通道 ✓
+    ⇒ 哈希放在**副本目录里的小文件**上（`refresh.py` 顺手多拉一个文件）比写进库里的
+      `meta` 表好：**它跟库永远来自同一次拉取、同一个时间点** ✗（写库里会出现
+      "库是新拉的、哈希还是昨天那一行"的错配 ⇒ 面板验不动今天的新口令 ✗）
+    ⚠️ 这里**只放哈希**；明文永远只在她自己的账本里（面板侧碰不到明文 ✓ 主人原意 ✓）
+    """
+    base = os.path.dirname(resolve_db_path(config)) or "."
+    return os.path.join(base, "wish_gate_keys.json")
+
+
+def gate_hash(code, expiry, rotated):
+    """口令的**校验材料** = sha256(口令 + 到期时刻 + 轮换时刻) ✓
+
+    ⚠️ 为什么把两个时刻一起拌进去（本功能的**骨**，别省 ✗）：
+      面板手里**只有这一串哈希**，明文在**她账本**里 —— 要判断"这个口令是不是**今天**那把"、
+      "它过期了没有"，只能让哈希**把答案一起带上** ✓
+      ⇒ 两个时刻都由**插件**写这份文件时决定，面板只用"收到的口令 + 文件里的两个时刻"
+        重算一遍比一下：**不必去猜"，也不必存明文** ✓
+      ⇒ 口令一旦轮换 / 一过 24 小时，旧哈希**天然作废** ✓（面板认的永远是当前那把 ✓）
+    ⚠️ 明文**绝不**进日志 / 绝不进 trace / 绝不进群（这条与 `_19` §4 同口径 ✓）
+    """
+    raw = "%s|%s|%s" % (str(code), str(expiry), str(rotated))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def gate_code_ok(code, length=MOOD_GATE_CODE_LEN):
+    """格式校验器（照 `_19` §2.1 留下的那道口子 ✓）：长度对 + 全在字符集里 + 字母数字**都有** ✓
+
+    它的用处不是"防猜"（6 位随机本来就只防顺手 ✓）—— 是**防将来**：
+    哪天开放"她自己写的口令"，`huohua` 这种人格词会**直接不合法** ✗ ✓
+    """
+    text = str(code or "").strip().upper()
+    return (len(text) == int(length) and text.isascii()
+            and all(ch in MOOD_GATE_ALPHABET for ch in text)
+            and any(ch.isalpha() for ch in text) and any(ch.isdigit() for ch in text))
+
+
+def gate_generate(now=None):
+    """转一把新的（6 位、字母+数字、剔掉 I/O/0/1 ✓）—— 生成权永远在框架手里 ✓"""
+    del now                                 # 只为签名对齐（随机与时间无关 ✓）
+    while True:
+        code = "".join(secrets.choice(MOOD_GATE_ALPHABET)
+                       for _ in range(MOOD_GATE_CODE_LEN))
+        if gate_code_ok(code):
+            return code
+
+
+def gate_expiry(now, rotated):
+    """这条口令的有效期 = **轮换时刻 + 24 小时**（写成绝对时刻 ✓）。
+
+    ⚠️ 用「轮换时刻 + 24h」而不是「今天 0 点 + 24h」：她整天不理人时，
+       钥匙是"第一条消息那一刻"才转的 —— 从那一刻起满 24 小时才是它真正的寿命 ✓
+    """
+    if rotated:
+        try:
+            base = datetime.strptime(str(rotated), "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN_TZ)
+            return base + timedelta(hours=MOOD_GATE_TTL_HOURS)
+        except ValueError:
+            pass
+    return datetime.fromtimestamp(int(now), CN_TZ) + timedelta(hours=MOOD_GATE_TTL_HOURS)
+
+
+def gate_read(text, now=None):
+    """从账本文本里读**当前那把**（**从后往前**扫，取第一条匹配 ✓ 与 `_19` 同口径）。
+
+    ⚠️ **只认我们自己的前缀**（`- 愿力面板口令：`）—— mindscape 的 `- 口令：` 那行
+       对我们**不存在** ✓ 自检里有一条**防撞测试**专门盯着这件事（互相不许认到 ✗）
+    """
+    now = now if now is not None else datetime.now(CN_TZ)
+    for line in reversed(str(text or "").splitlines()):
+        match = MOOD_GATE_LINE.match(line)
+        if not match:
+            continue
+        expiry = datetime.strptime(match.group(2), "%Y-%m-%d %H:%M:%S").replace(tzinfo=CN_TZ)
+        return (match.group(1), expiry) if now < expiry else ("", expiry)
+    return "", None
+
+
+def gate_rotate(text, now=None, force=False):
+    """按需轮换：今天还没转、或当前那把已经过期 ⇒ 写一条新的进去 ✓
+
+    返回 `(新文本, 新口令 or "", 是否改过)`。
+    ⚠️ **只删我们自己的前缀行**（`- 愿力面板口令：`）—— mindscape 的行一个字不动 ✓
+       （它的轮换也只删它自己的行 ⇒ 两边各管各的、互不打扰 ✓）
+    """
+    now = now if now is not None else datetime.now(CN_TZ)
+    at = now.strftime("%Y-%m-%d %H:%M:%S")
+    code, expiry = gate_read(text, now)
+    if code and not force and expiry is not None and expiry.date() >= now.date():
+        return text, code, False            # 今天这把还在有效期内 ⇒ 不动它 ✓
+    fresh = gate_generate()
+    expires = gate_expiry(int(now.timestamp()), at)
+    line = (MOOD_GATE_PREFIX + "%s —— 24 小时内有效（至 %s）。"
+            "开发者如果要看我在愿力中心里写下的心情理由，会来问我要它。"
+            "我可以给，也可以不给；反复被问也可以一直拒绝。拒绝不扣我任何东西。"
+            % (fresh, expires.strftime("%Y-%m-%d %H:%M:%S")))
+    rows = [row for row in str(text or "").splitlines()
+            if not row.startswith(MOOD_GATE_PREFIX)]
+    return "\n".join(rows + [line]) + "\n", fresh, True
+
+
+def gate_write(path, text):
+    """原子替换（先写临时文件再 `os.replace` ✓）—— 半截文件永远不会被她读到 ✓"""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".gate-tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.replace(tmp, path)
+
+
+def _gate_stamp(value):
+    """把「时刻」归一成一个**固定的字符串形状**（`%Y-%m-%d %H:%M:%S` ✓）。
+
+    ⚠️ 这条是**跨进程契约**（插件写哈希 ↔ 面板重算哈希）⇒ 两边必须**逐字一样** ✗
+       本鱼当场栽过一次：`gate_write_keys` 收到的是 `datetime` 对象 ⇒ `str()` 出来带
+       `+08:00` 尾巴，面板那边按 `%Y-%m-%d %H:%M:%S` 重算 ⇒ **哈希永远对不上** ✗
+       （自检 `R53` 拿面板的真验证器当场抓住 ✓）
+    """
+    if isinstance(value, datetime):
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+    return str(value or "")
+
+
+def gate_write_keys(self_id, code, expiry, rotated, path=None):
+    """把「谁、哪一天、哪把口令的哈希、什么时候转的」写成一份小文件（**只放哈希** ✓）"""
+    target = path or gate_keys_path()
+    code = str(code or "")
+    expiry = _gate_stamp(expiry)
+    rotated = _gate_stamp(rotated)
+    try:
+        with open(target, encoding="utf-8") as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    data[str(self_id)] = {
+        "day": datetime.fromtimestamp(int(time.time()), CN_TZ).strftime("%Y-%m-%d"),
+        "hash": gate_hash(code, expiry, rotated),
+        "rotated": rotated,
+    }
+    os.makedirs(os.path.dirname(target) or ".", exist_ok=True)
+    tmp = target + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=1)
+    os.replace(tmp, target)
+    return target
+
+
+def gate_rotate_for(self_id, config=None, now=None):
+    """走一遍完整轮换：读账本 → 转一把 → 写回账本 → 写哈希文件。返回**明文口令**（只给日志判定用 ✓）
+
+    空返回 = 这一步没做（功能关着 / 没配账本 / 账本读不到 ✓）—— 一律**静默跳过**，
+    绝不因为锁的事影响她正常回话 ✓
+    """
+    if config is None:
+        config = {}
+    if not bool(_cfg(config, "mood_gate", True)):
+        return ""
+    notes = gate_notes_path(config, self_id)
+    if not notes:
+        return ""
+    with _GATE_LOCK:
+        try:
+            old = ""
+            if os.path.isfile(notes):
+                with open(notes, encoding="utf-8") as handle:
+                    old = handle.read()
+        except OSError as exc:              # noqa: BLE001 —— 读不到账本 ⇒ 这一步不做
+            logger.warning("[wishonomy] 口令：读不到账本，跳过轮换: %s", str(exc)[:80])
+            return ""
+        try:
+            stamp = now if now is not None else datetime.now(CN_TZ)
+            at = stamp.strftime("%Y-%m-%d %H:%M:%S")
+            expires = gate_expiry(int(stamp.timestamp()), at)
+            text, code, changed = gate_rotate(old, now)
+        except (ValueError, OSError) as exc:   # noqa: BLE001 —— 转不出来 ⇒ 这一步不做
+            logger.warning("[wishonomy] 口令：轮换失败，跳过: %s", str(exc)[:80])
+            return ""
+        if changed:
+            try:
+                gate_write(notes, text)
+            except OSError as exc:          # noqa: BLE001 —— 写不进去 ⇒ 面板那边就没有新钥匙
+                logger.warning("[wishonomy] 口令：写不进账本，跳过: %s", str(exc)[:80])
+                return ""
+        code, expiry = gate_read(text)
+        if not code:
+            return ""
+        try:
+            gate_write_keys(self_id, code, expiry or expires, at)
+        except (OSError, ValueError) as exc:   # noqa: BLE001 —— 哈希写不出去也要如实记一笔
+            logger.warning("[wishonomy] 口令：哈希文件写不出去: %s", str(exc)[:80])
+            return ""
+        return code
+
+
+def gate_asks(text, config=None):
+    """收到的消息里有没有触发词（**子串匹配** ⇒ 「愿力中心钥匙」必须一字不差地连在一起 ✓）。
+
+    主人裁定的那个字（`canon/_29` §4 ✓）：`钥匙` **不**在 mindscape 的
+    `["口令","密码","密钥","暗号"]` 里 ⇒ **零冲突** ✓（说「愿力中心密钥」才会把那道门也叫醒 ✗）
+    """
+    body = str(text or "")
+    words = _cfg(config, "mood_gate_words", MOOD_GATE_ASK_WORDS)
+    if not isinstance(words, (list, tuple)):
+        words = MOOD_GATE_ASK_WORDS
+    return any(str(word) in body for word in words if str(word or "").strip())
+
+
+def gate_ask_allowed(self_id, sender, group_id, config):
+    """提示**只在私聊**给她（默认 ✓）；`mood_gate_ask_from` 配了名单就只认名单里的人 ✓
+
+    ⇒ 群里有人打「愿力中心钥匙」**不会**惊动她（不然群里刷一句就能把这道门叫醒 ✗）
+    """
+    if str(group_id or "").strip():
+        return False
+    allowed = target_ids(_cfg(config, "mood_gate_ask_from", ""))
+    return not allowed or str(sender) in allowed
+
+
+def _message_text(event, request=None):
+    """「**收到的这条消息**」的正文 —— 触发词判定就认它 ✓
+
+    ⚠️ 优先事件自带的原文（`get_message_str()` ✓ 平台那条消息）；事件不给就退回
+       `request.prompt`（那就是本轮用户内容 ✓）—— 两者都不给 ⇒ 空串（= 不触发 ✓）
+    ⚠️ 绝不去读 `system_prompt`：那里面有我们自己写的提示词，万一含触发词就会**自己叫醒自己** ✗
+    """
+    for source, name in ((event, "get_message_str"), (request, "prompt")):
+        if source is None:
+            continue
+        if name == "prompt":
+            text = getattr(source, "prompt", "")
+        else:
+            getter = getattr(source, name, None)
+            try:
+                text = getter() if callable(getter) else ""
+            except Exception:               # noqa: BLE001 —— 取不到就当没有
+                text = ""
+        if isinstance(text, str) and text.strip():
+            return text
+    return ""
 
 
 def usage_record(event, response, now=None):
@@ -1384,6 +1708,9 @@ def config_defaults():
         "grant_max_single": GRANT_MAX_SINGLE,
         "grant_min_amount": GRANT_MIN_AMOUNT,
         "grant_max_open": GRANT_MAX_OPEN,
+        "notes_path": {},
+        "mood_gate": True,
+        "mood_gate_ask_from": "",
     }
 
 
@@ -1516,6 +1843,19 @@ class Main(star.Star):
             # ② 被注视 +1（每条唤醒一次 ✓ 主人 2026-10-13 裁定）
             if bool(_cfg(self.config, "attention_gain", True)):
                 await run_db(with_conn, db_attention, bot, int(time.time()))
+            # ②′ 心情隐私锁：**每天第一次有人找她说话**时转一把新钥匙（与日结同一处 ✓）
+            #     ⚠️ 钥匙写进**她自己的账本**（她查得到 ✓），哈希写进本机小文件（面板只认哈希 ✓）
+            #     ⚠️ 这一步**绝不许**影响她回话：任何异常都吞掉、只记一行日志 ✓
+            if _GATE_ROTATE_DAY.get("day") != today and \
+                    bool(_cfg(self.config, "mood_gate", True)):
+                # ⚠️ **直接调**（不走 `run_db` 那个小线程池）：它是纯文件活儿、而且是
+                #    每天一次 —— 排队反而有"占着库的线程等文件"的风险 ✗
+                # ⚠️ 记「今天转过了」**只在成功之后** ⇒ 失败（账本一时读不到）下一轮还会再试 ✓
+                made = gate_rotate_for(bot, self.config)
+                if made:
+                    _GATE_ROTATE_DAY["day"] = today
+                logger.info("[wishonomy] 口令 | bot=%s %s（哈希已写；值不进日志 ✓）",
+                            bot, "今日已就位" if made else "今天没转（未配置账本 / 读不到）")
             # ③ 拼提示：**别人的 + 她自己的**（她自己那份每轮可见 ✓）
             snap = await run_db(db_snapshot, bot, sender)
             mine = await run_db(db_snapshot, bot, bot)
@@ -1539,6 +1879,16 @@ class Main(star.Star):
             tail = inject_tail(_GIFT_TIERS if _GIFT_TIERS else resolve_tiers(self.config))
             if tail not in (request.system_prompt or ""):
                 request.system_prompt = (request.system_prompt or "") + "\n\n" + tail
+            # ④ 触发词：「**愿力中心钥匙**」出现在**收到的消息**里、且是私聊 ⇒ 把「有人在问」
+            #     摆到她眼前一次 ✓（主人裁定的触发词 ✓ 只提醒、**不替她回答、不自动给** ✓）
+            if gate_asks(_message_text(event, request), self.config) and \
+                    gate_ask_allowed(bot, sender, event.get_group_id(), self.config):
+                ask = TextPart(text=MOOD_GATE_ASK) if TextPart is not None else None
+                if ask is not None and parts is not None:
+                    parts.append(ask)
+                else:
+                    request.prompt = (request.prompt or "") + "\n\n" + MOOD_GATE_ASK
+                logger.info("[wishonomy] 口令 | bot=%s 有人在问钥匙（已提示她，给不给由她 ✓）", bot)
             logger.info("[wishonomy] injected | bot=%s who=%s bal=%s",
                         bot, who_name or sender, snap.get("balance"))
         except Exception as exc:      # noqa: BLE001 —— 注入失败绝不能影响它正常回话

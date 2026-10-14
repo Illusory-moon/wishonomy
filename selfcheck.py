@@ -14,6 +14,7 @@ import ast
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -165,11 +166,11 @@ def call_raw(tool, plugin, event, *args):
     return asyncio.run(tool(plugin, event, *args))
 
 
-def raw_mood(mod, user_id, delta, ref, now, cap=3000, group=GROUP, name=""):
+def raw_mood(mod, user_id, delta, ref, now, cap=3000, group=GROUP, name="", bot=None):
     conn = mod._connect()
     try:
-        return mod.db_mood(conn, BOT, group, user_id, delta, "自检", ref, now, cap,
-                           name=name)
+        return mod.db_mood(conn, BOT if bot is None else bot, group, user_id, delta, "自检",
+                           ref, now, cap, name=name)
     finally:
         conn.close()
 
@@ -1410,6 +1411,9 @@ def _visible_texts(mod):
         ("POWER_NOTE", mod.POWER_NOTE),
         ("SETTLE_NOTE", mod.SETTLE_NOTE),
         ("MOOD_NOTE", mod.MOOD_NOTE),
+        ("SPEND_NOTE", mod.SPEND_NOTE),
+        ("MOOD_GATE_NOTE", mod.MOOD_GATE_NOTE),
+        ("MOOD_GATE_ASK", mod.MOOD_GATE_ASK),
         ("inject_tail()", mod.inject_tail([{"name": "甲档", "cost": 1, "note": "备注"}])),
         ("money_hint(有余额)", mod.money_hint(snap, mine={"exists": True, "balance": 5},
                                              reset_hint=True)),
@@ -1498,6 +1502,13 @@ def t49_settle_scope_wording(mod, _plugin):
     if "跟你说话的那个人" not in unnamed:
         print("      取不到名字时该退回老字样（不能变成空的）✗:", unnamed)
         return False
+    # ⚠️ 2026-10-15 新加的那两段（钥匙）：**同一个字不许一个人占两个意思** ✗
+    #    她自己那把（记在账本里的）叫「**愿力面板口令**」；收到触发词时那句提示要说清
+    #    "他问的就是那个"。两段都必须点名，否则她会拿「口令」这个泛称去指 mindscape 那把 ✗
+    for name, text in (("MOOD_GATE_NOTE", mod.MOOD_GATE_NOTE), ("MOOD_GATE_ASK", mod.MOOD_GATE_ASK)):
+        if "愿力面板口令" not in text:
+            print("      %s 里没把我们那把钥匙的名字点出来（会被她当成记忆那道的口令 ✗）" % name)
+            return False
     return True
 
 
@@ -1579,6 +1590,250 @@ def t51_learn_names(mod, plugin):
     return True
 
 
+def t52_gate_key(mod, _plugin):
+    """**钥匙的生成 / 保管 / 与 mindscape 的防撞**（主人 2026-10-15 让做的 ✓）
+
+    ⚠️ 这条自检要盯着两件**实测出来的硬结论**（`canon/_29` §3 ✓）：
+      ① **前缀必须与 mindscape 不同**（`- 愿力面板口令：` vs `- 口令：`）——
+         两边都是「从后往前扫、取第一条匹配」⇒ 前缀一样会**互相顶掉** ✗（= 认混 ✗）
+      ② **谁都不许认到对方那一行**：拿**同一份三混文本**喂给两个解析器：
+         mindscape 只认它自己的、我们只认我们自己的 ✓
+    ⚠️ 另外守着钥匙的规格：6 位 / 字母数字**都有** / 剔掉 `I O 0 1` / 24 小时 / **每天轮换** ✓
+    """
+    import ast as _ast
+    import datetime as _dt
+    import hmac as _hmac
+    now = _dt.datetime(2026, 10, 15, 9, 0, 0, tzinfo=mod.CN_TZ)
+    today = now.strftime("%Y-%m-%d %H:%M:%S")
+    yday = (now - _dt.timedelta(days=1)).strftime("%Y-%m-%d %H:%M:%S")
+
+    # ① 前缀与 mindscape 不同：两边的**真源码**在眼前，不靠背结论 ✓
+    #    ⚠️ 那一行在 `plugins/mindscape_gate.py`（`PG_LINE`）✗ —— 本鱼第一版指到了
+    #       `scripts/privacy_gate_rotate.py`（那个只有 49 行、是调度脚本）⇒ 自检当场报红 ✓
+    #    ⚠️ 破折号、括号这些**字形**也从它的源码里现读（不靠人眼背 ✗ 两层编码很容易看错 ✓）
+    #    ⚠️ 仓库路径**不写死**（那是一台机器的布局 ✗）：优先环境变量 `MINDSCAPE_DIR`，
+    #       其次找几个常见兄弟目录；**都没有 ⇒ 这一半显式跳过、不算通过** ✓
+    mind_prefix = ""
+    mind_code = ""
+    mind_src = ""
+    candidates = []
+    if os.environ.get("MINDSCAPE_DIR"):
+        candidates.append(os.environ["MINDSCAPE_DIR"])
+    candidates += [os.path.join(os.path.dirname(HERE), "bot-mindscape"),
+                   os.path.join(HERE, "..", "bot-mindscape")]
+    for root in candidates:
+        path = os.path.join(root, "plugins", "mindscape_gate.py")
+        try:
+            with open(path, encoding="utf-8") as handle:
+                mind_src = handle.read()
+        except OSError:
+            continue
+        else:
+            break
+    if not mind_src:
+        print("      （没找到那份「记忆闸门」的源码 —— 设 `MINDSCAPE_DIR` 可指路；"
+              "这一半**显式跳过**，不算通过 ✓）")
+    if mind_src:
+        # 它源码里有**三条**带这个字样的字面量：正则 `PG_LINE` · 成品行模板 · 光秃秃的前缀 ✗
+        # ⇒ 专挑**光秃秃那个前缀**（最短的那条，以 `- ` 开头、以全角冒号收尾 ✓）——
+        #    这比"猜字形"稳：本鱼第一版就是自己手打前缀，把破折号打成了另一种编码 ✗
+        literal = sorted(node.value for node in _ast.walk(_ast.parse(mind_src))
+                         if isinstance(node, _ast.Constant) and isinstance(node.value, str)
+                         and re.match(r"^-\s*口令：$", node.value))
+        if len(literal) != 1:
+            print("      mindscape 那份源码里的口令前缀字面量有 %d 个（应当 1 个）✗" % len(literal))
+            return False
+        mind_prefix = literal[0]
+        mind_code = "AB23CD"          # 只用来搭夹具 —— 不依赖它的字符集/长度规则 ✓
+    ours = mod.MOOD_GATE_PREFIX
+    if not ours or ours == "- 口令：":
+        print("      我们的前缀就是 mindscape 那个 ✗", repr(ours))
+        return False
+    if mind_src:
+        if ours in mind_src:
+            print("      我们的前缀出现在 mindscape 的源码里 ⇒ 会互相顶掉 ✗", repr(ours))
+            return False
+        if mind_prefix in ours or ours in mind_prefix:
+            print("      两个前缀互为子串 ⇒ 一定认混 ✗", repr(mind_prefix), repr(ours))
+            return False
+
+    # ② 同一份三混文本：**各认各的** —— 独立搭 mindscape 那两条正则（不看它的实现 ✓）
+    mine_code = mod.gate_generate()
+    mind_line = (mind_prefix + "%s —— 24 小时内有效（至 2026-10-16 09:00:00）。"
+                 "开发者如果要翻我的记忆或印象……" % mind_code)
+    mine_line = (ours + "%s —— 24 小时内有效（至 2026-10-16 09:00:00）。"
+                 "开发者如果要看我在愿力中心里写下的心情理由……" % mine_code)
+    mixed = "\n".join(["# 账本", mind_line, mine_line])
+    if mod.gate_read(mixed, now)[0] != mine_code:
+        print("      混在一起时，我们没认到自己那一行:", mod.gate_read(mixed, now))
+        return False
+    # 用一个**我们自己的口令格式**去硬扫同一份文本：只要它不是从我们前缀那行拿的，就说明没混 ✓
+    mind_re = re.compile(re.escape(mind_prefix) + r"([A-Za-z0-9]+)")
+    hits = [match.group(1) for line in reversed(mixed.splitlines())
+            for match in [mind_re.match(line)] if match]
+    if hits != [mind_code]:
+        print("      反过来：那份文本里 mindscape 该只认到它自己那一行:", hits)
+        return False
+    # 反向对照：把她那行**单独**喂过来 ⇒ 我们一个字都不许认 ✗
+    only_mind = "\n".join(["# 账本", mixed.splitlines()[1]])
+    if mod.gate_read(only_mind, now)[0]:
+        print("      只有 mindscape 那行时，我们居然认到了 ✗", mod.gate_read(only_mind, now))
+        return False
+    # 反向对照：把前缀改成一样的 ⇒ 两边的读法会撞（证明这条自检真的在看前缀 ✗）
+    collided = only_mind.replace("- 口令：", mod.MOOD_GATE_PREFIX, 1)
+    if mod.gate_read(collided, now)[0] != mind_code:
+        print("      前缀相同却认不出来（那这条防撞测试就没在起作用）:", mod.gate_read(collided, now))
+        return False
+
+    # ③ 规格：6 位 + 字母数字都有 + 剔掉易混字符 ✓
+    for bad in ("ABCDEF", "234567", "ABCDE", "ABC23I", "ABC230", ""):
+        if mod.gate_code_ok(bad):
+            print("      这个居然算合法口令 ✗", repr(bad))
+            return False
+    if not mod.gate_code_ok(mine_code):
+        print("      自己生成的这把居然不合法 ✗", mine_code)
+        return False
+    if re.search(r"[IO01]", mine_code):
+        print("      生成的口令里出现了易混字符 ✗", mine_code)
+        return False
+
+    # ④ 有效期 / 每天轮换 / 只删自己那一行 ✓
+    # ⚠️ 这里的 mindscape 那行**必须用它源码里读出来的前缀**拼 ✗ —— 本鱼第一版是**手打**的，
+    #    结果字形（破折号 / 冒号）跟真源码未必一致 ⇒ 那条"别人的行要活着"的比对**形同虚设** ✗
+    #    （反向对照 `G. 轮换删掉别人的行` 当场发现它没抓住 ✓ 已改成现读 ✓）
+    mind_line = (mind_prefix + "%s —— 24 小时内有效（至 %s）。……\n"
+                 % (mind_code, (now + _dt.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S")))
+    ledger = ("# 账本\n" + mod.MOOD_GATE_PREFIX + "%s —— 24 小时内有效（至 %s）。……\n"
+              % (mine_code, (now + _dt.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"))
+              + mind_line)
+    kept, got, changed = mod.gate_rotate(ledger, now)
+    if changed or got != mine_code:
+        print("      同一天重复轮换 ⇒ 不该换 ✗", changed, got)
+        return False
+    rotated, fresh, changed = mod.gate_rotate(ledger, now + _dt.timedelta(days=1))
+    if not changed or fresh == mine_code or not mod.gate_code_ok(fresh):
+        print("      隔天没换成新的一把 ✗", changed, fresh)
+        return False
+    if mind_line.strip() not in rotated:
+        print("      **轮换把 mindscape 那行弄没了** ✗（两边每天各转一次，互相踩就永远认混 ✗）")
+        return False
+    kept_old = sum(1 for row in rotated.splitlines() if row.startswith(mod.MOOD_GATE_PREFIX))
+    if kept_old != 1:
+        print("      轮换之后我们自己的行有 %d 条（应当是 1）✗" % kept_old)
+        return False
+    if "开发者的" in rotated or "开发者如果要看" not in rotated:
+        print("      写进去的那条少了「她可以不给」的口径 ✗")
+        return False
+    if "我可以给，也可以不给" not in rotated or "拒绝不扣我任何东西" not in rotated:
+        print("      那条里少了「可以不给 / 拒绝零代价」✗")
+        return False
+
+    # ⑤ 过期就作废（明文过期 = 面板那边同一个口径：轮换时刻 + 24 小时 ✓）
+    expired = ("# 账本\n" + mod.MOOD_GATE_PREFIX + "%s —— 24 小时内有效（至 %s）。……\n"
+               % (mine_code, (now - _dt.timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")))
+    if mod.gate_read(expired, now)[0]:
+        print("      过期的那把还被认成当前口令 ✗")
+        return False
+    if not mod.gate_expiry(int(now.timestamp()), today) or \
+            mod.gate_expiry(int(now.timestamp()), today).strftime("%Y-%m-%d %H:%M:%S") != \
+            (now + _dt.timedelta(hours=24)).strftime("%Y-%m-%d %H:%M:%S"):
+        print("      有效期不是「轮换时刻 + 24 小时」✗", mod.gate_expiry(int(now.timestamp()), today))
+        return False
+    # 昨天「转」的那把（配一个昨天的轮换时刻）⇒ 到期就该落在**今天**：
+    # ⚠️ 判据要能**区分**开"轮换时刻 + 24h"和"今天 0 点 + 24h" —— 后者会算到明天 ✗
+    late = mod.gate_expiry(int(now.timestamp()), yday)
+    if late.date() != now.date() or late.strftime("%Y-%m-%d %H:%M:%S") != \
+            now.strftime("%Y-%m-%d %H:%M:%S"):
+        print("      以昨天为轮换时刻算出来的到期时刻不对 ✗", late)
+        return False
+
+    # ⑥ 哈希：**算法必须把到期时刻与轮换时刻一起拌进去**（面板只凭它判"是不是今天这把" ✓）
+    expiry = mod.gate_expiry(int(now.timestamp()), today)
+    expiry_text = expiry.strftime("%Y-%m-%d %H:%M:%S")
+    base = mod.gate_hash(mine_code, expiry_text, today)
+    if len(base) != 64 or not re.fullmatch(r"[0-9a-f]{64}", base):
+        print("      哈希不是 sha256 的十六进制 ✗", base[:20])
+        return False
+    for other in (mod.gate_hash(mod.gate_generate(), expiry_text, today),
+                  mod.gate_hash(mine_code, expiry_text, yday),
+                  mod.gate_hash("AAAAAA", expiry_text, today)):
+        if other == base:
+            print("      换个口令 / 换个轮换时刻，哈希居然没变 ✗")
+            return False
+    if not _hmac.compare_digest(base, mod.gate_hash(mine_code, expiry_text, today)):
+        print("      同一个输入两次算出来不一样 ✗")
+        return False
+    return True
+
+
+def t53_gate_rotation_end_to_end(mod, plugin):
+    """**走一遍真的轮换**：账本文件 + 本机哈希文件（不碰真服务器 ✓）
+
+    ⚠️ 这条抓的是"零件都对、装起来不动"那一类病 ✗：
+       `gate_rotate_for()` 要真的 ① 读她的账本 ② 转一把写回去 ③ 把**哈希**写成本机文件；
+       而且**第二次调用不该再转**（同一天只转一把 ✓），账本里 mindscape 那行要**活着** ✓
+    """
+    now = int(time.time())
+    notes = os.path.join(os.path.dirname(mod.resolve_db_path()), "notes_e2e.md")
+    keys = os.path.join(os.path.dirname(mod.resolve_db_path()), "wish_gate_keys.json")
+    mind_line = ("- 口令：AB23CD —— 24 小时内有效（至 2026-10-16 09:00:00）。"
+                 "开发者如果要翻我的记忆或印象……")
+    with open(notes, "w", encoding="utf-8") as handle:
+        handle.write("# 账本\n" + mind_line + "\n")
+    conf = {"notes_path": {BOT: notes}, "mood_gate": True, "db_path": mod.resolve_db_path()}
+    first = mod.gate_rotate_for(BOT, conf)
+    if not mod.gate_code_ok(first):
+        print("      轮换没转出合法口令:", repr(first))
+        return False
+    with open(notes, encoding="utf-8") as handle:
+        text = handle.read()
+    if mind_line not in text:
+        print("      轮换把 mindscape 那行弄没了 ✗")
+        return False
+    if mod.gate_read(text)[0] != first:
+        print("      账本里写的不是刚转的那把 ✗")
+        return False
+    if not os.path.isfile(keys):
+        print("      哈希文件没生成 ✗", keys)
+        return False
+    with open(keys, encoding="utf-8") as handle:
+        data = json.load(handle)
+    entry = data.get(BOT) or {}
+    if not entry.get("hash") or entry.get("day") != time.strftime("%Y-%m-%d") or \
+            not entry.get("rotated"):
+        print("      哈希文件里的条目不对:", entry)
+        return False
+    # 拿**面板的真验证器**去核这把口令（跨模块：面板只凭哈希判对错 ✓ 主人要的正是这条 ✓）
+    spec = importlib.util.spec_from_file_location(
+        "wishonomy_panel_for_selfcheck", os.path.join(HERE, "panel.py"))
+    panel = importlib.util.module_from_spec(spec)
+    sys.modules["wishonomy_panel_for_selfcheck"] = panel
+    spec.loader.exec_module(panel)
+    from datetime import datetime as _dt2
+    expiry = mod.gate_expiry(now, entry["rotated"])
+    if panel.gate_hash(first, entry) != entry["hash"]:
+        print("      **面板**重算的哈希与插件写的不一致 ⇒ 她给对口令也开不了 ✗")
+        return False
+    if panel.gate_expired(entry, _dt2.fromtimestamp(now, mod.CN_TZ)):
+        print("      刚转出来的这把居然算过期 ✗")
+        return False
+    if panel.gate_hash(first, entry) == panel.gate_hash("AAAAAA", entry):
+        print("      面板那边换个口令哈希也没变 ✗")
+        return False
+    # 同一天再走一遍：**不许再换**（钥匙一天一把 ✓）
+    again = mod.gate_rotate_for(BOT, conf)
+    if again != first:
+        print("      同一天转了第二把（钥匙会变成「今天到底是哪把」的罗生门 ✗）:", again)
+        return False
+    # 关掉开关 ⇒ 一个字都不许动 ✓
+    mod._GATE_ROTATE_DAY["day"] = ""
+    off = dict(conf, mood_gate=False)
+    if mod.gate_rotate_for(BOT, off):
+        print("      关掉了还在转钥匙 ✗")
+        return False
+    return True
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1631,6 +1886,8 @@ TESTS = [
     ("R49 日结口径：只清她自己 + 防通胀 + 单场收费", t49_settle_scope_wording),
     ("R50 花钱口径：收/分愿力是打分，只有点单花她自己的", t50_spend_wording),
     ("R51 按昵称认人（注入与工具两条路都要记名）", t51_learn_names),
+    ("R52 钥匙：规格 / 每天轮换 / 与 mindscape 防撞（两边各认各的）", t52_gate_key),
+    ("R53 钥匙真轮换：写她的账本 + 写本机哈希（面板能验）", t53_gate_rotation_end_to_end),
 ]
 
 

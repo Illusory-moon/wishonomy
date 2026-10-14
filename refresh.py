@@ -19,6 +19,8 @@ CONTAINER = os.environ.get("WISHONOMY_CONTAINER", "qqbot-astrbot")
 SSH_TARGET = os.environ.get("WISHONOMY_SSH", "srv")
 REMOTE_DATA = "/opt/astrbot/data/plugin_data/astrbot_plugin_wishonomy"
 STAGE = "/tmp/wishonomy-copy"
+# 心情锁那把钥匙的**哈希**文件（跟库放一起 ⇒ 一次拉全 ✓ 文件名与 `panel.GATE_FILE` 同源 ✓）
+GATE_KEYS = "wish_gate_keys.json"
 
 SSH = shutil.which("ssh") or r"C:\Windows\System32\OpenSSH\ssh.exe"
 SCP = shutil.which("scp") or r"C:\Windows\System32\OpenSSH\scp.exe"
@@ -53,9 +55,15 @@ def pull(dest_dir=None, ssh_target=None):
         info["error"] = "从容器里拷不出来：%s" % (err or out).strip()[:200]
         return info
     # ② 宿主机 → 本机
-    for name in ("ledger.db", "ledger.db-wal", "ledger.db-shm", "usage.jsonl"):
+    # ⚠️ `wish_gate_keys.json`（**心情锁那把钥匙的哈希** ✓）必须跟账本**同一次、同一批**拉回来 ✗：
+    #    面板跑在本机、插件跑在容器，两边只靠这份副本说话 ⇒ 少拉它一次，
+    #    面板就会拿着**旧哈希**去验**新口令**（她给对了也开不了门 ✗）
+    #    （口径见 `canon/_29` §3 ✓ 明文永远只在她自己的账本里 ✓）
+    names = ("ledger.db", "ledger.db-wal", "ledger.db-shm", "usage.jsonl",
+             GATE_KEYS)
+    for name in names:
         _run([SCP, "%s:%s/%s" % (target, STAGE, name), os.path.join(dest, name)])
-    for name in ("ledger.db", "ledger.db-wal", "ledger.db-shm", "usage.jsonl"):
+    for name in names:
         path = os.path.join(dest, name)
         if os.path.exists(path):
             info["files"].append(name)
