@@ -1,13 +1,19 @@
 # -*- coding: utf-8 -*-
 """愿力中心 · 只读面板（P6）。
 
-给**运营**看的一页：发行量 / 送礼 / 支出 / 欠条 / 信誉分 / 钱包排行 / 最近流水。
+给**运营**看的页面：发行量 / 送礼 / 支出 / 欠条 / 信誉分 / 钱包排行 / 最近流水。
+
+两个页面（2026-10-14 起 ✓）：
+  * `/`          —— 主页面：上面那些都在这一页；**最近流水不含被注视**（被注视一天两三百笔，
+                    混进来会把表占满 ✗）
+  * `/attention` —— **被注视次数**：总计 · 按天 · 今天按小时（它单独一页 ✓）
 
 三条纪律（代码保证 ✓）：
   1. **只读**：连接一律用 SQLite 的 `mode=ro` URI 打开 —— 面板**写不了**库 ✗
      （连 WAL 都不去碰：只读连接不会建 `-wal`/`-shm` ✓）
   2. **不占群里任何一句话**：它是本地页面，不是 bot 的功能 ✓
   3. **转义**：流水里的 `reason` 是用户/她写的原话 ⇒ 一律 `html.escape`（防 XSS ✓）
+  4. **零 `<script>`**：连展开都是纯 CSS（`label` + `:checked` ⇒ 点了**不跳页** ✓）
 
 跑法：
     python panel.py                      # 起在 127.0.0.1:8765
@@ -95,6 +101,9 @@ BRIEF_STAGE = 60        # 页面上**每次「再看更早的」放开多少行*
 BRIEF_MAX = 5000        # 上限（再多就该用 --json / 直接查库了 ✓）
 TOP_LIMIT = 12
 WALLET_LIMIT = 30
+ATTENTION_KIND = "attention"   # 「被注视」的流水类别 —— **不进最近流水**，单独一页 ✓
+ATTENTION_DAYS = 60            # 「被注视次数」那页按天最多列多少天
+CN_HOURS = int(CN_TZ.utcoffset(None).total_seconds() // 3600)   # SQLite 分天用（与 CN_TZ 同源 ✓）
 
 
 def connect(path):
@@ -118,14 +127,6 @@ def _name_of(conn, self_id, user_id):
     return name or str(user_id)
 
 
-def brief_of(conn, self_id, limit=BRIEF_LIMIT):
-    """最近流水（最新在前）。"""
-    rows = conn.execute(
-        "SELECT ts, group_id, from_id, to_id, amount, kind, reason FROM ledger "
-        "WHERE self_id=? ORDER BY id DESC LIMIT ?", (self_id, int(limit))).fetchall()
-    return rows_of(conn, self_id, rows)
-
-
 def rows_of(conn, self_id, rows):
     """把 ledger 的行整成面板要的形状（`brief` 与 `more` 共用 ✓）。"""
     out = []
@@ -140,72 +141,6 @@ def rows_of(conn, self_id, rows):
             "group_id": str(row["group_id"] or ""),
         })
     return out
-
-
-def group_brief(entries):
-    """把**连续同一类**的流水折起来（主人 2026-10-14 要的 ✓）。
-
-    ⚠️ 起因：`attention`（被注视 +1）一天能有两百多笔，一条一行会把整页刷满
-    （主人原话：「大多都是被注视」✗）⇒ 连着的一串合成一组：
-      - 被注视是**纯计数** ⇒ 合成一行「被注视 ×N（+N）」，展开才看细节 ✓
-      - 别的类别（送礼 / 心情 / 点单 / 日结…）**每笔都有话** ⇒ 原样一条一行 ✓
-    只折**连续**的（中间夹了别的就断组 ✓）—— 这样时间顺序不会乱 ✓
-    """
-    groups = []
-    for item in entries:
-        last = groups[-1] if groups else None
-        if (last is not None and item["kind"] == "attention"
-                and last["kind"] == "attention"):
-            last["count"] += 1
-            last["sum"] += item["amount"]
-            last["last_time"] = item["time"]
-            last["items"].append(item)
-            continue
-        groups.append({"kind": item["kind"], "count": 1, "sum": item["amount"],
-                       "time": item["time"], "last_time": item["time"],
-                       "items": [item], "entry": item})
-    return groups
-
-
-def snapshot(path, now=None, self_id=None, limit=BRIEF_LIMIT, more=False):
-    """面板要的全部数据（纯读 ✓）。数据库不存在/没建表 ⇒ 返回 available=False。"""
-    now = int(now if now is not None else time.time())
-    if not os.path.exists(path):
-        return {"available": False, "path": str(path), "reason": "数据库还不存在",
-                "now": now}
-    conn = connect(path)
-    try:
-        if not _has_schema(conn):
-            return {"available": False, "path": str(path),
-                    "reason": "数据库里还没有账本表", "now": now}
-        ids = ([str(self_id)] if self_id else
-               [str(r["self_id"]) for r in conn.execute(
-                   "SELECT DISTINCT self_id FROM account ORDER BY self_id").fetchall()])
-        bots = []
-        for bot in ids:
-            start = plugin.day_start(now)
-            rows = conn.execute(
-                "SELECT ts, group_id, from_id, to_id, amount, kind, reason FROM ledger "
-                "WHERE self_id=? ORDER BY id DESC LIMIT ?", (bot, int(limit))).fetchall()
-            entry_list = rows_of(conn, bot, rows)
-            total = int(conn.execute("SELECT COUNT(*) c FROM ledger WHERE self_id=?",
-                                     (bot,)).fetchone()["c"])
-            bots.append({
-                "self_id": bot,
-                "day": datetime.fromtimestamp(start, CN_TZ).strftime("%Y-%m-%d"),
-                "today": plugin.db_audit_totals(bot, start, now, conn=conn),
-                "today_detail": plugin.db_audit_detail(conn, bot, start, now, TOP_LIMIT),
-                "wallets": wallets_of(conn, bot),
-                "ious": ious_of(conn, bot),
-                "brief": group_brief(entry_list),
-                "brief_count": len(entry_list),
-                "ledger_total": total,
-                "limit": int(limit),
-                "more": bool(more),
-            })
-        return {"available": True, "path": str(path), "now": now, "bots": bots}
-    finally:
-        conn.close()
 
 
 def wallets_of(conn, self_id, limit=WALLET_LIMIT):
@@ -239,8 +174,10 @@ def ious_of(conn, self_id, limit=TOP_LIMIT):
 def snapshot(path, now=None, self_id=None, limit=BRIEF_LIMIT, more=False):
     """面板要的全部数据（纯读 ✓）。数据库不存在/没建表 ⇒ 返回 available=False。
 
-    ⚠️ 2026-10-14：这里曾有**第二份旧定义**（下面那个不带 `limit` 的）把它遮住 ✗ ——
-       Python 取**后**定义的 ⇒ 折叠/扩大范围全都看不到效果 ✓ 已删。
+    ⚠️ 2026-10-14：这里曾有**两份定义**（先定义的那份被后定义的遮住 ✗ ⇒ 改哪一份都不生效）
+       —— 已清掉，现在**只有这一份** ✓
+    ⚠️ **被注视（`kind='attention'`）刻意不在这份数据里**：它一天两三百笔，会把 400 行的
+       窗口占满（主人原话「大多都是被注视」✗）⇒ 它单独一页（见 `attention_snapshot()`）✓
     """
     now = int(now if now is not None else time.time())
     if not os.path.exists(path):
@@ -259,10 +196,12 @@ def snapshot(path, now=None, self_id=None, limit=BRIEF_LIMIT, more=False):
             start = plugin.day_start(now)
             rows = conn.execute(
                 "SELECT ts, group_id, from_id, to_id, amount, kind, reason FROM ledger "
-                "WHERE self_id=? ORDER BY id DESC LIMIT ?", (bot, int(limit))).fetchall()
+                "WHERE self_id=? AND kind<>? ORDER BY id DESC LIMIT ?",
+                (bot, ATTENTION_KIND, int(limit))).fetchall()
             entry_list = rows_of(conn, bot, rows)
-            total = int(conn.execute("SELECT COUNT(*) c FROM ledger WHERE self_id=?",
-                                     (bot,)).fetchone()["c"])
+            total = int(conn.execute(
+                "SELECT COUNT(*) c FROM ledger WHERE self_id=? AND kind<>?",
+                (bot, ATTENTION_KIND)).fetchone()["c"])
             bots.append({
                 "self_id": bot,
                 "day": datetime.fromtimestamp(start, CN_TZ).strftime("%Y-%m-%d"),
@@ -270,11 +209,75 @@ def snapshot(path, now=None, self_id=None, limit=BRIEF_LIMIT, more=False):
                 "today_detail": plugin.db_audit_detail(conn, bot, start, now, TOP_LIMIT),
                 "wallets": wallets_of(conn, bot),
                 "ious": ious_of(conn, bot),
-                "brief": group_brief(entry_list),
+                "brief": entry_list,
                 "brief_count": len(entry_list),
                 "ledger_total": total,
                 "limit": int(limit),
                 "more": bool(more),
+            })
+        return {"available": True, "path": str(path), "now": now, "bots": bots}
+    finally:
+        conn.close()
+
+
+def _stamps(row):
+    """把一条 `COUNT/SUM/MIN/MAX` 的结果整成「次数 / 折合愿力 / 首末时间」（纯读 ✓）"""
+    def at(value):
+        return (datetime.fromtimestamp(int(value), CN_TZ).strftime("%m-%d %H:%M")
+                if value else "")
+
+    return {"count": int(row["c"] or 0), "amount": int(row["s"] or 0),
+            "first": at(row["a"]), "last": at(row["b"])}
+
+
+def attention_snapshot(path, now=None, self_id=None, days=ATTENTION_DAYS):
+    """「被注视次数」那一页要的数据（**纯读** ✓ 主人 2026-10-14 裁定的独立界面）。
+
+    数字口径（准则②：**每个数字都要说清"这是谁的"** ✓）：
+      · 被注视 = `system → 她自己`（每条**唤醒** +1）⇒ 这些次数进的是**她自己**那一栏的愿力，
+        **不是别人的**（页面上每一处都写明 ✓）
+      · 分天 / 分小时一律按**北京时间**（`CN_HOURS` 与 `plugin.day_start()` 同源 ✓）
+    """
+    now = int(now if now is not None else time.time())
+    if not os.path.exists(path):
+        return {"available": False, "path": str(path), "now": now,
+                "reason": "数据库还不存在"}
+    conn = connect(path)
+    try:
+        if not _has_schema(conn):
+            return {"available": False, "path": str(path), "now": now,
+                    "reason": "数据库里还没有账本表"}
+        shift = "%+d hours" % CN_HOURS
+        ids = ([str(self_id)] if self_id else
+               [str(r["self_id"]) for r in conn.execute(
+                   "SELECT DISTINCT self_id FROM account ORDER BY self_id").fetchall()])
+        bots = []
+        for bot in ids:
+            start = plugin.day_start(now)
+            total = conn.execute(
+                "SELECT COUNT(*) c, SUM(amount) s, MIN(ts) a, MAX(ts) b FROM ledger "
+                "WHERE self_id=? AND kind=?", (bot, ATTENTION_KIND)).fetchone()
+            today = conn.execute(
+                "SELECT COUNT(*) c, SUM(amount) s, MIN(ts) a, MAX(ts) b FROM ledger "
+                "WHERE self_id=? AND kind=? AND ts>=? AND ts<=?",
+                (bot, ATTENTION_KIND, start, now)).fetchone()
+            by_day = conn.execute(
+                "SELECT date(ts,'unixepoch',?) d, COUNT(*) c, SUM(amount) s, "
+                "MIN(ts) a, MAX(ts) b FROM ledger WHERE self_id=? AND kind=? "
+                "GROUP BY d ORDER BY d DESC LIMIT ?",
+                (shift, bot, ATTENTION_KIND, int(days))).fetchall()
+            by_hour = conn.execute(
+                "SELECT CAST(strftime('%H', ts, 'unixepoch', ?) AS INTEGER) h, COUNT(*) c "
+                "FROM ledger WHERE self_id=? AND kind=? AND ts>=? AND ts<=? "
+                "GROUP BY h ORDER BY h", (shift, bot, ATTENTION_KIND, start, now)).fetchall()
+            bots.append({
+                "self_id": bot,
+                "day": datetime.fromtimestamp(start, CN_TZ).strftime("%Y-%m-%d"),
+                "total": _stamps(total),
+                "today": _stamps(today),
+                "days": [dict(_stamps(r), day=str(r["d"])) for r in by_day],
+                "hours": [{"hour": int(r["h"] or 0), "count": int(r["c"])}
+                          for r in by_hour],
             })
         return {"available": True, "path": str(path), "now": now, "bots": bots}
     finally:
@@ -287,7 +290,7 @@ PAGE = """<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<title>愿力中心 · 只读面板</title>
+<title>{title}</title>
 <style>
 :root{{
  --bg:#eef1f6; --card:#fff; --ink:#151b2b; --ink2:#4a5568; --mut:#7b8698;
@@ -375,6 +378,11 @@ td.num{{font-size:13px}}
 tr.muted td{{color:var(--mut)}}
 .pos{{color:var(--good)}} .neg{{color:var(--warn)}}
 .zero{{color:var(--mut)}}
+.mut{{color:var(--mut)}}
+.bar{{display:inline-block;height:10px;min-width:3px;border-radius:3px;
+ background:var(--info);vertical-align:middle}}
+.barwrap{{display:flex;align-items:center;gap:8px;min-width:120px}}
+.barwrap .n{{color:var(--mut);font-variant-numeric:tabular-nums;font-size:12px}}
 .ids{{font-size:11.5px;color:var(--mut);font-variant-numeric:tabular-nums}}
 
 /* ── 徽章 ── */
@@ -413,18 +421,19 @@ footer{{max-width:1240px;margin:0 auto;padding:0 var(--pad) 40px;
 }}
 </style></head><body>
 <div class="top"><div class="wrap">
- <div class="brand"><span class="dot"></span><h1>愿力中心 · 只读面板</h1></div>
+ <div class="brand"><span class="dot"></span><h1>{title}</h1></div>
  <div class="chips">
   <span class="chip">数据文件：<b>{path}</b></span>
   <span class="chip">看的时间：<b>{shown}</b></span>
   <span class="chip ok">连接：只读（面板写不了库 ✓）</span>
   {refresh_chip}
+  {nav}
  </div>
 </div></div>
 <main>
 {body}
 </main>
-<footer>本页是**只读**视图：数据来自账本的只读快照，页面上不会写入任何东西。<br>
+<footer>本页是<b>只读</b>视图：数据来自账本的只读快照，页面上不会写入任何东西。<br>
  页面零外部依赖（没有 CDN / 外链字体 / 外链脚本），可直接离线打开。</footer>
 </body></html>
 """
@@ -510,123 +519,100 @@ def brief_row(item):
             item["reason"] or "—"]
 
 
-def brief_table(bot, folded=False):
-    """最近流水：**被注视先藏着**，点按钮**原地展开**（不刷新、不回顶部 ✓ 主人 2026-10-14 要的）。
+def brief_table(bot, prefix="b"):
+    """最近流水：**被注视不在这张表里**（它单独一页 ✓ 主人 2026-10-14 要的）。
 
-    三层「展开」，全是**纯 CSS**（`:target` 控 display，零 JS ⇒ 不产生请求 ⇒ 不跳顶部 ✓）：
-      · **再看被注视** —— 主人真正的痛点（「大多都是被注视」✗）：默认只显示有内容的 ✓
-      · **再看更早的** —— 每次放开 `BRIEF_STAGE` 行（服务端一次就读够 400 行 ⇒ 也是零请求 ✓）
-      · 真读到头时给一个 `?n=` 兜底（那要重新查库，只有这一条会刷新 ✓）
-
-    ⚠️ 2026-10-14 真机 bug（主人报「两个按钮同时出现，点完一个就不能点另一个」✗）：
-       原来是**把按钮放在整张表下面** ⇒ 但 `:target~tr` **只能管到后面的兄弟** ✗
-       （表后面啥也没有）⇒ 点第二个当然没反应；而按钮之间又互相看不到 ⇒ 两个一起显出来 ✗
-       ⇒ 修：**锚点与按钮夹在"批"与"批"之间** —— 点一次展开下一批、
-          **并把它自己收起来**（`#more-N:target~tr.anchor.a{n}` 隐藏 ✓），
-          所以同一个时刻永远只看得见一颗 ✓
+    展开 = **label + checkbox**（纯 CSS、零 JS、零请求 ✓）：
+      · 点的是 `<label>`，**不是 `#` 锚点** ⇒ 浏览器不做文档跳转 ⇒ **页面零位移** ✓
+        （旧版是 `<a href="#more-N">` + `:target`，两个真病：① 点一下浏览器把这一行滚到视口
+         顶部 = 主人报的"比较大的位移" ✗ ② `:target` 同一时刻只认一个元素 ⇒ 点第二颗时
+         第一批整批缩回去 ✗ = 主人报的"第一个被折叠掉"）
+      · **同一时刻只看得见一颗按钮**（主人本轮的裁定 ✓）：它永远在最前沿 —— 夹在"已展开的
+        那批"末尾；点过之后它自己只留一条窄信息（按钮 `visibility:hidden`，**行高不塌** ⇒
+        上方一个像素都不动 ✓），下一颗按钮跟着内容**自然往下顺延** ✓
+      · 展开过的批次**只增不减**（勾上就一直勾着）✓
+      · 表底那颗「库里还有更早的」要重新查库 ⇒ **会刷新一次**（全页只有这一条会跳 ✓）
     """
-    groups = bot["brief"]
-    if not groups:
+    entries = bot["brief"]
+    if not entries:
         return _empty("还没有流水", "·")
     head = ["时间", "类别", "从", "到", "数额", "她/他写的原话"]
     total = bot.get("ledger_total") or 0
     shown = bot.get("brief_count", 0)
-    stages = max(1, (len(groups) + BRIEF_STAGE - 1) // BRIEF_STAGE)
-    hidden_after = shown < total          # 库里还有更早的 ⇒ 最后给 `?n=` 兜底 ✓
-    has_attention = any(g["kind"] == "attention" for g in groups)
+    stages = max(1, (len(entries) + BRIEF_STAGE - 1) // BRIEF_STAGE)
+    hidden_after = shown < total          # 库里还有更早的 ⇒ 表底给 `?n=` 兜底 ✓
 
     body = []
-    for index, group in enumerate(groups):
+    for index, item in enumerate(entries):
         if index and index % BRIEF_STAGE == 0:
-            stage = index // BRIEF_STAGE      # 第 stage 批**之前** ⇒ 放"开这一批"的按钮
-            # 最后一颗兼做两件事：① 放开本地那批 ② 若库里还有更早的，再给一个"读更早的"（要刷新 ✓）
-            tail = ""
-            # 最后一颗（后面没有第 n+1 批了）⇒ 兼做"库里还有更早的"那个入口 ✓
-            # ⚠️ 边界别再算错：按钮 id 是 `more-{批号-1}`，最后一颗就是 `stages-1` ✗
-            if stage == stages - 1 and hidden_after:
-                nxt = min(int(bot.get("limit") or BRIEF_LIMIT) * 3, BRIEF_MAX)
-                tail = (' <a class="btn ghost" href="?n=%d">库里还有更早的，读 %d 行'
-                        '（这一下会刷新一次）</a>' % (nxt, nxt))
-            body.append(
-                '<tr class="anchor a%d" id="more-%d"><td colspan="6">'
-                '<a class="btn" href="#more-%d">⬇ 再看更早的 %d 行</a>'
-                '<span class="mut">已看到第 %d 行 · 账上共 %d 笔 · 点一下原地展开 ✓</span>%s'
-                '</td></tr>' % (stage, stage, stage, BRIEF_STAGE, index, total, tail))
-        item = group["items"][0]
-        quiet = group["kind"] == "attention"
+            # 第 stage 批**之前**放这一颗按钮：点了才放开第 stage+1 批 ✓
+            body.append(_anchor_row(prefix, index // BRIEF_STAGE, index, total))
         classes = []
-        if quiet:
-            classes.append("quiet")
         if index >= BRIEF_STAGE:
             classes.append("stage")
             classes.append("s%d" % (index // BRIEF_STAGE + 1))
         attr = ' class="%s"' % " ".join(classes) if classes else ""
-        if quiet and group["count"] > 1:
-            inner = "".join(
-                '<tr class="sub">%s</tr>' % "".join(
-                    _cell(cell) for cell in [
-                        {"v": one["time"], "cls": "num"}, {"v": "", "cls": ""},
-                        {"v": "", "cls": ""}, {"v": "", "cls": ""},
-                        {"v": "+%d" % int(one["amount"]), "cls": "num pos"},
-                        {"v": one["reason"] or "—", "cls": ""}])
-                for one in group["items"])
-            body.append(
-                '<tr%s><td colspan="6"><details><summary>'
-                '<span class="pill p-attention">attention</span> 被注视 <b>×%d</b>'
-                ' <span class="mut">（+%d）</span>'
-                '<span class="mut"> · 最新 %s</span></summary>'
-                '<table class="inner">%s</table></details></td></tr>'
-                % (attr, group["count"], group["sum"], group["time"], inner))
-            continue
         body.append("<tr%s>%s</tr>" % (attr, "".join(_cell(cell) for cell in brief_row(item))))
 
-    foot = []
-    if has_attention:
-        body.insert(0, '<tr class="anchor" id="attention"><td colspan="6">'
-                       '<a class="btn ghost" href="#top">收起被注视</a></td></tr>')
-        foot.append('<a class="btn" href="#attention">👁 再看被注视</a>')
-    foot.append('<span class="mut">已显示最近 <b>%d</b> 笔中的前 <b>%d</b> 笔'
-                '（账上共 <b>%d</b> 笔）</span>'
-                % (shown, min(shown, BRIEF_STAGE * stages), total))
+    foot = ['<span class="mut">这张表<b>不含被注视</b>（它单独一页）：显示最近 %d 笔中的前 %d 笔，'
+            '这一类共 %d 笔</span>' % (shown, min(shown, BRIEF_STAGE * stages), total)]
+    if hidden_after:
+        nxt = min(int(bot.get("limit") or BRIEF_LIMIT) * 3, BRIEF_MAX)
+        foot.append('<a class="btn ghost" href="?n=%d">库里还有更早的，读 %d 行'
+                    '（这一下会重新查库、页面回到顶部）</a>' % (nxt, nxt))
     return ('<div class="tw" id="top"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
             '<div class="foot">%s</div>'
             % ("".join("<th%s>%s</th>" % (' class="num"' if i in (0, 4) else "", h)
                        for i, h in enumerate(head)), "".join(body), "".join(foot)))
 
 
-def stage_css(stages=6):
-    """展开用的**纯 CSS 规则**（零 JS ⇒ 不刷新、不跳顶部 ✓）。
+def _anchor_row(prefix, stage, seen, total):
+    """一颗「再看更早的」按钮 = **label + 藏起来的 checkbox**（点了不跳页 ✓）。
 
-    ⚠️ 这里踩过一次真 bug（2026-10-14 主人报「两个按钮同时出现、点完一个另一个点不动」✗）：
-       第一版把按钮**放在整张表下面**，还用"自己藏自己"—— 而 `:target~tr` **只管后面的兄弟** ✗
-       ⇒ 表后面啥也没有 ⇒ 点第二颗没反应；而几颗按钮互相看不见 ⇒ 一起显出来 ✗
-       ⇒ 现在改成**链式**：第 n 颗按钮**夹在第 n 批之前**，
-          ① 默认全藏 ② 只有"点了第 n−1 颗"才冒出第 n 颗 ③ 点了自己就收起自己 ✓
-          ⇒ **同一时刻永远只看得见一颗** ✓
+    ⚠️ 两个踩过的坑都写进规则里：
+      · 第一颗（`a1`）**永远可见** —— 上一版把所有按钮都藏了 ⇒ 页面上 0 颗按钮 ✗
+      · `for` 指的是**这一批自己的**开关；点过之后 CSS 只把按钮 `visibility:hidden`
+        （**不能 `display:none`** —— 那会塌掉一行，上方内容就会向上跳 ✗）
     """
-    rules = [".stage{display:none}", ".quiet{display:none}", "tr.anchor{display:none}"]
-    # ⚠️ 第一颗按钮（#more-1）**永远可见** ✗ —— 它没有"前一颗"能把它放出来，
-    #    上一版就是在这里翻车：`tr.anchor{display:none}` 把**所有**按钮都藏了 ⇒
-    #    页面上**一颗都没有**（主人报「直接没有再看更多的按钮了」✓）⇒ 现在给它开个例外 ✓
-    rules.append("tr.a1{display:table-row}")
+    box = "%s-tg-%d" % (prefix, stage)
+    return ('<tr class="anchor a%d"><td colspan="6">'
+            '<input type="checkbox" class="tg" id="%s">'
+            '<label class="btn" for="%s" title="就地展开，页面不会跳 ✓">'
+            '⬇ 再看更早的 %d 行</label>'
+            '<span class="mut">已看到第 %d 行 · 这一类共 %d 笔</span></td></tr>'
+            % (stage, box, box, BRIEF_STAGE, seen, total))
+
+
+def stage_css(prefix="b", stages=6):
+    """展开用的**纯 CSS 规则**（零 JS ⇒ 零请求、零跳顶部 ✓）。
+
+    机制（主人本轮裁定「同一时刻只看得见一颗按钮」✓）：
+      · `input.tg` 是真开关：视觉上藏起来，但**还能 Tab 到** ⇒ 键盘也开得动 ✓
+      · 第 k+1 批的行 + 第 k+1 颗按钮，要 `#…-tg-k` 勾上才出现 ⇒ 只有点过前一颗才冒出来 ✓
+      · 点过的那颗：**只把按钮 `visibility:hidden`**（留行高 ⇒ 上方零位移 ✓），
+        那一行从此变成一条窄信息（"已看到第 N 行"）
+      · 老浏览器没有 `:has()` ⇒ `@supports not …` 里**一次全展开**（不会"点了没反应" ✓）
+    """
+    rules = [".stage{display:none}", "tr.anchor{display:none}",
+             # ⚠️ 第一颗按钮必须永远可见 —— 上一版把它也藏了 ⇒ 页面上 0 颗按钮 ✗
+             "tr.a1{display:table-row}",
+             "input.tg{position:absolute;width:1px;height:1px;margin:0;border:0;"
+             "padding:0;opacity:0;pointer-events:none}",
+             "tr.anchor:has(input.tg:checked) label.btn{visibility:hidden}",
+             "tr.anchor:has(input.tg:focus-visible) label.btn{outline:2px solid var(--info);"
+             "outline-offset:2px}"]
     for stage in range(1, stages + 1):
-        # 点了第 n 颗：第 n+1 批的行出现、第 n+1 颗按钮出现、这 n 颗自己收起来 ✓
-        rules.append("#more-%d:target~tr.s%d{display:table-row}" % (stage, stage + 1))
-        rules.append("#more-%d:target~tr.a%d{display:table-row}" % (stage, stage + 1))
-        rules.append("#more-%d:target~tr.a%d{display:none}" % (stage, stage))
-        rules.append("#more-%d:target~tr.a%d{display:none}" % (stage, stage - 1))
-    # 点了**最后一颗**（它后面没有 a{n+1} 了）⇒ 按钮链到此结束
-    # ⚠️ 编号是 `more-0/1/2…`（按"第几批"从 0 起 ✗）—— 上一版写成 `more-{stages}`，
-    #    差一位 ⇒ **最后一颗点了收不掉**（而且兜底链接也挂不上去 ✓）
-    if stages >= 1:
-        rules.append("#more-%d:target~tr.anchor{display:none}" % (stages - 1))
-    # 被注视：锚点在**表体第一行** ⇒ 后面的 .quiet 才管得到 ✓
-    rules.append("#attention:target~tr.quiet{display:table-row}")
+        rules.append("table:has(#%s-tg-%d:checked) tr.s%d{display:table-row}"
+                     % (prefix, stage, stage + 1))
+        rules.append("table:has(#%s-tg-%d:checked) tr.a%d{display:table-row}"
+                     % (prefix, stage, stage + 1))
+    rules.append("@supports not selector(:has(*)){.stage{display:table-row}"
+                 "tr.anchor{display:none}}")
     rules.append('.anchor td,.foot{text-align:center;padding:10px 8px;background:var(--soft-bg);'
                  'border-top:1px solid var(--line)}')
     rules.append('.btn{display:inline-block;padding:7px 14px;margin:0 6px;border-radius:999px;'
                  'background:var(--info);color:#fff;font-weight:600;text-decoration:none;'
-                 'border:1px solid transparent}')
+                 'border:1px solid transparent;cursor:pointer}')
     rules.append('.btn:hover{filter:brightness(1.08)}')
     rules.append('.btn.ghost{background:transparent;color:var(--info);border-color:var(--info)}')
     return "<style>" + "".join(rules) + "</style>"
@@ -639,16 +625,13 @@ def _cell(cell):
     raw = cell.get("raw") if isinstance(cell, dict) else False
     text = value if raw else html.escape(str(value))
     return '<td%s>%s</td>' % (' class="%s"' % cls if cls else "", text)
-    """紫色那颗「一键拉取」按钮（**纯链接 + GET** ⇒ 不需要任何 JS ✓）"""
-    if not on:
-        return '<span class="chip">一键拉取：关（启动时加 --refresh 打开）</span>'
-    return ('<a class="chip btn" href="?refresh=1" '
-            'title="去服务器把账本的只读副本拉一份新的过来（不会改动远端任何东西）">'
-            '⟳ 一键拉取新副本</a>')
 
 
-def render(data, refresh_on=False, flash=""):
-    """把 `snapshot()` 的 dict 拼成一整页 HTML（**纯呈现**：一个数据查询都不做 ✓）。"""
+MAIN_TITLE = "愿力中心 · 只读面板"
+ATTENTION_TITLE = "愿力中心 · 被注视次数"
+NAV_ATTENTION = ('<a class="chip btn" href="/attention" '
+                 'title="她每被唤醒一次 +1；只列次数，不混进流水">👁 查看被注视次数</a>')
+NAV_HOME = '<a class="chip btn" href="/" title="回主页面（流水 / 钱包 / 欠条那一页）">← 回主页面</a>'
 
 
 def render(data, refresh_on=False, flash=""):
@@ -659,7 +642,8 @@ def render(data, refresh_on=False, flash=""):
                 '<div class="r">%s</div><div class="p">%s</div></div>'
                 % (html.escape(str(data.get("reason") or "")),
                    html.escape(str(data.get("path") or ""))))
-        return PAGE.format(path=html.escape(str(data.get("path") or "")), shown="-",
+        return PAGE.format(title=MAIN_TITLE, nav=NAV_ATTENTION, shown="-",
+                           path=html.escape(str(data.get("path") or "")),
                            refresh_chip=chip,
                            body=flash + _card("读不到账本", '<div class="pad">%s</div>' % note))
 
@@ -738,15 +722,99 @@ def render(data, refresh_on=False, flash=""):
             table = _empty("今天还没人动过", "·")
         blocks.append(_card("今日活跃", table, tag="进 / 出合计"))
 
-        # ⑤ 最近流水（被注视先藏着，点按钮原地展开 ✓ 主人 2026-10-14 要的）
+        # ⑤ 最近流水（**被注视不在这张表里** —— 它单独一页；展开是 label+checkbox，点了不跳页 ✓）
+        prefix = "b%s" % bot["self_id"]
         stages = max(1, (len(bot["brief"]) + BRIEF_STAGE - 1) // BRIEF_STAGE)
-        blocks.append(_card("最近流水", stage_css(min(stages, 12)) + brief_table(bot),
-                            tag="最新在前 · 被注视默认收起"))
+        link = ('<div class="pad"><a class="btn" href="/attention">👁 查看被注视次数</a>'
+                '<span class="mut">被注视（每被唤醒一次 +1）不在下面这张表里 —— 它单独一页 ✓</span>'
+                '</div>')
+        blocks.append(_card("最近流水",
+                            link + stage_css(prefix, min(stages, 12)) + brief_table(bot, prefix),
+                            tag="最新在前 · 不含被注视（另有一页）"))
 
     if not blocks:
         blocks.append(_card("账本", '<div class="pad">%s</div>'
                             % _empty("账本里还没有任何 bot 的账", "·")))
-    return PAGE.format(path=html.escape(str(data.get("path") or "")),
+    return PAGE.format(title=MAIN_TITLE, nav=NAV_ATTENTION,
+                       path=html.escape(str(data.get("path") or "")),
+                       shown=datetime.fromtimestamp(int(data["now"]), CN_TZ)
+                       .strftime("%Y-%m-%d %H:%M:%S"),
+                       refresh_chip=chip,
+                       body=flash + "".join(blocks))
+
+
+def attention_page(data, refresh_on=False, flash=""):
+    """「被注视次数」那一页（**纯呈现** ✓ 主人 2026-10-14 要的独立界面）。
+
+    看三样：**总计** · **按天** · **今天按小时**。每一处都写明「这是**她自己**那一栏的」✓
+    """
+    chip = _refresh_chip(refresh_on)
+    if not data.get("available"):
+        note = ('<div class="note"><div class="t">还读不到账本</div>'
+                '<div class="r">%s</div><div class="p">%s</div></div>'
+                % (html.escape(str(data.get("reason") or "")),
+                   html.escape(str(data.get("path") or ""))))
+        return PAGE.format(title=ATTENTION_TITLE, nav=NAV_HOME, shown="-",
+                           path=html.escape(str(data.get("path") or "")),
+                           refresh_chip=chip,
+                           body=flash + _card("读不到账本", '<div class="pad">%s</div>' % note))
+
+    blocks = []
+    for bot in data.get("bots") or []:
+        total, today = bot["total"], bot["today"]
+        blocks.append('<div class="bot"><span class="who">bot %s</span>'
+                      '<span class="day">被注视 = 她每被<b>唤醒</b>一次 +1 —— '
+                      '这些愿力进的是<b>她自己</b>那一栏，不是别人的 ✓</span></div>'
+                      % html.escape(str(bot["self_id"])))
+        blocks.append(_card("总计", '<div class="metrics">%s</div>' % "".join([
+            _metric("被注视（总次数）", "%d 次" % total["count"], tone="good",
+                    sub="最早 %s" % (total["first"] or "—")),
+            _metric("折合愿力（她自己的）", plugin.money_text(total["amount"]),
+                    sub="system → 她自己"),
+            _metric("今天", "%d 次" % today["count"], sub=str(bot["day"])),
+            _metric("今天折合（她自己的）", plugin.money_text(today["amount"]),
+                    sub="0 点日结会把它清掉 ✓"),
+            _metric("有记录的天数", "%d 天" % len(bot["days"]),
+                    sub="最多列 %d 天" % ATTENTION_DAYS),
+            _metric("最近一次", today["last"] or total["last"] or "—",
+                    sub="最近一次被唤醒"),
+        ]), tag="全部时间"))
+
+        if bot["days"]:
+            rows = [[d["day"], {"v": "%d 次" % d["count"], "cls": "num"},
+                     {"v": "+%d" % d["amount"], "cls": "num pos"},
+                     {"v": d["first"], "cls": "num"}, {"v": d["last"], "cls": "num"}]
+                    for d in bot["days"]]
+            table = _table(["日期", "次数", "折合愿力（她的）", "那天第一次", "那天最后一次"],
+                           rows, align=(1, 2, 3, 4))
+        else:
+            table = _empty("还没有被注视过", "·")
+        blocks.append(_card("按天", table, tag="最新在前 · 北京时间"))
+
+        if bot["hours"]:
+            peak = max([h["count"] for h in bot["hours"]] + [1])
+            rows = [[{"v": "%02d:00" % h["hour"], "cls": "num"},
+                     {"v": "%d 次" % h["count"], "cls": "num"},
+                     {"v": '<span class="bar" style="width:%dpx"></span>'
+                           % max(4, int(240 * h["count"] / peak)), "raw": True}]
+                    for h in bot["hours"]]
+            table = _table(["时", "次数", "多少"], rows, align=(0, 1))
+        else:
+            table = _empty("今天还没被注视过", "·")
+        blocks.append(_card("今天按小时", table, tag=str(bot["day"])))
+
+    blocks.append(_card("这一页是什么", '<div class="pad"><div class="note">'
+                       '<div class="t">为什么单独一页</div>'
+                       '<div class="r">被注视一天两三百笔，混在「最近流水」里会把整张表占满 '
+                       '（所以流水那张表**整类不含**它）。这里只看**次数**。</div>'
+                       '<div class="p">口径：每条唤醒 +1（`system → 她自己`）· '
+                       '负数/日结不算注视 · 全部按北京时间 · 本页只读 ✓</div>'
+                       '</div></div>'))
+    if not blocks:
+        blocks.append(_card("被注视", '<div class="pad">%s</div>'
+                            % _empty("账本里还没有任何 bot 的账", "·")))
+    return PAGE.format(title=ATTENTION_TITLE, nav=NAV_HOME,
+                       path=html.escape(str(data.get("path") or "")),
                        shown=datetime.fromtimestamp(int(data["now"]), CN_TZ)
                        .strftime("%Y-%m-%d %H:%M:%S"),
                        refresh_chip=chip,
@@ -799,9 +867,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):                                   # noqa: N802 —— http.server 的约定
         target = self._path_text()
         path, _sep, query = target.partition("?")
-        if path not in ("/", "/index.html"):
-            self.send_error(404, "only / is served")
+        # 两个页面：`/` = 流水那一页 · `/attention` = 被注视次数那一页（主人 2026-10-14 要的 ✓）
+        if path not in ("/", "/index.html", "/attention", "/attention.html"):
+            self.send_error(404, "only / and /attention are served")
             return
+        wanted_attention = path.startswith("/attention")
         flash = ""
         wants = urllib.parse.parse_qs(query or "")
         # 「再看更多」：`?n=36` 之类 ⇒ 这次多读一点（有上限、且必须是真的整数 ✓）
@@ -825,8 +895,13 @@ class Handler(BaseHTTPRequestHandler):
                 flash = ('<div class="note"><div class="t">拉取失败</div><div class="r">%s</div></div>'
                          % html.escape(str(exc)[:200]))
         try:
-            payload = render(snapshot(self.db_path, limit=limit), refresh_on=self.refresh,
-                             flash=flash).encode("utf-8")
+            if wanted_attention:
+                payload = attention_page(attention_snapshot(self.db_path),
+                                         refresh_on=self.refresh,
+                                         flash=flash).encode("utf-8")
+            else:
+                payload = render(snapshot(self.db_path, limit=limit), refresh_on=self.refresh,
+                                 flash=flash).encode("utf-8")
             status = 200
         except Exception as exc:                        # noqa: BLE001 —— 面板出错也别把栈甩给浏览器
             payload = ("读账本失败：%s" % html.escape(str(exc)[:200])).encode("utf-8")

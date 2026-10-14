@@ -326,104 +326,167 @@ def t10_open_browser_once(_env, _unused):
     return True
 
 
-def t11_fold_attention(env, _unused):
-    """被注视折叠：**连续同一类**折一行、可展开；别的类别一条一行 ✓（主人 2026-10-14 要的）
+def t11_expand_inplace(env, _unused):
+    """最近流水：展开 = **label + 真开关**（点了**不跳页** ✓）· 批次累积 · 零锚点 · 零 JS
 
-    ⚠️ 为什么值得一条自检：这功能改坏了**不会报错**，只会让页面又变回两百行 ✗
+    ⚠️ 为什么值得一条自检：这是**主人两次报障**的地方（"点完页面位移很大"✗ / "第一个查看更早
+       被折叠掉"✗）。旧版是 `<a href="#more-N">` + `:target`：① 浏览器跳锚点 ⇒ 页面位移
+       ② `:target` 同一时刻只认一个元素 ⇒ 点第二颗时第一批整批缩回去 ✗
+       ⇒ 所以这里**正面判据 + 反面判据**一起钉：
+         正面 = 有 checkbox 开关 / 有 `:has()` 门控 / 点过的按钮是 `visibility:hidden`
+         反面 = 源码里不许出现 `href="#` / `:target` / 用 `display:none` 收按钮（会塌行高 ✗）
     """
-    rows = []
     base = int(time.time())
-    seq = [("attention", 1), ("attention", 1), ("attention", 1), ("mood", 5),
-           ("attention", 1), ("attention", 1)]
-    for i, (kind, amount) in enumerate(seq):
-        rows.append({"ts": base + i, "group_id": "9", "from_id": "system",
-                     "to_id": env.sc.BOT, "amount": amount, "kind": kind,
-                     "reason": "自检 %s" % kind})
-    # ⚠️ 连接用完必须关：面板是只读连接，但没关的话 Windows 上连临时目录都删不掉 ✗
+    rows = [{"ts": base - i, "group_id": "9", "from_id": env.sc.BOB, "to_id": env.sc.BOT,
+             "amount": 5, "kind": "mood", "reason": "自检 %d" % i} for i in range(130)]
     conn = env.panel.connect(env.db)
     try:
         entries = env.panel.rows_of(conn, env.sc.BOT, rows)
     finally:
         conn.close()
-    groups = env.panel.group_brief(entries)
-    shapes = [(g["kind"], g["count"]) for g in groups]
-    if shapes != [("attention", 3), ("mood", 1), ("attention", 2)]:
-        print("      分组不对（连续才折、夹了别的要断）:", shapes)
-        return False
-    if sum(g["count"] for g in groups) != len(rows):
-        print("      折完条数对不上:", sum(g["count"] for g in groups), len(rows))
-        return False
-    single = env.panel.group_brief(entries[:4])
-    if single[0]["kind"] != "attention" or single[0]["count"] != 3:
-        print("      没有折起来:", single[0])
-        return False
-    # 页面里：折叠组要有可展开的壳 + 计数；单条的不该长成折叠组
-    html_out = env.panel.brief_table({"brief": groups, "brief_count": len(rows),
-                                      "ledger_total": len(rows), "limit": 400})
-    for token in ("<details>", "<summary>", "被注视", "×3", "×2", "p-attention",
-                  "再看被注视"):
+    html_out = env.panel.brief_table({"brief": entries, "brief_count": 130,
+                                      "ledger_total": 130, "limit": 400}, "bX")
+    # ① 按钮是 label + 真开关（`for` 指自己的那一颗），不是 `#` 锚点
+    for token in ('type="checkbox"', 'class="tg"', 'for="bX-tg-1"',
+                  'class="anchor a1"', 'class="anchor a2"', "再看更早的 60 行"):
         if token not in html_out:
             print("      页面里缺 %r" % token)
             return False
-    if html_out.count('<tr class="quiet">') + html_out.count('class="quiet"') < 1:
-        print("      被注视没有默认收起的标记（class=quiet）")
+    for bad in ('href="#', 'id="more-', "<details>", "<script", "onclick"):
+        if bad in html_out:
+            print("      还在用锚点/JS 展开（会跳页或折叠）: %r" % bad)
+            return False
+    # ② 被注视那套折叠**已经不该存在**（流水里整类不含它 ✓）
+    for bad in ('class="quiet"', "p-attention", "再看被注视"):
+        if bad in html_out:
+            print("      被注视折叠的残留还在: %r" % bad)
+            return False
+    # ③ 批次划分：前 60 行不藏、第 61~120 行是 s2（那之前的按钮是 a1）、最后 10 行是 s3
+    if html_out.count('class="stage s2"') != 60 or html_out.count('class="stage s3"') != 10:
+        print("      批次划分不对: s2=%d s3=%d"
+              % (html_out.count('class="stage s2"'), html_out.count('class="stage s3"')))
         return False
-    if html_out.count('<tr class="fold">') != 0:
-        print("      还在用老的 fold 行（应当改用 quiet + CSS 展开）")
+    # ④ 库里还有更早的 ⇒ 才给 `?n=` 兜底（全页**唯一**会刷新的一颗 ✓）；给全了就不许再催
+    more = env.panel.brief_table({"brief": entries, "brief_count": 130, "ledger_total": 999,
+                                  "limit": 400}, "bX")
+    if "库里还有更早的" not in more or "?n=" not in more:
+        print("      没给「库里还有更早的」兜底 ✗")
         return False
-    # 纯 CSS 展开规则：批行与按钮**默认都藏**、`:target` 才放出来（**不许有 <script>** ✗）
-    # ⚠️ 2026-10-14 真 bug 的回归：按钮必须**链式**（第 n 颗只由"点了第 n−1 颗"放出，
-    #    点了自己就收起）⇒ 同一时刻**只看得见一颗** ✗（主人报过"两颗一起出现、点不动"✓）
-    css = env.panel.stage_css(6)
-    for token in (".stage{display:none}", ".quiet{display:none}",
-                  "tr.anchor{display:none}",
-                  "tr.a1{display:table-row}",          # ⚠️ 第一颗必须永远可见（藏了就"没有按钮"✗）
-                  "#more-1:target~tr.s2", "#more-1:target~tr.a2",
-                  "#more-1:target~tr.a1{display:none}",
-                  "#more-2:target~tr.a2{display:none}",
-                  "#more-2:target~tr.a3{display:table-row}",
-                  "#more-5:target~tr.anchor{display:none}",
-                  "#attention:target~tr.quiet"):
+    if "?n=" in html_out:
+        print("      给全了还在催重读 ✗")
+        return False
+    # ⑤ CSS：`#tg-k` 勾上 ⇒ 放开第 k+1 批 + 第 k+1 颗按钮；点过的按钮**只藏自己**
+    css = env.panel.stage_css("bX", 3)
+    for token in (".stage{display:none}", "tr.anchor{display:none}",
+                  "tr.a1{display:table-row}",          # ⚠️ 第一颗必须永远可见（藏了就 0 颗按钮 ✗）
+                  "table:has(#bX-tg-1:checked) tr.s2{display:table-row}",
+                  "table:has(#bX-tg-1:checked) tr.a2{display:table-row}",
+                  "table:has(#bX-tg-2:checked) tr.s3{display:table-row}",
+                  "tr.anchor:has(input.tg:checked) label.btn{visibility:hidden}",
+                  "input.tg:focus-visible",                       # 键盘也开得动 ✓
+                  "@supports not selector(:has(*))"):             # 老浏览器：一次全展开 ✓
         if token not in css:
             print("      CSS 规则缺 %r" % token)
             return False
-    if "<script" in css or "onclick" in css:
-        print("      展开用了 JS ✗（必须纯 CSS）")
+    for bad in (":target", "<script", "onclick",
+                "tr.anchor:has(input.tg:checked) label.btn{display:none}"):
+        if bad in css:
+            print("      CSS 里还有会跳页/塌行的写法: %r" % bad)
+            return False
+    return True
+
+
+def t12_attention_page(env, _unused):
+    """被注视**单独一页**（主人 2026-10-14 要的 ✓）：流水里整类不含它、那一页数字要对
+
+    ⚠️ 数字口径（准则②）：被注视是 `system → 她自己` ⇒ 页面上每一处都要写明
+       「这是**她自己**那一栏的愿力」✗（不许给一个不说是谁的数 ✓）
+    """
+    now = int(time.time())
+    conn = env.mod._connect()
+    try:
+        for i in range(3):                       # 今天 3 笔
+            got = env.mod.db_attention(conn, env.sc.BOT, now - i, 1, "att-today-%d" % i)
+            if not got.get("ok"):
+                print("      造注视流水失败:", got)
+                return False
+        for i in range(2):                       # 昨天 2 笔（分天要分得开 ✓）
+            env.mod.db_attention(conn, env.sc.BOT, now - 86400 - i, 1, "att-yday-%d" % i)
+    finally:
+        conn.close()
+
+    data = env.panel.attention_snapshot(env.db)
+    if not data.get("available") or len(data.get("bots") or []) != 1:
+        print("      被注视快照读不到:", data)
         return False
-    # 分屏：够多行时要有「再看更早的」锚点按钮；**被注视的锚点必须在表体里**
-    # （`~` 只管后面的兄弟 ⇒ 放表尾就永远展开不了 ✗）
-    many = [{"kind": "attention" if i % 2 else "mood", "count": 1, "sum": 1,
-             "time": "10-14 21:00", "last_time": "10-14 21:00",
-             "items": [{"time": "10-14 21:00", "kind": "attention", "from": "sys",
-                        "to": "bot", "amount": 1, "reason": "x", "group_id": ""}]}
-            for i in range(130)]
-    big = env.panel.brief_table({"brief": many, "brief_count": 130, "ledger_total": 130,
-                                "limit": 400})
-    if "再看更早的" not in big or 'id="more-1"' not in big:
-        print("      没给分屏展开的锚点按钮")
+    bot = data["bots"][0]
+    if bot["total"]["count"] != 5 or bot["total"]["amount"] != 5:
+        print("      总次数/折合不对:", bot["total"])
         return False
-    if '<tr class="anchor" id="attention">' not in big:
-        print("      被注视的锚点没在表体里（放表尾就展开不了 ✗）")
+    if bot["today"]["count"] != 3:
+        print("      今天的次数不对:", bot["today"])
         return False
-    if "<script" in big:
-        print("      页面里出现了 <script> ✗")
+    if len(bot["days"]) != 2 or bot["days"][0]["count"] != 3 or bot["days"][1]["count"] != 2:
+        print("      按天分组不对:", bot["days"])
         return False
-    # ⚠️ 2026-10-14 真机 bug（主人报「改版之后直接没有再看更多的按钮了」✗）：
-    #    上一版把**所有**按钮都 `display:none`，而第一颗**没有前一颗能放出它** ⇒ 全页 0 按钮 ✗
-    #    ⇒ 断言：有更多可看时，页面上**必须至少有一颗按钮**（`tr.a1` 永远可见 ✓）
-    if "tr.a1{display:table-row}" not in css:
-        print("      第一颗按钮被藏了 ⇒ 页面上会一颗按钮都没有 ✗")
+    if sum(h["count"] for h in bot["hours"]) != 3:
+        print("      今天按小时不对:", bot["hours"])
         return False
-    if "库里还有更早的" not in env.panel.brief_table(
-            {"brief": many, "brief_count": 130, "ledger_total": 999, "limit": 400}):
-        print("      库里还有更早的时，没给「读更早的」兜底 ✗")
+    if not bot["days"][0]["first"] or not bot["total"]["last"]:
+        print("      首末时间没出来:", bot["days"][0], bot["total"])
         return False
-    # 给全了就不该再催「读更早的（会刷新）」
-    full = env.panel.brief_table({"brief": groups, "brief_count": 400, "ledger_total": 400,
-                                  "limit": 400})
-    if "会刷新" in full:
-        print("      给全了还在催重读 ✗")
+
+    page = env.panel.attention_page(data)
+    for token in ("被注视次数", "她自己", "按天", "今天按小时", 'href="/"', "只读"):
+        if token not in page:
+            print("      被注视页缺 %r" % token)
+            return False
+    if "<script" in page or "onclick" in page:
+        print("      被注视页里出现了 JS ✗")
         return False
+
+    # 反面判据：**主页面流水里一条被注视都不该有**，且"这一类共 N 笔"的口径不含它 ✓
+    snap = env.panel.snapshot(env.db, self_id=env.sc.BOT)
+    kinds = [e["kind"] for e in snap["bots"][0]["brief"]]
+    if "attention" in kinds:
+        print("      流水里还有被注视 ✗")
+        return False
+    conn = env.panel.connect(env.db)
+    try:
+        real = int(conn.execute("SELECT COUNT(*) c FROM ledger WHERE self_id=? AND kind<>?",
+                               (env.sc.BOT, env.panel.ATTENTION_KIND)).fetchone()["c"])
+    finally:
+        conn.close()
+    if int(snap["bots"][0]["ledger_total"]) != real:
+        print("      「这一类共 N 笔」口径不对:", snap["bots"][0]["ledger_total"], real)
+        return False
+
+    # 真 HTTP：两个页面 + 404（`/attention.html` 也给 ✓）
+    httpd = env.panel.serve(env.db, "127.0.0.1", 0, quiet=True)
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        for path, want, token in (("/attention", 200, "被注视次数"),
+                                  ("/attention.html", 200, "被注视次数"),
+                                  ("/", 200, "最近流水")):
+            with urllib.request.urlopen("http://127.0.0.1:%d%s" % (port, path),
+                                        timeout=10) as resp:
+                body = resp.read().decode("utf-8")
+                if resp.status != want or token not in body:
+                    print("      %s 不对: %s / 缺 %r" % (path, resp.status, token))
+                    return False
+        try:
+            urllib.request.urlopen("http://127.0.0.1:%d/nope" % port, timeout=10)
+            print("      /nope 居然 200 ✗")
+            return False
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                print("      /nope 返回码不对:", exc.code)
+                return False
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
     return True
 
 
@@ -438,7 +501,8 @@ TESTS = [
     ("P08 面板源码卫生", t08_source_hygiene),
     ("P09 CLI 入口（--json 真跑一遍）", t09_cli_entry),
     ("P10 开浏览器只开一次、失败不炸", t10_open_browser_once),
-    ("P11 被注视折叠 + 再看更多", t11_fold_attention),
+    ("P11 流水就地展开（label+开关、不跳页）", t11_expand_inplace),
+    ("P12 被注视单独一页（流水不含它）", t12_attention_page),
 ]
 
 
