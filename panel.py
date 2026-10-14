@@ -90,8 +90,8 @@ _ensure_astrbot_stub()
 import main as plugin                                  # noqa: E402 —— 复用同一套口径
 
 CN_TZ = timezone(timedelta(hours=8))
-BRIEF_LIMIT = 12
-BRIEF_STEP = 3          # 「再看更多」每次乘这么多（12 → 36 → 108 …）✓
+BRIEF_LIMIT = 400       # 一次从库里读多少行（**本地只读库、读 400 行很便宜** ✓）
+BRIEF_STAGE = 60        # 页面上**每次「再看更早的」放开多少行**（纯 CSS 展开，不刷新 ✓）
 BRIEF_MAX = 5000        # 上限（再多就该用 --json / 直接查库了 ✓）
 TOP_LIMIT = 12
 WALLET_LIMIT = 30
@@ -510,44 +510,100 @@ def brief_row(item):
             item["reason"] or "—"]
 
 
-def brief_table(bot):
-    """最近流水：**连续的被注视折成一行**（可展开），别的类别照旧一条一行 ✓"""
+def brief_table(bot, folded=False):
+    """最近流水：**被注视先藏着**，点按钮**原地展开**（不刷新、不回顶部 ✓ 主人 2026-10-14 要的）。
+
+    三层「展开」，全是**纯 CSS**（`:target` 控 display，零 JS ⇒ 不产生请求 ⇒ 不跳顶部 ✓）：
+      · **再看被注视** —— 主人真正的痛点（「大多都是被注视」✗）：默认只显示有内容的 ✓
+      · **再看更早的** —— 每次放开 `BRIEF_STAGE` 行（服务端一次就读够了，所以也是**零请求** ✓）
+      · 真读到头时给一个 `?n=` 兜底（那是要重新查库的，只有这一条会刷新 ✓）
+    """
     groups = bot["brief"]
     if not groups:
         return _empty("还没有流水", "·")
     head = ["时间", "类别", "从", "到", "数额", "她/他写的原话"]
+    total = bot.get("ledger_total") or 0
+    shown = bot.get("brief_count", 0)
+    stages = max(1, (len(groups) + BRIEF_STAGE - 1) // BRIEF_STAGE)
+    hidden_after = shown < total          # 库里还有更早的 ⇒ 最后一屏给 `?n=` 兜底 ✓
+    last = stages + (1 if hidden_after else 0)
+
     body = []
-    for group in groups:
-        if group["kind"] == "attention" and group["count"] > 1:
-            # 被注视：折一行，点开看那 N 笔的**逐条时间** ✓（原生 <details> ⇒ 零 JS ✓）
+    has_attention = False
+    for index, group in enumerate(groups):
+        stage = index // BRIEF_STAGE + 1
+        item = group["items"][0]
+        quiet = group["kind"] == "attention"
+        has_attention = has_attention or quiet
+        classes = []
+        if quiet:
+            classes.append("quiet")
+        if stage > 1:
+            classes.append("stage")
+            classes.append("s%d" % stage)
+        attr = ' class="%s"' % " ".join(classes) if classes else ""
+        # 每一屏前面插一个锚点 + 一颗按钮（点它 = 展开下一屏，**同页、不刷新** ✓）
+        if stage > 1 and index % BRIEF_STAGE == 0:
+            body.append('<tr class="anchor" id="more-%d"><td colspan="6">'
+                        '<a class="btn" href="#more-%d">⬇ 再看更早的 %d 行</a>'
+                        '<span class="mut">（已看到第 %d 行，账上共 %d 笔）</span>'
+                        '</td></tr>'
+                        % (stage, min(stage + 1, last), BRIEF_STAGE, index, total))
+        if quiet and group["count"] > 1:
             inner = "".join(
                 '<tr class="sub">%s</tr>' % "".join(
-                    _cell(cell) for cell in brief_row(item)[:2] + [
-                        {"v": "（被注视）", "cls": ""}, {"v": "", "cls": ""},
-                        {"v": "+%d" % int(item["amount"]), "cls": "num pos"},
-                        {"v": item["reason"] or "—", "cls": ""}])
-                for item in group["items"])
+                    _cell(cell) for cell in [
+                        {"v": one["time"], "cls": "num"}, {"v": "", "cls": ""},
+                        {"v": "", "cls": ""}, {"v": "", "cls": ""},
+                        {"v": "+%d" % int(one["amount"]), "cls": "num pos"},
+                        {"v": one["reason"] or "—", "cls": ""}])
+                for one in group["items"])
             body.append(
-                '<tr class="fold"><td colspan="6"><details><summary>'
+                '<tr%s><td colspan="6"><details><summary>'
                 '<span class="pill p-attention">attention</span> 被注视 <b>×%d</b>'
                 ' <span class="mut">（+%d）</span>'
                 '<span class="mut"> · 最新 %s</span></summary>'
                 '<table class="inner">%s</table></details></td></tr>'
-                % (group["count"], group["sum"], group["time"], inner))
+                % (attr, group["count"], group["sum"], group["time"], inner))
             continue
-        body.append("<tr>%s</tr>" % "".join(_cell(cell) for cell in brief_row(
-            group["items"][0])))
-    foot = ""
-    total = bot.get("ledger_total") or 0
-    if bot.get("brief_count", 0) < total:
-        nxt = min(int(bot.get("limit") or BRIEF_LIMIT) * BRIEF_STEP,
-                  max(total, BRIEF_LIMIT))
-        foot = ('<div class="foot">只列了最近 <b>%d</b> 笔（账上共 <b>%d</b> 笔）'
-                ' · <a href="?n=%d">再看更多 ↓</a></div>'
-                % (bot.get("brief_count", 0), total, nxt))
-    return ('<div class="tw"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>%s'
+        body.append("<tr%s>%s</tr>" % (attr, "".join(_cell(cell) for cell in brief_row(item))))
+
+    foot = []
+    if has_attention:
+        foot.append('<a class="btn" href="#attention" id="attention">👁 再看被注视</a>')
+    foot.append('<span class="mut">已显示最近 <b>%d</b> 笔中的前 <b>%d</b> 笔'
+                '（账上共 <b>%d</b> 笔）</span>'
+                % (shown, min(shown, BRIEF_STAGE * stages), total))
+    if hidden_after:
+        nxt = min(int(bot.get("limit") or BRIEF_LIMIT) * 3, BRIEF_MAX)
+        foot.append('<a class="btn ghost" href="?n=%d">读更早的（%d 行，会刷新一次）</a>'
+                    % (nxt, nxt))
+    return ('<div class="tw"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
+            '<div class="foot">%s</div>'
             % ("".join("<th%s>%s</th>" % (' class="num"' if i in (0, 4) else "", h)
-                       for i, h in enumerate(head)), "".join(body), foot))
+                       for i, h in enumerate(head)), "".join(body), "".join(foot)))
+
+
+def stage_css(stages=6):
+    """「再看更早的 / 再看被注视」用的**纯 CSS 展开规则**（零 JS ⇒ 不刷新、不跳顶部 ✓）。
+
+    原理：锚点 `#more-N:target` 之后的 `.stage` 行显示出来；`#attention:target` 之后
+    的 `.quiet`（被注视）行显示出来。都是 `display` 切换 ✓
+    """
+    rules = [".stage{display:none}", ".quiet{display:none}"]
+    for stage in range(2, stages + 1):
+        rules.append("#more-%d:target~tr.stage{display:table-row}" % stage)
+    for stage in range(2, stages):
+        rules.append("#more-%d:target~tr.s%d{display:none}" % (stage, stage + 1))
+    rules.append("#attention:target~tr.quiet{display:table-row}")
+    rules.append('.anchor td,.foot{text-align:center;padding:10px 8px;background:var(--soft-bg);'
+                 'border-top:1px solid var(--line)}')
+    rules.append('.btn{display:inline-block;padding:7px 14px;margin:0 6px;border-radius:999px;'
+                 'background:var(--info);color:#fff;font-weight:600;text-decoration:none;'
+                 'border:1px solid transparent}')
+    rules.append('.btn:hover{filter:brightness(1.08)}')
+    rules.append('.btn.ghost{background:transparent;color:var(--info);border-color:var(--info)}')
+    return "<style>" + "".join(rules) + "</style>"
 
 
 def _cell(cell):
@@ -653,9 +709,10 @@ def render(data, refresh_on=False, flash=""):
             table = _empty("今天还没人动过", "·")
         blocks.append(_card("今日活跃", table, tag="进 / 出合计"))
 
-        # ⑤ 最近流水（连续的被注视会折起来 ✓ 主人 2026-10-14 要的）
-        blocks.append(_card("最近流水", brief_table(bot),
-                            tag="最新在前 · 被注视已折叠"))
+        # ⑤ 最近流水（被注视先藏着，点按钮原地展开 ✓ 主人 2026-10-14 要的）
+        stages = max(1, (len(bot["brief"]) + BRIEF_STAGE - 1) // BRIEF_STAGE)
+        blocks.append(_card("最近流水", stage_css(min(stages, 12)) + brief_table(bot),
+                            tag="最新在前 · 被注视默认收起"))
 
     if not blocks:
         blocks.append(_card("账本", '<div class="pad">%s</div>'

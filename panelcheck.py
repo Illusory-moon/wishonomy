@@ -359,24 +359,47 @@ def t11_fold_attention(env, _unused):
         return False
     # 页面里：折叠组要有可展开的壳 + 计数；单条的不该长成折叠组
     html_out = env.panel.brief_table({"brief": groups, "brief_count": len(rows),
-                                      "ledger_total": len(rows), "limit": 12})
-    for token in ("<details>", "<summary>", "被注视", "×3", "×2", "p-attention"):
+                                      "ledger_total": len(rows), "limit": 400})
+    for token in ("<details>", "<summary>", "被注视", "×3", "×2", "p-attention",
+                  "再看被注视"):
         if token not in html_out:
             print("      页面里缺 %r" % token)
             return False
-    if html_out.count('<tr class="fold">') != 2:
-        print("      折叠组的行数不对:", html_out.count('<tr class="fold">'))
+    if html_out.count('<tr class="quiet">') + html_out.count('class="quiet"') < 1:
+        print("      被注视没有默认收起的标记（class=quiet）")
         return False
-    # 「再看更多」：账上还有更多时必须给入口，给全了就不该给
-    more = env.panel.brief_table({"brief": groups, "brief_count": 6, "ledger_total": 400,
-                                  "limit": 12})
-    if "?n=" not in more or "账上共" not in more:
-        print("      没给「再看更多」入口:", more[-120:])
+    if html_out.count('<tr class="fold">') != 0:
+        print("      还在用老的 fold 行（应当改用 quiet + CSS 展开）")
         return False
+    # 纯 CSS 展开规则：要有 .stage/.quiet 默认藏、:target 显示（**不许有 <script>** ✗）
+    css = env.panel.stage_css(6)
+    for token in (".stage{display:none}", ".quiet{display:none}",
+                  "#more-2:target~tr.stage", "#attention:target~tr.quiet"):
+        if token not in css:
+            print("      CSS 规则缺 %r" % token)
+            return False
+    if "<script" in css or "onclick" in css:
+        print("      展开用了 JS ✗（必须纯 CSS）")
+        return False
+    # 分屏：够多行时要有「再看更早的」锚点按钮
+    many = [{"kind": "attention" if i % 2 else "mood", "count": 1, "sum": 1,
+             "time": "10-14 21:00", "last_time": "10-14 21:00",
+             "items": [{"time": "10-14 21:00", "kind": "attention", "from": "sys",
+                        "to": "bot", "amount": 1, "reason": "x", "group_id": ""}]}
+            for i in range(130)]
+    big = env.panel.brief_table({"brief": many, "brief_count": 130, "ledger_total": 130,
+                                "limit": 400})
+    if "再看更早的" not in big or 'id="more-2"' not in big:
+        print("      没给分屏展开的锚点按钮")
+        return False
+    if "<script" in big:
+        print("      页面里出现了 <script> ✗")
+        return False
+    # 给全了就不该再催「读更早的（会刷新）」
     full = env.panel.brief_table({"brief": groups, "brief_count": 400, "ledger_total": 400,
                                   "limit": 400})
-    if "再看更多" in full:
-        print("      给全了还在催更多 ✗")
+    if "会刷新" in full:
+        print("      给全了还在催重读 ✗")
         return False
     return True
 
