@@ -5,7 +5,7 @@
 
 两个页面（2026-10-14 起 ✓）：
   * `/`          —— 主页面：上面那些都在这一页；**最近流水不含被注视**（被注视一天两三百笔，
-                    混进来会把表占满 ✗）
+                    混进来会把表占满 ✗）· **默认只看本日**，可**按日 / 按类别**检索 ✓
   * `/attention` —— **被注视次数**：总计 · 按天 · 今天按小时（它单独一页 ✓）
 
 三条纪律（代码保证 ✓）：
@@ -13,13 +13,18 @@
      （连 WAL 都不去碰：只读连接不会建 `-wal`/`-shm` ✓）
   2. **不占群里任何一句话**：它是本地页面，不是 bot 的功能 ✓
   3. **转义**：流水里的 `reason` 是用户/她写的原话 ⇒ 一律 `html.escape`（防 XSS ✓）
-  4. **零 `<script>`**：连展开都是纯 CSS（`label` + `:checked` ⇒ 点了**不跳页** ✓）
+  4. **JS 只有一段**（2026-10-14 主人批的：他要"换个日期/看点更早的**别把页面弹回顶部**"✓）：
+     内联、无外链、无 `onclick=`、无 CDN/字体 ⇒ 仍然**单文件、可离线打开** ✓
+     **关掉 JS 也活**（工具条是原生 `<form method="get">`、"更早的"是真链接 ✓）
 
 跑法：
     python panel.py                      # 起在 127.0.0.1:8765
     python panel.py --port 9000          # 换端口
     python panel.py --db <ledger.db>     # 指定数据库
     python panel.py --json               # 不开服务，直接吐 JSON（给脚本/部署后核对用）
+
+⚠️ **按需取，不是"一天全读"**（主人给的理由：**开源插件不能拿我们自己的用量当设计基准** ✗）：
+   服务端只读"所选那一天的 N 行"（`?day=&kind=&n=`），大用量实例一天几万笔也扛得住 ✓
 """
 import argparse
 import html
@@ -171,13 +176,58 @@ def ious_of(conn, self_id, limit=TOP_LIMIT):
                      if r["due_ts"] else "")} for r in rows]
 
 
-def snapshot(path, now=None, self_id=None, limit=BRIEF_LIMIT, more=False):
+def _date_text(ts):
+    """时间戳 ⇒ 北京时间的 `YYYY-MM-DD` ✓"""
+    return datetime.fromtimestamp(int(ts), CN_TZ).strftime("%Y-%m-%d")
+
+
+def _day_bounds(day, now):
+    """把 `day` 参数解释成 `[start, end)`（**北京时间** ✓）。
+
+    * **空 ⇒ 今天**（主人 2026-10-14 定：流水**默认只看本日** ✓）
+    * `YYYY-MM-DD` ⇒ 那一天
+    * 解析不出来 ⇒ 退回今天（**不报错、也不吐 500** ✓）
+    """
+    text = str(day or "").strip()
+    if text:
+        try:
+            stamp = datetime.strptime(text, "%Y-%m-%d")
+            start = int(stamp.replace(tzinfo=CN_TZ).timestamp())
+            return start, start + 86400, _date_text(start)
+        except ValueError:
+            pass
+    start = int(plugin.day_start(now))
+    return start, start + 86400, _date_text(start)
+
+
+def _flow_where(bot, day_start, day_end, kind):
+    """流水的 WHERE 片段 + 参数（**只读** ✓）。
+
+    ⚠️ 两条口径写死在这里：
+      * **被注视永远排除**（`kind<>'attention'`）—— 它一天两三百笔，会把窗口占满 ✗
+      * **按日**（`ts>=? AND ts<?`）—— 主人 2026-10-14 定的默认行为 ✓
+        按需取的好处：**别人那边一天几万笔也不会被我们的小账本"惯坏"** ✓
+    """
+    conds = ["self_id=?", "kind<>?"]
+    args = [str(bot), ATTENTION_KIND]
+    if day_end is not None:
+        conds.append("ts>=?")
+        conds.append("ts<?")
+        args += [int(day_start), int(day_end)]
+    if kind:
+        conds.append("kind=?")
+        args.append(str(kind))
+    return " AND ".join(conds), args
+
+
+def snapshot(path, now=None, self_id=None, limit=BRIEF_LIMIT, more=False, day="", kind=""):
     """面板要的全部数据（纯读 ✓）。数据库不存在/没建表 ⇒ 返回 available=False。
 
     ⚠️ 2026-10-14：这里曾有**两份定义**（先定义的那份被后定义的遮住 ✗ ⇒ 改哪一份都不生效）
        —— 已清掉，现在**只有这一份** ✓
     ⚠️ **被注视（`kind='attention'`）刻意不在这份数据里**：它一天两三百笔，会把 400 行的
        窗口占满（主人原话「大多都是被注视」✗）⇒ 它单独一页（见 `attention_snapshot()`）✓
+    ⚠️ **流水默认只看本日**（`day` 空 = 今天 ✓）；`kind` 是类别筛选（空 = 全部）✓
     """
     now = int(now if now is not None else time.time())
     if not os.path.exists(path):
@@ -191,22 +241,26 @@ def snapshot(path, now=None, self_id=None, limit=BRIEF_LIMIT, more=False):
         ids = ([str(self_id)] if self_id else
                [str(r["self_id"]) for r in conn.execute(
                    "SELECT DISTINCT self_id FROM account ORDER BY self_id").fetchall()])
+        start, end, day_label = _day_bounds(day, now)
         bots = []
         for bot in ids:
-            start = plugin.day_start(now)
+            where, args = _flow_where(bot, start, end, kind)
             rows = conn.execute(
                 "SELECT ts, group_id, from_id, to_id, amount, kind, reason FROM ledger "
-                "WHERE self_id=? AND kind<>? ORDER BY id DESC LIMIT ?",
-                (bot, ATTENTION_KIND, int(limit))).fetchall()
+                "WHERE %s ORDER BY id DESC LIMIT ?" % where,
+                tuple(args + [int(limit)])).fetchall()
             entry_list = rows_of(conn, bot, rows)
             total = int(conn.execute(
-                "SELECT COUNT(*) c FROM ledger WHERE self_id=? AND kind<>?",
-                (bot, ATTENTION_KIND)).fetchone()["c"])
+                "SELECT COUNT(*) c FROM ledger WHERE %s" % where, tuple(args)).fetchone()["c"])
+            kinds = [str(r["kind"]) for r in conn.execute(
+                "SELECT DISTINCT kind FROM ledger WHERE self_id=? AND kind<>? ORDER BY kind",
+                (bot, ATTENTION_KIND)).fetchall()]
+            today_start = int(plugin.day_start(now))
             bots.append({
                 "self_id": bot,
-                "day": datetime.fromtimestamp(start, CN_TZ).strftime("%Y-%m-%d"),
-                "today": plugin.db_audit_totals(bot, start, now, conn=conn),
-                "today_detail": plugin.db_audit_detail(conn, bot, start, now, TOP_LIMIT),
+                "day": datetime.fromtimestamp(today_start, CN_TZ).strftime("%Y-%m-%d"),
+                "today": plugin.db_audit_totals(bot, today_start, now, conn=conn),
+                "today_detail": plugin.db_audit_detail(conn, bot, today_start, now, TOP_LIMIT),
                 "wallets": wallets_of(conn, bot),
                 "ious": ious_of(conn, bot),
                 "brief": entry_list,
@@ -214,6 +268,12 @@ def snapshot(path, now=None, self_id=None, limit=BRIEF_LIMIT, more=False):
                 "ledger_total": total,
                 "limit": int(limit),
                 "more": bool(more),
+                "kinds": kinds,
+                "flow_day": day_label,
+                "kind": str(kind or ""),
+                "prev_day": _date_text(start - 86400),
+                "next_day": ("" if start >= today_start else _date_text(start + 86400)),
+                "is_today": start >= today_start,
             })
         return {"available": True, "path": str(path), "now": now, "bots": bots}
     finally:
@@ -379,6 +439,11 @@ tr.muted td{{color:var(--mut)}}
 .pos{{color:var(--good)}} .neg{{color:var(--warn)}}
 .zero{{color:var(--mut)}}
 .mut{{color:var(--mut)}}
+.flowbar{{display:flex;gap:8px;align-items:center;flex-wrap:wrap}}
+.flowbar form{{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0}}
+.flowbar input,.flowbar select{{font:inherit;padding:6px 10px;border-radius:8px;
+ border:1px solid var(--line);background:var(--card);color:var(--ink)}}
+.flowbar button{{font:inherit;cursor:pointer}}
 .bar{{display:inline-block;height:10px;min-width:3px;border-radius:3px;
  background:var(--info);vertical-align:middle}}
 .barwrap{{display:flex;align-items:center;gap:8px;min-width:120px}}
@@ -433,8 +498,10 @@ footer{{max-width:1240px;margin:0 auto;padding:0 var(--pad) 40px;
 <main>
 {body}
 </main>
+{script}
 <footer>本页是<b>只读</b>视图：数据来自账本的只读快照，页面上不会写入任何东西。<br>
- 页面零外部依赖（没有 CDN / 外链字体 / 外链脚本），可直接离线打开。</footer>
+ 页面零外部依赖（没有 CDN / 外链字体 / 外链脚本）；JS 只有本页内联的那一小段，
+ 只为了"换个日期/看点更早的别把页面弹回顶部" —— 关掉 JS 也一样能用 ✓</footer>
 </body></html>
 """
 
@@ -539,13 +606,18 @@ def brief_table(bot, prefix="b"):
       · 表底那颗「库里还有更早的」要重新查库 ⇒ **会刷新一次**（全页只有这一条会跳 ✓）
     """
     entries = bot["brief"]
+    day = str(bot.get("flow_day") or "")
+    kind = str(bot.get("kind") or "")
     if not entries:
-        return _empty("还没有流水", "·")
+        if kind:
+            return _empty("这一天没有「%s」这一类（被注视不在这张表里）"
+                          % KIND_TEXT.get(kind, kind), "·")
+        return _empty("这一天没有有内容的流水（被注视不在这张表里）· 上面换个日期看看", "·")
     head = ["时间", "类别", "从", "到", "数额", "她/他写的原话"]
     total = bot.get("ledger_total") or 0
     shown = bot.get("brief_count", 0)
     stages = max(1, (len(entries) + BRIEF_STAGE - 1) // BRIEF_STAGE)
-    hidden_after = shown < total          # 库里还有更早的 ⇒ 表底给 `?n=` 兜底 ✓
+    hidden_after = shown < total          # 这一天还有更早的 ⇒ 表底给"多读"的入口 ✓
 
     body = []
     for index, item in enumerate(entries):
@@ -559,16 +631,66 @@ def brief_table(bot, prefix="b"):
         attr = ' class="%s"' % " ".join(classes) if classes else ""
         body.append("<tr%s>%s</tr>" % (attr, "".join(_cell(cell) for cell in brief_row(item))))
 
-    foot = ['<span class="mut">这张表<b>不含被注视</b>（它单独一页）：显示最近 %d 笔中的前 %d 笔，'
-            '这一类共 %d 笔</span>' % (shown, min(shown, BRIEF_STAGE * stages), total)]
+    scope = "%s%s" % (html.escape(day), " · 只看「%s」" % html.escape(KIND_TEXT.get(kind, kind))
+                      if kind else "")
+    foot = ['<span class="mut">%s · <b>不含被注视</b>（它单独一页）· 这一类共 <b>%d</b> 笔，'
+            '这里显示最新的 <b>%d</b> 笔</span>' % (scope, total, shown)]
     if hidden_after:
         nxt = min(int(bot.get("limit") or BRIEF_LIMIT) * 3, BRIEF_MAX)
-        foot.append('<a class="btn ghost" href="?n=%d">库里还有更早的，读 %d 行'
-                    '（这一下会重新查库、页面回到顶部）</a>' % (nxt, nxt))
-    return ('<div class="tw" id="top"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
+        foot.append('<a class="btn ghost" href="?%s" data-more="%d">这一天还有更早的 '
+                    '%d 笔，就地多读</a>'
+                    % (_flow_query(day, kind, nxt), nxt, max(0, total - shown)))
+    return ('<div class="tw"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
             '<div class="foot">%s</div>'
             % ("".join("<th%s>%s</th>" % (' class="num"' if i in (0, 4) else "", h)
                        for i, h in enumerate(head)), "".join(body), "".join(foot)))
+
+
+def _flow_query(day, kind, n=None):
+    """流水链接 / 片段请求**共用的查询串**（口径只有一个 ⇒ 两边不会跑偏 ✓）"""
+    parts = ["day=%s" % urllib.parse.quote(str(day or ""))]
+    if kind:
+        parts.append("kind=%s" % urllib.parse.quote(str(kind)))
+    if n:
+        parts.append("n=%d" % int(n))
+    return "&".join(parts)
+
+
+def flow_toolbar(data):
+    """「看哪一天的流水」工具条（全页**一个**，管所有 bot ✓）。
+
+    ⚠️ 设计要点（主人 2026-10-14 追加的需求 + 他给的理由）：
+      · **默认只看本日**、要能**按日检索**（"以后流水多了至少要能按日查"✓）
+      · 主人原话：**"开源插件不能拿我们自己的用量当设计基准"** ⇒ 服务端**按需取**
+        （只读这一天的 N 行），不是"一天全读" ✗ ⇒ 别人一天几万笔也扛得住 ✓
+      · 控件全部用**原生**的（`<input type="date">` / `<select>` / `<form method=get>`）
+        ⇒ **没 JS 也能用**（提交即整页刷新 ✓）；有 JS 时被接管成就地换 ✓
+    """
+    bots = data.get("bots") or []
+    if not bots:
+        return ""
+    first = bots[0]
+    day = str(first.get("flow_day") or "")
+    kind = str(first.get("kind") or "")
+    kinds = sorted({k for b in bots for k in (b.get("kinds") or [])})
+    options = ['<option value="">全部类别</option>']
+    for one in kinds:
+        options.append('<option value="%s"%s>%s</option>'
+                       % (html.escape(one), " selected" if one == kind else "",
+                          html.escape(KIND_TEXT.get(one, one))))
+    prev_link = ('<a class="btn ghost" href="?%s" title="看前一天">‹ 前一天</a>'
+                 % _flow_query(first["prev_day"], kind))
+    next_link = ('<a class="btn ghost" href="?%s" title="看后一天">后一天 ›</a>'
+                 % _flow_query(first["next_day"], kind)
+                 if first.get("next_day") else '<span class="mut">后一天 ›</span>')
+    today_link = ('<a class="btn ghost" href="?%s">今天</a>'
+                  % _flow_query(first.get("day") or "", kind))
+    return ('<div class="pad flowbar"><form method="get" id="flowform">'
+            '<input type="date" name="day" value="%s" aria-label="看哪一天的流水">'
+            '<select name="kind" aria-label="看哪一类流水">%s</select>'
+            '<button class="btn" type="submit">看</button></form>%s %s %s'
+            '<span class="mut">默认只看<b>本日</b>（北京时间）· 「被注视」在另一页</span>'
+            '</div>' % (html.escape(day), "".join(options), prev_link, next_link, today_link))
 
 
 def _anchor_row(prefix, stage, seen, total):
@@ -638,6 +760,60 @@ NAV_ATTENTION = ('<a class="chip btn" href="/attention" '
                  'title="她每被唤醒一次 +1；只列次数，不混进流水">👁 查看被注视次数</a>')
 NAV_HOME = '<a class="chip btn" href="/" title="回主页面（流水 / 钱包 / 欠条那一页）">← 回主页面</a>'
 
+# 面板里**唯一**的一段 JS（主人 2026-10-14 批的：他要"点了就地换、不回顶"✓）
+# ⚠️ 纪律变了但**没收松**：从"零 <script>"改成"**只许这一段内联 JS**" ——
+#    没有外链、没有 `onclick=` 内联属性、没有 CDN/字体/外链资源 ⇒ 仍然**单文件、可离线打开** ✓
+# ⚠️ 没 JS 也活：工具条是原生 `<form method="get">`（提交即整页刷新 ✓）、
+#    「还有更早的」是**真链接**（JS 只是把它拦下来改成就地取 ✓）
+FLOW_JS = """<script>
+(function () {
+  var form = document.getElementById('flowform');
+  if (!form) { return; }
+  function boxes() { return document.querySelectorAll('div.flows'); }
+  function opened() {
+    var ids = [];
+    boxes().forEach(function (box) {
+      box.querySelectorAll('input.tg:checked').forEach(function (el) { ids.push(el.id); });
+    });
+    return ids;
+  }
+  function query(n) {
+    var q = new URLSearchParams();
+    if (form.day.value) { q.set('day', form.day.value); }
+    if (form.kind.value) { q.set('kind', form.kind.value); }
+    if (n) { q.set('n', n); }
+    return q;
+  }
+  function load(n, keep) {
+    var q = query(n);
+    var keepIds = keep ? opened() : [];
+    fetch('/?' + q.toString(), {headers: {'X-Panel-Partial': '1'}})
+      .then(function (resp) { return resp.ok ? resp.text() : ''; })
+      .then(function (html) {
+        if (!html) { return; }
+        var fresh = new DOMParser().parseFromString(html, 'text/html');
+        fresh.querySelectorAll('div.flows').forEach(function (one) {
+          var old = document.getElementById(one.id);
+          if (old) { old.innerHTML = one.innerHTML; }
+        });
+        keepIds.forEach(function (id) {
+          var box = document.getElementById(id);
+          if (box) { box.checked = true; }
+        });
+        history.replaceState(null, '', location.pathname + '?' + q.toString());
+      });
+  }
+  form.addEventListener('submit', function (ev) { ev.preventDefault(); load('', false); });
+  form.addEventListener('change', function () { load('', false); });
+  document.addEventListener('click', function (ev) {
+    var link = ev.target && ev.target.closest ? ev.target.closest('a[data-more]') : null;
+    if (!link) { return; }
+    ev.preventDefault();
+    load(link.getAttribute('data-more'), true);
+  });
+})();
+</script>"""
+
 
 def render(data, refresh_on=False, flash=""):
     """把 `snapshot()` 的 dict 拼成一整页 HTML（**纯呈现**：一个数据查询都不做 ✓）。"""
@@ -647,12 +823,15 @@ def render(data, refresh_on=False, flash=""):
                 '<div class="r">%s</div><div class="p">%s</div></div>'
                 % (html.escape(str(data.get("reason") or "")),
                    html.escape(str(data.get("path") or ""))))
-        return PAGE.format(title=MAIN_TITLE, nav=NAV_ATTENTION, shown="-",
+        return PAGE.format(title=MAIN_TITLE, nav=NAV_ATTENTION, script=FLOW_JS, shown="-",
                            path=html.escape(str(data.get("path") or "")),
                            refresh_chip=chip,
                            body=flash + _card("读不到账本", '<div class="pad">%s</div>' % note))
 
     blocks = []
+    toolbar = flow_toolbar(data)
+    if toolbar:
+        blocks.append(_card("看哪一天的流水", toolbar, tag="默认只看本日 · 按日检索"))
     for bot in data.get("bots") or []:
         today = bot["today"]
         detail = bot["today_detail"]
@@ -728,24 +907,49 @@ def render(data, refresh_on=False, flash=""):
         blocks.append(_card("今日活跃", table, tag="进 / 出合计"))
 
         # ⑤ 最近流水（**被注视不在这张表里** —— 它单独一页；展开是 label+checkbox，点了不跳页 ✓）
+        #    `div.flows` 是**唯一会被那段内联 JS 换掉**的块（别的卡片一个字节不动 ⇒ 零重排 ✓）
         prefix = "b%s" % bot["self_id"]
         stages = max(1, (len(bot["brief"]) + BRIEF_STAGE - 1) // BRIEF_STAGE)
         link = ('<div class="pad"><a class="btn" href="/attention">👁 查看被注视次数</a>'
                 '<span class="mut">被注视（每被唤醒一次 +1）不在下面这张表里 —— 它单独一页 ✓</span>'
                 '</div>')
+        body = stage_css(prefix, min(stages, 12)) + brief_table(bot, prefix)
         blocks.append(_card("最近流水",
-                            link + stage_css(prefix, min(stages, 12)) + brief_table(bot, prefix),
-                            tag="最新在前 · 不含被注视（另有一页）"))
+                            link + '<div class="flows" id="flows-%s">%s</div>'
+                            % (html.escape(str(bot["self_id"])), body),
+                            tag="%s · 最新在前 · 不含被注视（另有一页）"
+                                % str(bot.get("flow_day") or "")))
 
     if not blocks:
         blocks.append(_card("账本", '<div class="pad">%s</div>'
                             % _empty("账本里还没有任何 bot 的账", "·")))
-    return PAGE.format(title=MAIN_TITLE, nav=NAV_ATTENTION,
+    return PAGE.format(title=MAIN_TITLE, nav=NAV_ATTENTION, script=FLOW_JS,
                        path=html.escape(str(data.get("path") or "")),
                        shown=datetime.fromtimestamp(int(data["now"]), CN_TZ)
                        .strftime("%Y-%m-%d %H:%M:%S"),
                        refresh_chip=chip,
                        body=flash + "".join(blocks))
+
+
+def render_flow_fragment(data):
+    """**片段模式**：只吐流水那几块（`div.flows`）—— 给面板自己那段内联 JS 用 ✓。
+
+    ⚠️ 为什么要有它（主人 2026-10-14 定的方向）：
+       他要的是"点了**就地换**、不回顶"✗。整页重载会（a）把全部卡片重建一遍
+       （b）把视口弹回顶部 ✗ ⇒ **只换流水那几块** ⇒ 页面别处一个字节不动 ⇒ 零重排 ✓
+    ⚠️ 每块都带上自己那份 `stage_css`：换了日期之后批次数量会变 ✗
+       （不带上它，新出现的批次就点不开）✓
+    """
+    if not data.get("available"):
+        return ""
+    blocks = []
+    for bot in data.get("bots") or []:
+        prefix = "b%s" % bot["self_id"]
+        stages = max(1, (len(bot["brief"]) + BRIEF_STAGE - 1) // BRIEF_STAGE)
+        blocks.append('<div class="flows" id="flows-%s">%s%s</div>'
+                      % (html.escape(str(bot["self_id"])),
+                         stage_css(prefix, min(stages, 12)), brief_table(bot, prefix)))
+    return "".join(blocks)
 
 
 def attention_page(data, refresh_on=False, flash=""):
@@ -759,7 +963,7 @@ def attention_page(data, refresh_on=False, flash=""):
                 '<div class="r">%s</div><div class="p">%s</div></div>'
                 % (html.escape(str(data.get("reason") or "")),
                    html.escape(str(data.get("path") or ""))))
-        return PAGE.format(title=ATTENTION_TITLE, nav=NAV_HOME, shown="-",
+        return PAGE.format(title=ATTENTION_TITLE, nav=NAV_HOME, script="", shown="-",
                            path=html.escape(str(data.get("path") or "")),
                            refresh_chip=chip,
                            body=flash + _card("读不到账本", '<div class="pad">%s</div>' % note))
@@ -818,7 +1022,7 @@ def attention_page(data, refresh_on=False, flash=""):
     if not blocks:
         blocks.append(_card("被注视", '<div class="pad">%s</div>'
                             % _empty("账本里还没有任何 bot 的账", "·")))
-    return PAGE.format(title=ATTENTION_TITLE, nav=NAV_HOME,
+    return PAGE.format(title=ATTENTION_TITLE, nav=NAV_HOME, script="",
                        path=html.escape(str(data.get("path") or "")),
                        shown=datetime.fromtimestamp(int(data["now"]), CN_TZ)
                        .strftime("%Y-%m-%d %H:%M:%S"),
@@ -877,6 +1081,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(404, "only / and /attention are served")
             return
         wanted_attention = path.startswith("/attention")
+        # **片段模式**：面板自己那段内联 JS 来取"只换流水那几块"的 HTML ✓
+        # （认这个头就只吐 `div.flows`；不认别的 ⇒ 仍然只是个只读 GET ✓）
+        wanted_partial = (self.headers.get("X-Panel-Partial") or "").strip() == "1"
         flash = ""
         wants = urllib.parse.parse_qs(query or "")
         # 「再看更多」：`?n=36` 之类 ⇒ 这次多读一点（有上限、且必须是真的整数 ✓）
@@ -885,6 +1092,9 @@ class Handler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             limit = BRIEF_LIMIT
         limit = max(BRIEF_LIMIT, min(limit, BRIEF_MAX))
+        # 「看哪一天 / 哪一类」：`day=2026-10-14`（**空 = 今天** ✓）· `kind=gift`（空 = 全部）
+        day = str((wants.get("day") or [""])[0])[:10]
+        kind = str((wants.get("kind") or [""])[0])[:32]
         # 「一键拉取」：同一台机器上的页面点那个按钮 ⇒ 走这里（GET 只是为了让浏览器停在页面上 ✓）
         if "refresh" in wants and self.refresh and self._same_origin():
             try:
@@ -905,8 +1115,9 @@ class Handler(BaseHTTPRequestHandler):
                                          refresh_on=self.refresh,
                                          flash=flash).encode("utf-8")
             else:
-                payload = render(snapshot(self.db_path, limit=limit), refresh_on=self.refresh,
-                                 flash=flash).encode("utf-8")
+                data = snapshot(self.db_path, limit=limit, day=day, kind=kind)
+                payload = (render_flow_fragment(data) if wanted_partial else
+                           render(data, refresh_on=self.refresh, flash=flash)).encode("utf-8")
             status = 200
         except Exception as exc:                        # noqa: BLE001 —— 面板出错也别把栈甩给浏览器
             payload = ("读账本失败：%s" % html.escape(str(exc)[:200])).encode("utf-8")

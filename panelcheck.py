@@ -163,8 +163,10 @@ def t02_snapshot_content(env, _unused):
 def t03_html_escaped(env, _unused):
     """用户写的原话必须转义（防 XSS）✓"""
     page = env.panel.render(env.panel.snapshot(env.db, self_id=env.sc.BOT))
-    if "<script>" in page:
-        print("      原话没转义，页面里出现了真 <script> ✗")
+    # ⚠️ 2026-10-14：页面现在**真有**一段内联 JS ⇒ 断言不能再是"页面里不许出现 <script>" ✗
+    #    ⇒ 改成盯**那个载荷本身**（用户原话里的 `alert('x')` 绝不许原样出现在页面里 ✓）
+    if "<script>alert" in page or "alert('x')</script>" in page:
+        print("      原话里的脚本没转义，页面里出现了可执行载荷 ✗")
         return False
     if "&lt;script&gt;" not in page:
         print("      看不出转义后的样子（可能没渲染那条）")
@@ -371,14 +373,14 @@ def t11_expand_inplace(env, _unused):
     if '<span class="pill p-mood" title="mood">收愿力</span>' not in html_out:
         print("      徽章没出中文名，或原始 kind 没留在 title 里")
         return False
-    # ④ 库里还有更早的 ⇒ 才给 `?n=` 兜底（全页**唯一**会刷新的一颗 ✓）；给全了就不许再催
+    # ④ 这一天还有更早的 ⇒ 才给「多读」的入口（表底那一颗；**按日之后它很少出现** ✓）
     more = env.panel.brief_table({"brief": entries, "brief_count": 130, "ledger_total": 999,
-                                  "limit": 400}, "bX")
-    if "库里还有更早的" not in more or "?n=" not in more:
-        print("      没给「库里还有更早的」兜底 ✗")
+                                  "limit": 400, "flow_day": "2026-10-14"}, "bX")
+    if "这一天还有更早的" not in more or "data-more=" not in more:
+        print("      没给「这一天还有更早的」多读入口 ✗")
         return False
-    if "?n=" in html_out:
-        print("      给全了还在催重读 ✗")
+    if "data-more=" in html_out:
+        print("      给全了还在催多读 ✗")
         return False
     # ⑤ CSS：`#tg-k` 勾上 ⇒ 放开第 k+1 批 + 第 k+1 颗按钮；点过的按钮**只藏自己**
     css = env.panel.stage_css("bX", 3)
@@ -521,30 +523,37 @@ def t13_browser_no_jump(env, _unused):
         return False
 
     now = int(time.time())
-    for i in range(200):                     # 200 行 ⇒ 4 批（每批 BRIEF_STAGE=60）⇒ 点两次正好 +120 ✓
+    for i in range(420):                     # 420 行 > 一次读的 400 行 ⇒ 表底那颗"多读"才出得来 ✓
         env.sc.raw_mood(env.mod, env.sc.ALICE, 5, "e2e-%d" % i, now + i)
+    for i in range(3):                       # 昨天 3 行（换日期要**真的换出东西**才测得出 ✓）
+        env.sc.raw_mood(env.mod, env.sc.ALICE, 5, "e2e-yday-%d" % i, now - 86400 - i)
+    yday = time.strftime("%Y-%m-%d", time.localtime(now - 86400))
 
     httpd = env.panel.serve(env.db, "127.0.0.1", 0, quiet=True)
     port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    # ⚠️ 选择器**必须锁在流水那张表里**（`#top`）—— 第一版写成 `tbody tr`，
+    # ⚠️ 选择器**必须锁在流水那块里**（`div.flows`）—— 第一版写成 `tbody tr`，
     #    把钱包 / 欠条 / 今日活跃那几张表的行也数进去了 ⇒ 数字全歪 ✗（2026-10-14 当场被这条自检抓住 ✓）
     state_js = ("() => {"
-                "  const rows = [...document.querySelectorAll('#top tbody tr')];"
+                "  const rows = [...document.querySelectorAll('.flows tbody tr')];"
                 "  const vis = el => el.offsetHeight > 0;"
                 "  const data = rows.filter(r => !r.classList.contains('anchor'));"
-                "  const btns = [...document.querySelectorAll('#top tr.anchor label.btn')]"
+                "  const btns = [...document.querySelectorAll('.flows tr.anchor label.btn')]"
                 "    .filter(el => getComputedStyle(el).visibility === 'visible' && vis(el));"
-                "  const a1 = document.querySelector('#top tr.anchor.a1');"
+                "  const a1 = document.querySelector('.flows tr.anchor.a1');"
+                "  const box = document.querySelector('.flows');"
                 "  return {scrollY: window.scrollY,"
                 "          rows: data.filter(vis).length, total: data.length,"
                 "          btns: btns.length,"
+                "          opened: document.querySelectorAll('.flows input.tg:checked').length,"
+                "          docTop: box ? box.getBoundingClientRect().top + window.scrollY : -1,"
                 "          a1h: a1 ? a1.getBoundingClientRect().height : -1,"
                 "          above: (a1 && a1.previousElementSibling)"
                 "                 ? a1.previousElementSibling.getBoundingClientRect().top : null};"
                 "}")
-    click_js = ("() => {const btns = [...document.querySelectorAll('#top tr.anchor label.btn')]"
-                "  .filter(el => getComputedStyle(el).visibility === 'visible' && el.offsetHeight > 0);"
+    click_js = ("() => {const btns = [...document.querySelectorAll('.flows tr.anchor label.btn')]"
+                "  .filter(el => getComputedStyle(el).visibility === 'visible'"
+                "          && el.offsetHeight > 0);"
                 "  if (!btns.length) return 'no-button'; btns[0].click(); return 'clicked';}")
     errors = []
     try:
@@ -561,7 +570,7 @@ def t13_browser_no_jump(env, _unused):
                    滚进视野 ✗（真人做不到这一步）⇒ 不先滚过去，量到的是假跳 ✗
                 """
                 ok = page.evaluate(
-                    "() => {const b=[...document.querySelectorAll('#top tr.anchor label.btn')]"
+                    "() => {const b=[...document.querySelectorAll('.flows tr.anchor label.btn')]"
                     "  .filter(el=>getComputedStyle(el).visibility==='visible'"
                     "          && el.offsetHeight>0);"
                     "  if(!b.length) return false;"
@@ -590,6 +599,32 @@ def t13_browser_no_jump(env, _unused):
                 return False
             page.wait_for_timeout(150)
             second = page.evaluate(state_js)
+            # ③ 表底「还有更早的」⇒ **就地多读**（先把那颗链接滚进视口 —— 真人就是这么点的 ✓）
+            more_js = ("() => {const a=document.querySelector('a[data-more]');"
+                       "  if(!a) return false; a.scrollIntoView({block:'center'}); return true;}")
+            if not page.evaluate(more_js):
+                print("      表底那颗「还有更早的」没出现（读的行数够 420 吗？）✗")
+                return False
+            page.wait_for_timeout(80)
+            before_more = page.evaluate(state_js)
+            page.evaluate("() => {const a=document.querySelector('a[data-more]'); a.click();}")
+            page.wait_for_timeout(900)          # 等 fetch + 换 DOM
+            after_more = page.evaluate(state_js)
+            # ④ 换日期：JS 就地取 ✓
+            #    ⚠️ **在页顶做**：跨"3 行 ↔ 400 行"这种剧烈变化时，浏览器本来就会
+            #       钳制/锚定滚动位置 ✗（那不是"页面跳了"）⇒ 页顶做，判据才确定 ✓
+            page.evaluate("() => window.scrollTo(0, 0)")
+            page.wait_for_timeout(120)
+            top_before = page.evaluate(state_js)
+            page.evaluate("(d) => {const f=document.getElementById('flowform');"
+                          " f.day.value=d; f.dispatchEvent(new Event('change'));}", yday)
+            page.wait_for_timeout(900)
+            after_yday = page.evaluate(state_js)
+            # ⑤ 再换回今天（内容变多）：同样必须在**页顶**、`scrollY` 一点不动 ✓
+            page.evaluate("() => {const f=document.getElementById('flowform');"
+                          " f.day.value=''; f.dispatchEvent(new Event('change'));}")
+            page.wait_for_timeout(900)
+            back = page.evaluate(state_js)
             if os.environ.get("PANEL_E2E_SHOT"):
                 page.screenshot(path=os.environ["PANEL_E2E_SHOT"], full_page=False)
             att = browser.new_page()
@@ -638,6 +673,157 @@ def t13_browser_no_jump(env, _unused):
         if snap["btns"] != 1:
             print("      %s 看得见 %d 颗按钮（应当是 1 颗）" % (name, snap["btns"]))
             return False
+    # ⑥ **就地多读**：不跳 + 行数变多 + 已展开的批次保持展开（主人 2026-10-14 追加 ✓）
+    #    ⚠️ 判据分两层：**流水卡在文档里的位置**一点不动（上面真的没变 ✓）；
+    #       `scrollY` 允许多少抖一点（浏览器**滚动锚定**会在换 DOM 时做几十像素微调 ✓，
+    #       那不是"页面跳了"，但超过 40px 就得当事故查 ✗）
+    if abs(after_more["docTop"] - before_more["docTop"]) > 0.6:
+        print("      多读之后**流水卡上方**的东西动了（文档位置 %.1f → %.1f）✗"
+              % (before_more["docTop"], after_more["docTop"]))
+        return False
+    if abs(after_more["scrollY"] - before_more["scrollY"]) > 40:
+        print("      点「还有更早的」跳了：scrollY %s → %s"
+              % (before_more["scrollY"], after_more["scrollY"]))
+        return False
+    if after_more["total"] <= before_more["total"]:
+        print("      点了「还有更早的」行数没变多：%s → %s"
+              % (before_more["total"], after_more["total"]))
+        return False
+    if after_more["opened"] < before_more["opened"] or after_more["opened"] < 1:
+        print("      多读之后**已展开的批次丢了** ✗：%s → %s"
+              % (before_more["opened"], after_more["opened"]))
+        return False
+    # ⑦ 换日期真的换出东西（那一天只有 3 行）· 页顶做 ⇒ 判据确定
+    if after_yday["rows"] != 3:
+        print("      换到 %s 之后行数不对：%s" % (yday, after_yday["rows"]))
+        return False
+    if after_yday["scrollY"] != 0 or back["scrollY"] != 0:
+        print("      换日期时页面动了：scrollY %s → %s → %s"
+              % (top_before["scrollY"], after_yday["scrollY"], back["scrollY"]))
+        return False
+    if abs(after_yday["docTop"] - top_before["docTop"]) > 0.6 or \
+            abs(back["docTop"] - top_before["docTop"]) > 0.6:
+        print("      换日期之后**流水卡上方**的东西动了：%.1f → %.1f → %.1f"
+              % (top_before["docTop"], after_yday["docTop"], back["docTop"]))
+        return False
+    if back["rows"] <= 3:
+        print("      换回今天之后行数没回来：%s" % back["rows"])
+        return False
+    return True
+
+
+def t14_day_and_kind_filter(env, _unused):
+    """**按日检索 + 类别筛选**（主人 2026-10-14 追加：默认只显示本日 ✓）· 以及 JS 纪律
+
+    ⚠️ 为什么要一条自检：这两件事**改坏了不报错**，只会让面板又变成"一屏全是几天前的流水" ✗；
+       而且主人给的理由是「**开源插件不能拿我们自己的用量当设计基准**」⇒
+       服务端必须**按需取**（只读这一天的 N 行），不是"一天全读" ✓（别人一天几万笔也扛得住）
+    ⚠️ 顺带守着"那段内联 JS"的边界：**只许一段**、不许 `src=`、不许 `onclick=`、
+       不许任何外链资源（CDN / 字体 / `<link>`）—— 面板仍然**单文件、可离线打开** ✓
+    """
+    now = int(time.time())
+    old_day = time.strftime("%Y-%m-%d", time.localtime(now - 2 * 86400))
+    # ⚠️ 标记用**金额 777**，别用 `ref` —— 行的 `reason` 是 `raw_mood` 的默认文案，
+    #    跟 ref 无关 ✗（第一版就是这么写错的，被这条自检当场抓住 ✓）
+    env.sc.raw_mood(env.mod, env.sc.BOB, 777, "filter-old", now - 2 * 86400)
+    env.sc.raw_mood(env.mod, env.sc.ALICE, 555, "filter-today", now)
+
+    today_bot = env.panel.snapshot(env.db, self_id=env.sc.BOT)["bots"][0]
+    today = today_bot["flow_day"]
+    if today_bot["is_today"] is not True or today != time.strftime("%Y-%m-%d", time.localtime(now)):
+        print("      默认不是今天:", today_bot["flow_day"], today_bot["is_today"])
+        return False
+    if any(int(e["amount"]) == 777 for e in today_bot["brief"]):
+        print("      默认视图里混进了两天前那笔 ✗")
+        return False
+    if not any(int(e["amount"]) == 555 for e in today_bot["brief"]):
+        print("      默认视图里没有今天那笔（是不是把今天也滤掉了？）✗")
+        return False
+    if today_bot["prev_day"] != time.strftime("%Y-%m-%d", time.localtime(now - 86400)):
+        print("      「前一天」的日期不对:", today_bot["prev_day"])
+        return False
+    if today_bot["next_day"]:
+        print("      今天不该有「后一天」✗:", today_bot["next_day"])
+        return False
+
+    old_bot = env.panel.snapshot(env.db, self_id=env.sc.BOT, day=old_day)["bots"][0]
+    if not any(int(e["amount"]) == 777 for e in old_bot["brief"]):
+        print("      按日没查到那一天:", old_day, [e["amount"] for e in old_bot["brief"]])
+        return False
+    if any(int(e["amount"]) == 555 for e in old_bot["brief"]):
+        print("      按日查询把别的天的也带出来了 ✗")
+        return False
+    if old_bot["next_day"] != time.strftime("%Y-%m-%d", time.localtime(now - 86400)):
+        print("      那一天的「后一天」不对:", old_bot["next_day"])
+        return False
+
+    moods = env.panel.snapshot(env.db, self_id=env.sc.BOT, day=old_day, kind="mood")["bots"][0]
+    if not moods["brief"] or any(e["kind"] != "mood" for e in moods["brief"]):
+        print("      按类别过滤（mood）不对:", [e["kind"] for e in moods["brief"]])
+        return False
+    none_kind = env.panel.snapshot(env.db, self_id=env.sc.BOT, kind="不存在的类别")["bots"][0]
+    if none_kind["brief"]:
+        print("      不存在的类别居然查出了东西 ✗")
+        return False
+    if "mood" not in today_bot["kinds"] or "gift" not in today_bot["kinds"]:
+        print("      类别清单纯（下拉框的选项）不对:", today_bot["kinds"])
+        return False
+    fallback = env.panel.snapshot(env.db, self_id=env.sc.BOT, day="不是日期")["bots"][0]
+    if fallback["flow_day"] != today:
+        print("      非法日期没有退回今天:", fallback["flow_day"])
+        return False
+
+    # 片段模式：只有流水那几块（没有整页壳）✓
+    frag = env.panel.render_flow_fragment(env.panel.snapshot(env.db))
+    if 'class="flows" id="flows-' not in frag or "<html" in frag or "<tbody>" not in frag:
+        print("      片段模式不对:", frag[:80])
+        return False
+    # 整页：工具条 + **只有一段**内联 JS + 零外链 ✓
+    page = env.panel.render(env.panel.snapshot(env.db))
+    for token in ('id="flowform"', 'type="date"', "<select", 'class="flows"'):
+        if token not in page:
+            print("      整页缺 %r" % token)
+            return False
+    if page.count("<script") != 1:
+        print("      内联 JS 不是恰好一段:", page.count("<script"))
+        return False
+    for bad in ("<script src", "onclick=", "onload=", "<link", "cdn.", 'src="http'):
+        if bad in page:
+            print("      面板出现了外链/内联事件（不许有）:", bad)
+            return False
+    if "<script" in env.panel.attention_page(env.panel.attention_snapshot(env.db)):
+        print("      被注视那一页不该有 JS ✗")
+        return False
+
+    # 真 HTTP：带 day/kind、片段头、非法日期
+    httpd = env.panel.serve(env.db, "127.0.0.1", 0, quiet=True)
+    port = httpd.server_address[1]
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        def fetch(path, headers=None):
+            req = urllib.request.Request("http://127.0.0.1:%d%s" % (port, path),
+                                         headers=headers or {})
+            try:
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    return resp.status, resp.read().decode("utf-8")
+            except urllib.error.HTTPError as exc:
+                return exc.code, ""
+
+        code, body = fetch("/?day=%s&kind=mood" % old_day)
+        if code != 200 or "只看「收愿力」" not in body:
+            print("      GET day+kind 不对:", code, body[:80])
+            return False
+        code, body = fetch("/?day=%s" % old_day, {"X-Panel-Partial": "1"})
+        if code != 200 or "<html" in body or 'class="flows"' not in body:
+            print("      片段请求不对:", code, body[:80])
+            return False
+        code, body = fetch("/?day=abc")
+        if code != 200 or "最近流水" not in body:
+            print("      非法日期没兜住:", code)
+            return False
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
     return True
 
 
@@ -655,6 +841,7 @@ TESTS = [
     ("P11 流水就地展开（label+开关、不跳页）", t11_expand_inplace),
     ("P12 被注视单独一页（流水不含它）", t12_attention_page),
     ("P13 真浏览器：点完不位移 / 批次不回收 / 只一颗按钮", t13_browser_no_jump),
+    ("P14 按日检索 + 类别筛选（默认本日）+ JS 纪律", t14_day_and_kind_filter),
 ]
 
 
