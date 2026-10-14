@@ -8,9 +8,13 @@
   （它跟插件**同一个模块里的同一段代码**，不另写一份口径 ⇒ 不会两边跑偏 ✓）
 
 跑法（**在容器里**跑，因为账本与配置都在容器里）：
-    docker exec -it qqbot-astrbot /opt/astrbot/.venv/bin/python \
+    docker exec -it qqbot-astrbot \
+        -e WISH_GATE_NOTES=/path/to/notes.md -e WISH_GATE_SELF_ID=<bot 号> \
+        /opt/astrbot/.venv/bin/python \
         /opt/astrbot/data/plugins/astrbot_plugin_wishonomy/rotate_gate.py
-本地那份 `wishonomy/rotate_gate.py` 只是个副本（部署时一起传 ✓）。
+
+⚠️ **这个脚本里不写死任何路径与 bot 号** ✗（公开仓铁律）——
+   路径与号一律从**插件配置**或**环境变量**来（`WISH_GATE_NOTES` / `WISH_GATE_SELF_ID` ✓）。
 """
 import asyncio
 import importlib.util
@@ -30,9 +34,14 @@ def data_dir():
     ⚠️ 必须与框架的 `StarTools.get_data_dir()` 一致 ✗ —— 本鱼第一版随手写成
        "脚本所在目录" ⇒ **哈希被写进了插件代码目录**、而库在 `plugin_data/` 里 ⇒
        面板永远拿不到它 ✗（差一个目录就是"看得见门、找不到钥匙" ✓）
+    ⚠️ 这里也**不写死插件名之下那个目录**：用 `WISH_GATE_DATA_DIR` 覆盖，
+       或者按 `<ASTRBOT_ROOT>/data/plugin_data/<插件目录名>` 这个**通用**约定推 ✓
     """
+    override = str(os.environ.get("WISH_GATE_DATA_DIR") or "").strip()
+    if override:
+        return override
     base = os.environ.get("ASTRBOT_ROOT") or "/opt/astrbot"
-    guess = os.path.join(base, "data", "plugin_data", "astrbot_plugin_wishonomy")
+    guess = os.path.join(base, "data", "plugin_data", os.path.basename(HERE))
     return guess if os.path.isdir(guess) else HERE
 
 
@@ -100,24 +109,23 @@ def main():
         return 1
     mod = load_plugin(conf)
     merged = mod.merge_config(conf)
-    targets = mod.target_ids(mod._cfg(merged, "enabled_self_ids", ""))
-    if not targets:
-        print("✗ 配置里没有启用任何 bot")
+    pairs = mod._gate_dict(mod._cfg(merged, "notes_path", {}))
+    if not pairs and not os.environ.get("WISH_GATE_NOTES"):
+        print("✗ 配置里没配 notes_path，也没给 WISH_GATE_NOTES ⇒ 不知道该给谁转（整套是关着的 ✓）")
         return 1
     done = []
-    for bot in sorted(targets):
-        path = mod.gate_notes_path(merged, bot)
-        if not path:
-            print("・ bot=%s 没配笔记路径（notes_path 留空 = 整套关着）⇒ 跳过" % bot)
+    for sid in sorted(pairs) or [""]:
+        notes, sid, entry = mod.gate_default_notes(sid, merged)
+        if not notes:
+            print("・ bot=%s 没配笔记路径 ⇒ 跳过" % (sid or "?"))
             continue
-        code = mod.gate_rotate_for(bot, merged)
+        code = mod.gate_rotate_for(sid, merged)
         if not code:
-            print("✗ bot=%s 轮换失败（账本读不到？）: %s" % (bot, path))
+            print("✗ bot=%s 轮换失败（账本读不到？）: %s" % (sid, notes))
             continue
-        entry = mod.gate_keys_path(merged)
-        done.append(bot)
+        done.append(sid)
         print("✅ bot=%s 今天的钥匙已就位 · 笔记=%s · 哈希=%s（明文不入日志 ✓）"
-              % (bot, path, entry))
+              % (sid, notes, entry))
     return 0 if done else 1
 
 

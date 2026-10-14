@@ -567,6 +567,8 @@ def gate_notes_path(config, self_id):
     """这个 bot 的账本文件在哪（**空 = 功能关闭** ✓ 零耦合 ✓）。
 
     相对路径按插件的**数据目录**解析（与 `db_path` 留空时的落点同一个目录 ✓）。
+    ⚠️ 通用插件里**不写死**任何私域路径 ✗ —— 路径一律由配置给；
+       运营脚本那种"没有配置对象、只想立刻转一把"的场合，走 `gate_default_notes()` ✓
     """
     path = _gate_dict(_cfg(config, "notes_path", {})).get(str(self_id), "")
     if not path:
@@ -580,7 +582,31 @@ def gate_notes_path(config, self_id):
     return os.path.join(base, path)
 
 
-def gate_keys_path(config=None):
+def gate_default_notes(self_id="", config=None):
+    """**给运营脚本用的兜底路径**：`(账本路径, bot 号, 键文件路径)`
+
+    为什么要有它（2026-10-15 真机）✗：钥匙平时是"她今天第一次被唤醒"时转的 ✓，
+    可她整天不理人 / 半夜 / 刚部署完时**一把都没有** ⇒ 运营谁也开不了门 ⇒
+    需要"立刻转一把"的入口（`rotate_gate.py` ✓）。
+
+    ⚠️ 这个入口**不在配置对象里**（脚本是独立进程、拿不到框架给的 config ✓）
+       ⇒ 三样东西一律**从环境变量来**，代码里**不写死任何私域路径与号** ✗：
+         · `WISH_GATE_NOTES`    —— 账本文件路径（不填 = 按 `notes_path` 的解析规则猜一个）
+         · `WISH_GATE_SELF_ID`  —— 给哪个 bot 转（不填 = 配置里第一个）
+         · `WISH_GATE_KEYS`     —— 哈希文件路径（不填 = 数据目录下 `wish_gate_keys.json`）
+    """
+    conf = config if config is not None else {}
+    pairs = _gate_dict(_cfg(conf, "notes_path", {}))
+    first = sorted(pairs)[0] if pairs else ""
+    sid = str(os.environ.get("WISH_GATE_SELF_ID") or self_id or first or "").strip()
+    notes = str(os.environ.get("WISH_GATE_NOTES") or "").strip()
+    if notes:
+        return notes, sid, gate_keys_path(conf, keys_path=os.environ.get("WISH_GATE_KEYS") or "")
+    return gate_notes_path(conf, sid), sid, gate_keys_path(
+        conf, keys_path=os.environ.get("WISH_GATE_KEYS") or "")
+
+
+def gate_keys_path(config=None, keys_path=""):
     """**口令哈希**落在哪 —— 与愿力中心的数据文件**同目录、同一个批次** ✓
 
     面板跑在**本机**、插件跑在**容器**，两者之间只有「拉回来的一份只读副本」这一条通道 ✓
@@ -589,6 +615,8 @@ def gate_keys_path(config=None):
       "库是新拉的、哈希还是昨天那一行"的错配 ⇒ 面板验不动今天的新口令 ✗）
     ⚠️ 这里**只放哈希**；明文永远只在她自己的账本里（面板侧碰不到明文 ✓ 主人原意 ✓）
     """
+    if keys_path:
+        return keys_path
     base = os.path.dirname(resolve_db_path(config)) or "."
     return os.path.join(base, "wish_gate_keys.json")
 
