@@ -91,6 +91,8 @@ import main as plugin                                  # noqa: E402 —— 复�
 
 CN_TZ = timezone(timedelta(hours=8))
 BRIEF_LIMIT = 12
+BRIEF_STEP = 3          # 「再看更多」每次乘这么多（12 → 36 → 108 …）✓
+BRIEF_MAX = 5000        # 上限（再多就该用 --json / 直接查库了 ✓）
 TOP_LIMIT = 12
 WALLET_LIMIT = 30
 
@@ -121,6 +123,11 @@ def brief_of(conn, self_id, limit=BRIEF_LIMIT):
     rows = conn.execute(
         "SELECT ts, group_id, from_id, to_id, amount, kind, reason FROM ledger "
         "WHERE self_id=? ORDER BY id DESC LIMIT ?", (self_id, int(limit))).fetchall()
+    return rows_of(conn, self_id, rows)
+
+
+def rows_of(conn, self_id, rows):
+    """把 ledger 的行整成面板要的形状（`brief` 与 `more` 共用 ✓）。"""
     out = []
     for row in rows:
         out.append({
@@ -133,6 +140,72 @@ def brief_of(conn, self_id, limit=BRIEF_LIMIT):
             "group_id": str(row["group_id"] or ""),
         })
     return out
+
+
+def group_brief(entries):
+    """把**连续同一类**的流水折起来（主人 2026-10-14 要的 ✓）。
+
+    ⚠️ 起因：`attention`（被注视 +1）一天能有两百多笔，一条一行会把整页刷满
+    （主人原话：「大多都是被注视」✗）⇒ 连着的一串合成一组：
+      - 被注视是**纯计数** ⇒ 合成一行「被注视 ×N（+N）」，展开才看细节 ✓
+      - 别的类别（送礼 / 心情 / 点单 / 日结…）**每笔都有话** ⇒ 原样一条一行 ✓
+    只折**连续**的（中间夹了别的就断组 ✓）—— 这样时间顺序不会乱 ✓
+    """
+    groups = []
+    for item in entries:
+        last = groups[-1] if groups else None
+        if (last is not None and item["kind"] == "attention"
+                and last["kind"] == "attention"):
+            last["count"] += 1
+            last["sum"] += item["amount"]
+            last["last_time"] = item["time"]
+            last["items"].append(item)
+            continue
+        groups.append({"kind": item["kind"], "count": 1, "sum": item["amount"],
+                       "time": item["time"], "last_time": item["time"],
+                       "items": [item], "entry": item})
+    return groups
+
+
+def snapshot(path, now=None, self_id=None, limit=BRIEF_LIMIT, more=False):
+    """面板要的全部数据（纯读 ✓）。数据库不存在/没建表 ⇒ 返回 available=False。"""
+    now = int(now if now is not None else time.time())
+    if not os.path.exists(path):
+        return {"available": False, "path": str(path), "reason": "数据库还不存在",
+                "now": now}
+    conn = connect(path)
+    try:
+        if not _has_schema(conn):
+            return {"available": False, "path": str(path),
+                    "reason": "数据库里还没有账本表", "now": now}
+        ids = ([str(self_id)] if self_id else
+               [str(r["self_id"]) for r in conn.execute(
+                   "SELECT DISTINCT self_id FROM account ORDER BY self_id").fetchall()])
+        bots = []
+        for bot in ids:
+            start = plugin.day_start(now)
+            rows = conn.execute(
+                "SELECT ts, group_id, from_id, to_id, amount, kind, reason FROM ledger "
+                "WHERE self_id=? ORDER BY id DESC LIMIT ?", (bot, int(limit))).fetchall()
+            entry_list = rows_of(conn, bot, rows)
+            total = int(conn.execute("SELECT COUNT(*) c FROM ledger WHERE self_id=?",
+                                     (bot,)).fetchone()["c"])
+            bots.append({
+                "self_id": bot,
+                "day": datetime.fromtimestamp(start, CN_TZ).strftime("%Y-%m-%d"),
+                "today": plugin.db_audit_totals(bot, start, now, conn=conn),
+                "today_detail": plugin.db_audit_detail(conn, bot, start, now, TOP_LIMIT),
+                "wallets": wallets_of(conn, bot),
+                "ious": ious_of(conn, bot),
+                "brief": group_brief(entry_list),
+                "brief_count": len(entry_list),
+                "ledger_total": total,
+                "limit": int(limit),
+                "more": bool(more),
+            })
+        return {"available": True, "path": str(path), "now": now, "bots": bots}
+    finally:
+        conn.close()
 
 
 def wallets_of(conn, self_id, limit=WALLET_LIMIT):
@@ -163,8 +236,12 @@ def ious_of(conn, self_id, limit=TOP_LIMIT):
                      if r["due_ts"] else "")} for r in rows]
 
 
-def snapshot(path, now=None, self_id=None):
-    """面板要的全部数据（纯读 ✓）。数据库不存在/没建表 ⇒ 返回 available=False。"""
+def snapshot(path, now=None, self_id=None, limit=BRIEF_LIMIT, more=False):
+    """面板要的全部数据（纯读 ✓）。数据库不存在/没建表 ⇒ 返回 available=False。
+
+    ⚠️ 2026-10-14：这里曾有**第二份旧定义**（下面那个不带 `limit` 的）把它遮住 ✗ ——
+       Python 取**后**定义的 ⇒ 折叠/扩大范围全都看不到效果 ✓ 已删。
+    """
     now = int(now if now is not None else time.time())
     if not os.path.exists(path):
         return {"available": False, "path": str(path), "reason": "数据库还不存在",
@@ -180,6 +257,12 @@ def snapshot(path, now=None, self_id=None):
         bots = []
         for bot in ids:
             start = plugin.day_start(now)
+            rows = conn.execute(
+                "SELECT ts, group_id, from_id, to_id, amount, kind, reason FROM ledger "
+                "WHERE self_id=? ORDER BY id DESC LIMIT ?", (bot, int(limit))).fetchall()
+            entry_list = rows_of(conn, bot, rows)
+            total = int(conn.execute("SELECT COUNT(*) c FROM ledger WHERE self_id=?",
+                                     (bot,)).fetchone()["c"])
             bots.append({
                 "self_id": bot,
                 "day": datetime.fromtimestamp(start, CN_TZ).strftime("%Y-%m-%d"),
@@ -187,7 +270,11 @@ def snapshot(path, now=None, self_id=None):
                 "today_detail": plugin.db_audit_detail(conn, bot, start, now, TOP_LIMIT),
                 "wallets": wallets_of(conn, bot),
                 "ious": ious_of(conn, bot),
-                "brief": brief_of(conn, bot),
+                "brief": group_brief(entry_list),
+                "brief_count": len(entry_list),
+                "ledger_total": total,
+                "limit": int(limit),
+                "more": bool(more),
             })
         return {"available": True, "path": str(path), "now": now, "bots": bots}
     finally:
@@ -413,6 +500,71 @@ def _refresh_chip(on):
             '⟳ 一键拉取新副本</a>')
 
 
+def brief_row(item):
+    """一行流水的单元格（分组内每一条都用它 ✓）。"""
+    amount = int(item["amount"])
+    return [{"v": item["time"], "cls": "num"}, {"v": _badge(item["kind"]), "raw": True},
+            item["from"], item["to"],
+            {"v": "+%d" % amount if amount > 0 else "%+d" % amount,
+             "cls": "num pos" if amount > 0 else "num neg"},
+            item["reason"] or "—"]
+
+
+def brief_table(bot):
+    """最近流水：**连续的被注视折成一行**（可展开），别的类别照旧一条一行 ✓"""
+    groups = bot["brief"]
+    if not groups:
+        return _empty("还没有流水", "·")
+    head = ["时间", "类别", "从", "到", "数额", "她/他写的原话"]
+    body = []
+    for group in groups:
+        if group["kind"] == "attention" and group["count"] > 1:
+            # 被注视：折一行，点开看那 N 笔的**逐条时间** ✓（原生 <details> ⇒ 零 JS ✓）
+            inner = "".join(
+                '<tr class="sub">%s</tr>' % "".join(
+                    _cell(cell) for cell in brief_row(item)[:2] + [
+                        {"v": "（被注视）", "cls": ""}, {"v": "", "cls": ""},
+                        {"v": "+%d" % int(item["amount"]), "cls": "num pos"},
+                        {"v": item["reason"] or "—", "cls": ""}])
+                for item in group["items"])
+            body.append(
+                '<tr class="fold"><td colspan="6"><details><summary>'
+                '<span class="pill p-attention">attention</span> 被注视 <b>×%d</b>'
+                ' <span class="mut">（+%d）</span>'
+                '<span class="mut"> · 最新 %s</span></summary>'
+                '<table class="inner">%s</table></details></td></tr>'
+                % (group["count"], group["sum"], group["time"], inner))
+            continue
+        body.append("<tr>%s</tr>" % "".join(_cell(cell) for cell in brief_row(
+            group["items"][0])))
+    foot = ""
+    total = bot.get("ledger_total") or 0
+    if bot.get("brief_count", 0) < total:
+        nxt = min(int(bot.get("limit") or BRIEF_LIMIT) * BRIEF_STEP,
+                  max(total, BRIEF_LIMIT))
+        foot = ('<div class="foot">只列了最近 <b>%d</b> 笔（账上共 <b>%d</b> 笔）'
+                ' · <a href="?n=%d">再看更多 ↓</a></div>'
+                % (bot.get("brief_count", 0), total, nxt))
+    return ('<div class="tw"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>%s'
+            % ("".join("<th%s>%s</th>" % (' class="num"' if i in (0, 4) else "", h)
+                       for i, h in enumerate(head)), "".join(body), foot))
+
+
+def _cell(cell):
+    """`_table` 那份单元格逻辑（原样复用，别写两套 ✓）"""
+    value = cell["v"] if isinstance(cell, dict) else cell
+    cls = cell.get("cls", "") if isinstance(cell, dict) else ""
+    raw = cell.get("raw") if isinstance(cell, dict) else False
+    text = value if raw else html.escape(str(value))
+    return '<td%s>%s</td>' % (' class="%s"' % cls if cls else "", text)
+    """紫色那颗「一键拉取」按钮（**纯链接 + GET** ⇒ 不需要任何 JS ✓）"""
+    if not on:
+        return '<span class="chip">一键拉取：关（启动时加 --refresh 打开）</span>'
+    return ('<a class="chip btn" href="?refresh=1" '
+            'title="去服务器把账本的只读副本拉一份新的过来（不会改动远端任何东西）">'
+            '⟳ 一键拉取新副本</a>')
+
+
 def render(data, refresh_on=False, flash=""):
     """把 `snapshot()` 的 dict 拼成一整页 HTML（**纯呈现**：一个数据查询都不做 ✓）。"""
 
@@ -501,20 +653,9 @@ def render(data, refresh_on=False, flash=""):
             table = _empty("今天还没人动过", "·")
         blocks.append(_card("今日活跃", table, tag="进 / 出合计"))
 
-        # ⑤ 最近流水
-        brief = bot["brief"]
-        if brief:
-            rows = [[{"v": b["time"], "cls": "num"}, {"v": _badge(b["kind"]), "raw": True},
-                     b["from"], b["to"],
-                     {"v": "+%d" % b["amount"] if b["amount"] > 0 else "%+d" % b["amount"],
-                      "cls": "num pos" if b["amount"] > 0 else "num neg"},
-                     b["reason"] or "—"]
-                    for b in brief]
-            table = _table(["时间", "类别", "从", "到", "数额", "她/他写的原话"], rows,
-                           align=(0, 4))
-        else:
-            table = _empty("还没有流水", "·")
-        blocks.append(_card("最近流水", table, tag="最新在前"))
+        # ⑤ 最近流水（连续的被注视会折起来 ✓ 主人 2026-10-14 要的）
+        blocks.append(_card("最近流水", brief_table(bot),
+                            tag="最新在前 · 被注视已折叠"))
 
     if not blocks:
         blocks.append(_card("账本", '<div class="pad">%s</div>'
@@ -577,6 +718,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         flash = ""
         wants = urllib.parse.parse_qs(query or "")
+        # 「再看更多」：`?n=36` 之类 ⇒ 这次多读一点（有上限、且必须是真的整数 ✓）
+        try:
+            limit = int((wants.get("n") or [BRIEF_LIMIT])[0])
+        except (TypeError, ValueError):
+            limit = BRIEF_LIMIT
+        limit = max(BRIEF_LIMIT, min(limit, BRIEF_MAX))
         # 「一键拉取」：同一台机器上的页面点那个按钮 ⇒ 走这里（GET 只是为了让浏览器停在页面上 ✓）
         if "refresh" in wants and self.refresh and self._same_origin():
             try:
@@ -592,7 +739,7 @@ class Handler(BaseHTTPRequestHandler):
                 flash = ('<div class="note"><div class="t">拉取失败</div><div class="r">%s</div></div>'
                          % html.escape(str(exc)[:200]))
         try:
-            payload = render(snapshot(self.db_path), refresh_on=self.refresh,
+            payload = render(snapshot(self.db_path, limit=limit), refresh_on=self.refresh,
                              flash=flash).encode("utf-8")
             status = 200
         except Exception as exc:                        # noqa: BLE001 —— 面板出错也别把栈甩给浏览器

@@ -96,7 +96,7 @@ class Env:
         sc.raw_mood(mod, sc.ALICE, 120, "panel-alice", now)
         sc.raw_gift(mod, sc.ALICE, 20, "panel-gift", now)
         sc.raw_grant(mod, sc.ALICE, 60, item="<script>alert('x')</script>念一句台词")
-        sc.raw_grant(mod, sc.BOB, 30, item="举一次牌")
+        sc.raw_grant(mod, sc.BOB, max(45, mod.GRANT_MIN_AMOUNT), item="举一次牌")
         sc.raw_settle(mod, 1, "defaulted", "他没做")
         # 名字进账本（面板/排行要显示人名 ✓；线上这条由工具写账时带上 ✓）
         conn = mod._connect()
@@ -326,6 +326,61 @@ def t10_open_browser_once(_env, _unused):
     return True
 
 
+def t11_fold_attention(env, _unused):
+    """被注视折叠：**连续同一类**折一行、可展开；别的类别一条一行 ✓（主人 2026-10-14 要的）
+
+    ⚠️ 为什么值得一条自检：这功能改坏了**不会报错**，只会让页面又变回两百行 ✗
+    """
+    rows = []
+    base = int(time.time())
+    seq = [("attention", 1), ("attention", 1), ("attention", 1), ("mood", 5),
+           ("attention", 1), ("attention", 1)]
+    for i, (kind, amount) in enumerate(seq):
+        rows.append({"ts": base + i, "group_id": "9", "from_id": "system",
+                     "to_id": env.sc.BOT, "amount": amount, "kind": kind,
+                     "reason": "自检 %s" % kind})
+    # ⚠️ 连接用完必须关：面板是只读连接，但没关的话 Windows 上连临时目录都删不掉 ✗
+    conn = env.panel.connect(env.db)
+    try:
+        entries = env.panel.rows_of(conn, env.sc.BOT, rows)
+    finally:
+        conn.close()
+    groups = env.panel.group_brief(entries)
+    shapes = [(g["kind"], g["count"]) for g in groups]
+    if shapes != [("attention", 3), ("mood", 1), ("attention", 2)]:
+        print("      分组不对（连续才折、夹了别的要断）:", shapes)
+        return False
+    if sum(g["count"] for g in groups) != len(rows):
+        print("      折完条数对不上:", sum(g["count"] for g in groups), len(rows))
+        return False
+    single = env.panel.group_brief(entries[:4])
+    if single[0]["kind"] != "attention" or single[0]["count"] != 3:
+        print("      没有折起来:", single[0])
+        return False
+    # 页面里：折叠组要有可展开的壳 + 计数；单条的不该长成折叠组
+    html_out = env.panel.brief_table({"brief": groups, "brief_count": len(rows),
+                                      "ledger_total": len(rows), "limit": 12})
+    for token in ("<details>", "<summary>", "被注视", "×3", "×2", "p-attention"):
+        if token not in html_out:
+            print("      页面里缺 %r" % token)
+            return False
+    if html_out.count('<tr class="fold">') != 2:
+        print("      折叠组的行数不对:", html_out.count('<tr class="fold">'))
+        return False
+    # 「再看更多」：账上还有更多时必须给入口，给全了就不该给
+    more = env.panel.brief_table({"brief": groups, "brief_count": 6, "ledger_total": 400,
+                                  "limit": 12})
+    if "?n=" not in more or "账上共" not in more:
+        print("      没给「再看更多」入口:", more[-120:])
+        return False
+    full = env.panel.brief_table({"brief": groups, "brief_count": 400, "ledger_total": 400,
+                                  "limit": 400})
+    if "再看更多" in full:
+        print("      给全了还在催更多 ✗")
+        return False
+    return True
+
+
 TESTS = [
     ("P01 只读连接写不了库", t01_readonly),
     ("P02 快照读得到发行/钱包/欠条/流水", t02_snapshot_content),
@@ -337,6 +392,7 @@ TESTS = [
     ("P08 面板源码卫生", t08_source_hygiene),
     ("P09 CLI 入口（--json 真跑一遍）", t09_cli_entry),
     ("P10 开浏览器只开一次、失败不炸", t10_open_browser_once),
+    ("P11 被注视折叠 + 再看更多", t11_fold_attention),
 ]
 
 
