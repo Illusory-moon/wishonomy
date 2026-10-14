@@ -539,11 +539,19 @@ def brief_table(bot, folded=False):
     for index, group in enumerate(groups):
         if index and index % BRIEF_STAGE == 0:
             stage = index // BRIEF_STAGE      # 第 stage 批**之前** ⇒ 放"开这一批"的按钮
+            # 最后一颗兼做两件事：① 放开本地那批 ② 若库里还有更早的，再给一个"读更早的"（要刷新 ✓）
+            tail = ""
+            # 最后一颗（后面没有第 n+1 批了）⇒ 兼做"库里还有更早的"那个入口 ✓
+            # ⚠️ 边界别再算错：按钮 id 是 `more-{批号-1}`，最后一颗就是 `stages-1` ✗
+            if stage == stages - 1 and hidden_after:
+                nxt = min(int(bot.get("limit") or BRIEF_LIMIT) * 3, BRIEF_MAX)
+                tail = (' <a class="btn ghost" href="?n=%d">库里还有更早的，读 %d 行'
+                        '（这一下会刷新一次）</a>' % (nxt, nxt))
             body.append(
                 '<tr class="anchor a%d" id="more-%d"><td colspan="6">'
                 '<a class="btn" href="#more-%d">⬇ 再看更早的 %d 行</a>'
-                '<span class="mut">已看到第 %d 行 · 账上共 %d 笔 · 点一下原地展开 ✓</span>'
-                '</td></tr>' % (stage, stage, stage, BRIEF_STAGE, index, total))
+                '<span class="mut">已看到第 %d 行 · 账上共 %d 笔 · 点一下原地展开 ✓</span>%s'
+                '</td></tr>' % (stage, stage, stage, BRIEF_STAGE, index, total, tail))
         item = group["items"][0]
         quiet = group["kind"] == "attention"
         classes = []
@@ -574,17 +582,12 @@ def brief_table(bot, folded=False):
 
     foot = []
     if has_attention:
-        # ⚠️ 这个锚点必须在**开头**（`~tr.quiet` 只管后面 ✗）⇒ 放进表体第一行 ✓
         body.insert(0, '<tr class="anchor" id="attention"><td colspan="6">'
                        '<a class="btn ghost" href="#top">收起被注视</a></td></tr>')
         foot.append('<a class="btn" href="#attention">👁 再看被注视</a>')
     foot.append('<span class="mut">已显示最近 <b>%d</b> 笔中的前 <b>%d</b> 笔'
                 '（账上共 <b>%d</b> 笔）</span>'
                 % (shown, min(shown, BRIEF_STAGE * stages), total))
-    if hidden_after:
-        nxt = min(int(bot.get("limit") or BRIEF_LIMIT) * 3, BRIEF_MAX)
-        foot.append('<a class="btn ghost" href="?n=%d">读更早的（%d 行，会刷新一次）</a>'
-                    % (nxt, nxt))
     return ('<div class="tw" id="top"><table><thead><tr>%s</tr></thead><tbody>%s</tbody></table></div>'
             '<div class="foot">%s</div>'
             % ("".join("<th%s>%s</th>" % (' class="num"' if i in (0, 4) else "", h)
@@ -602,14 +605,21 @@ def stage_css(stages=6):
           ⇒ **同一时刻永远只看得见一颗** ✓
     """
     rules = [".stage{display:none}", ".quiet{display:none}", "tr.anchor{display:none}"]
+    # ⚠️ 第一颗按钮（#more-1）**永远可见** ✗ —— 它没有"前一颗"能把它放出来，
+    #    上一版就是在这里翻车：`tr.anchor{display:none}` 把**所有**按钮都藏了 ⇒
+    #    页面上**一颗都没有**（主人报「直接没有再看更多的按钮了」✓）⇒ 现在给它开个例外 ✓
+    rules.append("tr.a1{display:table-row}")
     for stage in range(1, stages + 1):
         # 点了第 n 颗：第 n+1 批的行出现、第 n+1 颗按钮出现、这 n 颗自己收起来 ✓
         rules.append("#more-%d:target~tr.s%d{display:table-row}" % (stage, stage + 1))
         rules.append("#more-%d:target~tr.a%d{display:table-row}" % (stage, stage + 1))
         rules.append("#more-%d:target~tr.a%d{display:none}" % (stage, stage))
         rules.append("#more-%d:target~tr.a%d{display:none}" % (stage, stage - 1))
-    if stages < 1:
-        rules = rules[:3]
+    # 点了**最后一颗**（它后面没有 a{n+1} 了）⇒ 按钮链到此结束
+    # ⚠️ 编号是 `more-0/1/2…`（按"第几批"从 0 起 ✗）—— 上一版写成 `more-{stages}`，
+    #    差一位 ⇒ **最后一颗点了收不掉**（而且兜底链接也挂不上去 ✓）
+    if stages >= 1:
+        rules.append("#more-%d:target~tr.anchor{display:none}" % (stages - 1))
     # 被注视：锚点在**表体第一行** ⇒ 后面的 .quiet 才管得到 ✓
     rules.append("#attention:target~tr.quiet{display:table-row}")
     rules.append('.anchor td,.foot{text-align:center;padding:10px 8px;background:var(--soft-bg);'

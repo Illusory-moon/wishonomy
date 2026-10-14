@@ -377,10 +377,12 @@ def t11_fold_attention(env, _unused):
     css = env.panel.stage_css(6)
     for token in (".stage{display:none}", ".quiet{display:none}",
                   "tr.anchor{display:none}",
+                  "tr.a1{display:table-row}",          # ⚠️ 第一颗必须永远可见（藏了就"没有按钮"✗）
                   "#more-1:target~tr.s2", "#more-1:target~tr.a2",
                   "#more-1:target~tr.a1{display:none}",
                   "#more-2:target~tr.a2{display:none}",
                   "#more-2:target~tr.a3{display:table-row}",
+                  "#more-5:target~tr.anchor{display:none}",
                   "#attention:target~tr.quiet"):
         if token not in css:
             print("      CSS 规则缺 %r" % token)
@@ -405,6 +407,16 @@ def t11_fold_attention(env, _unused):
         return False
     if "<script" in big:
         print("      页面里出现了 <script> ✗")
+        return False
+    # ⚠️ 2026-10-14 真机 bug（主人报「改版之后直接没有再看更多的按钮了」✗）：
+    #    上一版把**所有**按钮都 `display:none`，而第一颗**没有前一颗能放出它** ⇒ 全页 0 按钮 ✗
+    #    ⇒ 断言：有更多可看时，页面上**必须至少有一颗按钮**（`tr.a1` 永远可见 ✓）
+    if "tr.a1{display:table-row}" not in css:
+        print("      第一颗按钮被藏了 ⇒ 页面上会一颗按钮都没有 ✗")
+        return False
+    if "库里还有更早的" not in env.panel.brief_table(
+            {"brief": many, "brief_count": 130, "ledger_total": 999, "limit": 400}):
+        print("      库里还有更早的时，没给「读更早的」兜底 ✗")
         return False
     # 给全了就不该再催「读更早的（会刷新）」
     full = env.panel.brief_table({"brief": groups, "brief_count": 400, "ledger_total": 400,
