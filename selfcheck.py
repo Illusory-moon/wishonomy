@@ -1501,6 +1501,34 @@ def t49_settle_scope_wording(mod, _plugin):
     return True
 
 
+def t50_spend_wording(mod, _plugin):
+    """**"谁花的钱"口径必须写死**（主人 2026-10-15 报的理解偏差 ✓）
+
+    ⚠️ 起因：她把「扣别人的分」也当成「自己花出去」✗ ——
+       实测 10-15 00:26 她嘴上说的是「你等着看我**下单**就是了」（点单，对 ✓），
+       可她的心情标签却写了 `delta=-3` ⇒ 走了**分愿力（扣人）**✗
+       ⇒ 三条口径要一件不少地写进她读得到的文本里：
+         ① 收愿力/分愿力 = **打分**，不动她自己的余额
+         ② **只有点单**才叫她花自己的钱
+         ③ 心情标签**只能记当前说话人**，要动别人必须用工具
+    """
+    tail = mod.inject_tail([{"name": "甲档", "cost": 1, "note": "备注"}])
+    need = ["花你的钱", "打分", "点单", "花自己的钱", "只记「这一轮跟你说话的人」"]
+    missing = [word for word in need if word not in tail]
+    if missing:
+        print("      注入里缺「谁花的钱」的口径:", missing)
+        return False
+    mood_doc = mod.wish_mood.__doc__ or ""
+    if "打分" not in mood_doc or "不动你自己的余额" not in mood_doc:
+        print("      收愿力那个工具的说明没写清'这是打分、不是花钱' ✗")
+        return False
+    grant_doc = mod.wish_grant.__doc__ or ""
+    if "花自己的钱" not in grant_doc:
+        print("      点单那个工具的说明没写清'这才叫你花自己的钱' ✗")
+        return False
+    return True
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1551,6 +1579,7 @@ TESTS = [
     ("R47 收愿力是净额（扣人要减出去）", t47_issued_net_of_deduct),
     ("R48 她读得到的文本里没有装饰符号（日结口径也在里面）", t48_no_marks_in_visible_text),
     ("R49 日结口径：只清她自己 + 防通胀 + 单场收费", t49_settle_scope_wording),
+    ("R50 花钱口径：收/分愿力是打分，只有点单花她自己的", t50_spend_wording),
 ]
 
 
