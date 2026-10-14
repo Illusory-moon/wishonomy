@@ -1820,10 +1820,23 @@ def t53_gate_rotation_end_to_end(mod, plugin):
     if panel.gate_hash(first, entry) == panel.gate_hash("AAAAAA", entry):
         print("      面板那边换个口令哈希也没变 ✗")
         return False
-    # 同一天再走一遍：**不许再换**（钥匙一天一把 ✓）
+    # 同一天再走一遍：**不许再换**（钥匙一天一把 ✓）· 而且**哈希必须一模一样** ✓
+    # ⚠️ 这条是**真机撞出来的** ✗：同一天第二次被唤醒时 `changed=False`（那把还在有效期内 ✓），
+    #    若那一刻用"现在"当轮换时刻去算哈希 ⇒ 写出来的哈希**和笔记那行对不上** ⇒
+    #    面板重算永远不匹配 ⇒ **她给对了口令也开不了门** ✗
+    #    （实测症状：键文件里的 `rotated` 与那一行的到期时刻差了 23 秒 ✓）
+    with open(keys, encoding="utf-8") as handle:
+        first_keys = json.load(handle)[BOT]
     again = mod.gate_rotate_for(BOT, conf)
     if again != first:
         print("      同一天转了第二把（钥匙会变成「今天到底是哪把」的罗生门 ✗）:", again)
+        return False
+    with open(keys, encoding="utf-8") as handle:
+        second_keys = json.load(handle)[BOT]
+    if second_keys != first_keys:
+        print("      **同一天再走一遍，哈希变了** ✗（面板会认不出她对的口令 ⇒ 开不了门 ✗）:")
+        print("        第一次:", first_keys)
+        print("        第二次:", second_keys)
         return False
     # 关掉开关 ⇒ 一个字都不许动 ✓
     mod._GATE_ROTATE_DAY["day"] = ""

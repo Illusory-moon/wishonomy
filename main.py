@@ -757,7 +757,6 @@ def gate_rotate_for(self_id, config=None, now=None):
         try:
             stamp = now if now is not None else datetime.now(CN_TZ)
             at = stamp.strftime("%Y-%m-%d %H:%M:%S")
-            expires = gate_expiry(int(stamp.timestamp()), at)
             text, code, changed = gate_rotate(old, now)
         except (ValueError, OSError) as exc:   # noqa: BLE001 —— 转不出来 ⇒ 这一步不做
             logger.warning("[wishonomy] 口令：轮换失败，跳过: %s", str(exc)[:80])
@@ -771,8 +770,15 @@ def gate_rotate_for(self_id, config=None, now=None):
         code, expiry = gate_read(text)
         if not code:
             return ""
+        # ⚠️ **只用笔记里那一行自己的事实**算哈希与时刻 ✗ —— 别用"现在"：
+        #    同一天里她**第二次**被唤醒时 `changed=False`（那把钥匙还在有效期内、没换 ✓），
+        #    若这里用"现在"当轮换时刻，就会写出一个**和笔记那行对不上**的哈希 ✗
+        #    ⇒ 面板重算永远不匹配 ⇒ **她给对了口令也开不了门** ✗
+        #    （本鱼在真机第二次跑轮换时当场撞上：`rotated` 与那一行的到期时刻差了 23 秒 ✓
+        #      自检 R53 里加了一条"再走一遍必须给出**同一个哈希**"盯着它 ✓）
+        rotated = (expiry - timedelta(hours=MOOD_GATE_TTL_HOURS)).strftime("%Y-%m-%d %H:%M:%S")
         try:
-            gate_write_keys(self_id, code, expiry or expires, at)
+            gate_write_keys(self_id, code, expiry, rotated)
         except (OSError, ValueError) as exc:   # noqa: BLE001 —— 哈希写不出去也要如实记一笔
             logger.warning("[wishonomy] 口令：哈希文件写不出去: %s", str(exc)[:80])
             return ""
@@ -1854,8 +1860,16 @@ class Main(star.Star):
                 made = gate_rotate_for(bot, self.config)
                 if made:
                     _GATE_ROTATE_DAY["day"] = today
-                logger.info("[wishonomy] 口令 | bot=%s %s（哈希已写；值不进日志 ✓）",
-                            bot, "今日已就位" if made else "今天没转（未配置账本 / 读不到）")
+                    logger.info("[wishonomy] 口令 | bot=%s 今日已就位（哈希已写；值不进日志 ✓）",
+                                bot)
+                else:
+                    # ⚠️ 这里要说清是**哪种**没转（原来那句把两种原因混在一起，误导了本鱼一轮 ✗）：
+                    #    · 没配笔记路径 ⇒ 整套关着（不报错 ✓）
+                    #    · 配了却读不到 ⇒ 要看一眼文件权限/路径 ✗
+                    logger.info("[wishonomy] 口令 | bot=%s 今天没转：%s", bot,
+                                "没配笔记路径（notes_path 留空 = 整套关着）"
+                                if not gate_notes_path(self.config, bot)
+                                else "配了笔记路径但读不到它 ⇒ 去看一眼那个文件 ✗")
             # ③ 拼提示：**别人的 + 她自己的**（她自己那份每轮可见 ✓）
             snap = await run_db(db_snapshot, bot, sender)
             mine = await run_db(db_snapshot, bot, bot)
