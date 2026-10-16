@@ -75,6 +75,15 @@ _MOOD_CLOSE = r"(?:\[\[/wish_mood\]\]|\[/wish_mood\]|</wish_mood>)"
 MOOD_TAG_FULL = re.compile(_MOOD_OPEN + r"[ \t]*`*[ \t]*(?P<payload>\{[^{}]*\})?[ \t]*`*[ \t]*"
                            + _MOOD_CLOSE)
 MOOD_TAG_OPEN = re.compile(_MOOD_OPEN + r"[ \t]*`*[ \t]*(?P<payload>\{[^{}]*\})?")
+# ⚠️ 2026-10-16 真事故（主人报「impression 的 json 漏出去了」时本鱼顺带扫出来的 ✗）：
+#   群里实际收到过这两种残缺形态 ——
+#     `…门票钱进谁兜了~[[/wish_mood]]`        ← **只剩闭合标签**（开头被吃掉/她没写）
+#     `…还用得着谁来封嘛♥，[[/wish_mood]]`
+#   而 `MOOD_TAG_FULL` 要求头尾齐全、`MOOD_TAG_OPEN` 只认**开头** ✗
+#   ⇒ 两种情况都匹配不到 ⇒ 标签原样漏进群 ✗（本鱼实测复现 ✓）
+#   ⇒ 补两条：**只剩闭合标签** / **开标签后跟没闭合的 `{`**（截断）⇒ 一律扒掉 ✓
+MOOD_TAG_CLOSE_ONLY = re.compile(_MOOD_CLOSE)
+MOOD_TAG_TRUNC = re.compile(_MOOD_OPEN + r"[ \t]*(?P<tail>\{[^{}]*$)")
 
 MOOD_NOTE = (
     "另外，**每一轮**都要顺手问自己一次：这一轮他让你更想给他愿力，还是更不想？"
@@ -89,7 +98,8 @@ def parse_mood_tag(text):
 
     返回 (清理后的正文, delta, reason)；没有有效标签时返回 (原文, 0, "") ✓
 
-    ⚠️ 三种写法都认（`<…>` / `[[…]]` / `[…]`）、**任何位置**都扒 ——
+    ⚠️ 五种形态都认（`<…>` / `[[…]]` / `[…]` / **只剩闭合标签** / **标签+截断 JSON**）、
+       **任何位置**都扒 ——（后两种是 2026-10-16 补的 ✓ 真事故驱动的 ✓）
        她写标签的写法会漂（`[[x]]` 那次就是活教训 ✗）；而且**绝不用"截断到标签为止"**
        （那会连她说的话一起吃 ✗ 印象插件那次真踩过）。
     """
@@ -101,6 +111,16 @@ def parse_mood_tag(text):
     for match in MOOD_TAG_FULL.finditer(text):
         if match.group("payload"):
             payload = match.group("payload")
+    # ⚠️ 顺序很关键：这两步必须**排在 MOOD_TAG_FULL / OPEN 之后、early return 之前** ✗
+    #   否则「只剩闭合标签」和「截断的 JSON」都会漏出去（真事故 ✓）
+    #   ⚠️ 而且 **payload 为 None 时也必须扒干净** —— 老代码在 payload 为空时直接
+    #      `return cleaned`，闭合标签没被清掉就漏进群了 ✗（2026-10-16 实测 ✓）
+    cleaned = MOOD_TAG_TRUNC.sub("", cleaned)
+    if payload is None:
+        for match in MOOD_TAG_TRUNC.finditer(text):
+            if match.group("tail"):
+                payload = match.group("tail")
+    cleaned = MOOD_TAG_CLOSE_ONLY.sub("", cleaned)
     if payload is None:
         for match in MOOD_TAG_OPEN.finditer(cleaned):
             if match.group("payload"):

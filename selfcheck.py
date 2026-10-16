@@ -1879,6 +1879,44 @@ def t53_gate_rotation_end_to_end(mod, plugin):
     return True
 
 
+def t55_residual_tag_forms_are_stripped(mod, _plugin):
+    """⚠️ 2026-10-16 主人报「impression 的 json 漏出去了」时本鱼顺带扫出来的同类事故 ✗
+
+    群里实际收到过（网关库原文）：
+      `…门票钱进谁兜了~[[/wish_mood]]`            ← **只剩闭合标签**（开头没了/她没写）
+      `…还用得着谁来封嘛♥，[[/wish_mood]]`
+      `…一天换三回~[[wish_mood]]{"delta":0,...}`  ← 完整标签
+    而老解析器：`MOOD_TAG_FULL` 要求头尾齐全 ✗、`MOOD_TAG_OPEN` 只认**开头** ✗
+    ⇒ 上面三种一律匹配不到 ⇒ **标签原样漏进群** ✗（实测复现 ✓）
+
+    ⇒ 修：补「只剩闭合标签」「开标签 + 没闭合的 JSON」两条清理 ✓
+    ⇒ 判据：**正文里绝不许再出现 `wish_mood`** ✓（正常提到这个词的句子不许被误伤 ✗）
+    """
+    cases = [
+        ("只剩闭合标签", '「火花大会」？前几期？门票钱进谁兜了~[[/wish_mood]]'),
+        ("只剩闭合标签 2", '这话火花花爱听~还用得着谁来封嘛♥，[[/wish_mood]]'),
+        ("截断·开标签 + 没闭合 JSON", '说一句话~[[wish_mood]]{"delta":5,"reason":"没写完'),
+        ("完整闭合（还要能记账）", '说一句话~[[wish_mood]]{"delta":3,"reason":"挺实在"}[[/wish_mood]]'),
+    ]
+    for name, txt in cases:
+        cleaned, _d, _r = mod.parse_mood_tag(txt)
+        if "wish_mood" in cleaned:
+            print("      ✗ %s 没扒干净:" % name, cleaned[:80])
+            return False
+    # 完整闭合那条必须**真的记上账** ✓（别为了扒干净把功能弄没了 ✗）
+    _c, d2, r2 = mod.parse_mood_tag(cases[3][1])
+    if d2 != 3 or r2 != "挺实在":
+        print("      ✗ 完整标签解析坏了:", d2, r2)
+        return False
+    # 正常句子不许被误伤 ✓
+    keep = '你说的 wish_mood 那套账我记着呢~'
+    c2, d3, _r3 = mod.parse_mood_tag(keep)
+    if c2.strip() != keep or d3 != 0:
+        print("      ✗ 正常句子被误伤:", c2)
+        return False
+    return True
+
+
 TESTS = [
     ("R01 库结构 / user_version / WAL", t01_schema),
     ("R02 迁移可重入（带数据）", t02_migration_idempotent),
@@ -1934,6 +1972,7 @@ TESTS = [
     ("R52 钥匙：规格 / 每天轮换 / 与 mindscape 防撞（两边各认各的）", t52_gate_key),
     ("R53 钥匙真轮换：写她的账本 + 写本机哈希（面板能验）", t53_gate_rotation_end_to_end),
     ("R54 心情标签 amount=0 按「无变化」放过（P1 重复消息的成因）", t54_mood_zero_is_accepted),
+    ("R55 残缺标签形态也要扒干净（只剩闭合 / 截断 JSON）", t55_residual_tag_forms_are_stripped),
 ]
 
 
@@ -1946,6 +1985,7 @@ def reset_state(mod):
     finally:
         conn.close()
     mod.forget_names()
+
 
 
 def main():
