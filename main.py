@@ -2142,8 +2142,20 @@ async def _mood_core(args, kwargs, source):
         if candidate < 0:
             negative = True
             amount = -candidate
-    if not amount:
+    if raw is None:
         return "给我一个数：正数是收愿力，负数是扣。"
+    if not amount:
+        # ⭐ 2026-10-16 修：`delta=0` **必须按「无变化」放过** ✓
+        #   病：工具这条路口径与「输出标签」那条路**不一致** ✗ ——
+        #       prompt 明说「没有变化就写 {"delta":0}」（MOOD_NOTE ✓）而标签路
+        #       在 `if delta == 0: return (cleaned, 0, "")` 处**静默放过** ✓，
+        #       工具路却把 0 当成「没给数」拒掉 ✗
+        #   ⇒ 她照 prompt 用 0 ⇒ 被拒 ⇒ 框架再问一次模型 ⇒
+        #     **模型把这一轮正文又输出一遍** ⇒ 群里原模原样两条 ✗
+        #     （2026-10-16 实测：今天 3 条紧挨重复里 2 条都是这个 ✓ 而 wish_mood 恰好被拒 2 次 ✓）
+        #   ⇒ 所以这里**照标签路的口径**放过，并给一句「照常说话」的话术
+        #     （不能用报错口吻 ✗ —— 模型会当成失败又重发一遍 ✗）
+        return "这条没动账 —— 0 不用记，照常说话就行。"
     cap = normalize_amount(_cfg(plugin.config, "mood_max_delta", MOOD_MAX_DELTA)) or MOOD_MAX_DELTA
     if amount > cap:
         return "一次最多 ±%d，别一口气给那么多 —— 想多给就下次再给。" % cap

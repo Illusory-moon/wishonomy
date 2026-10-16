@@ -1460,6 +1460,38 @@ def t48_no_marks_in_visible_text(mod, _plugin):
     return True
 
 
+def t54_mood_zero_is_accepted(mod, plugin):
+    """`wish_mood(amount=0)` 必须**按「无变化」放过** ✓（不是报错 ✗）
+
+    ⭐ 2026-10-16 主人报的 P1「有些消息原模原样发两遍」的真根因：
+      提示词 `MOOD_NOTE` 明说「没有变化就写 {"delta":0}」（输出标签那条路 ✓
+      它在 `if delta == 0: return (cleaned, 0, "")` 处**静默放过** ✓），
+      而**工具那条路**却用 `if not amount:` 把 0 当成「没给数」**拒掉** ✗
+      ⇒ 她照 prompt 用 0 ⇒ 被拒 ⇒ 框架再问一次模型 ⇒
+        **模型把这一轮正文又输出一遍** ⇒ 群里原模原样两条 ✗
+        （实测：10-16 三处紧挨重复里两处都是这个，而 wish_mood 恰好被拒两次 ✓）
+    ⇒ 判据：① 返回里**没有报错口吻**（不能含「给我一个数」）
+             ② 必须**明确说没动账**（免得模型以为失败又重发 ✗）
+             ③ 余额不许变 ✓
+    """
+    seed_bot(mod, 500, "zero-seed")
+    before = balance_of(mod, ALICE)
+    out = call(mod.wish_mood, plugin, Ev(), who="爱丽丝", amount=0, reason="这条不动账")
+    text = str(out or "")
+    if "给我一个数" in text:
+        print("      ✗ 0 被当成「没给数」拒了（这正是 P1 的成因）:", text)
+        return False
+    if "没动账" not in text:
+        print("      ✗ 没明确说「没动账」—— 模型会以为失败又重发一遍:", text)
+        return False
+    if balance_of(mod, ALICE) != before:
+        print("      ✗ 0 居然动了账:", before, "->", balance_of(mod, ALICE))
+        return False
+    # 对照：真正没给数的时候，仍然要**要一个数** ✓（别把这个也放过了 ✗）
+    out2 = str(call(mod.wish_mood, plugin, Ev(), who="爱丽丝", reason="忘了给数") or "")
+    return "给我一个数" in out2
+
+
 def t49_settle_scope_wording(mod, _plugin):
     """**日结口径必须在她读得到的文本里说清**（主人 2026-10-14 追加的 ✓）
 
@@ -1901,6 +1933,7 @@ TESTS = [
     ("R51 按昵称认人（注入与工具两条路都要记名）", t51_learn_names),
     ("R52 钥匙：规格 / 每天轮换 / 与 mindscape 防撞（两边各认各的）", t52_gate_key),
     ("R53 钥匙真轮换：写她的账本 + 写本机哈希（面板能验）", t53_gate_rotation_end_to_end),
+    ("R54 心情标签 amount=0 按「无变化」放过（P1 重复消息的成因）", t54_mood_zero_is_accepted),
 ]
 
 
