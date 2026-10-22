@@ -455,8 +455,17 @@ def inject_tail(tiers=None):
     lines.append(MOOD_NOTE)
     tiers = [t for t in (tiers or []) if t.get("name") and t.get("cost")]
     if tiers:
-        lines.append("礼物单（有人问你有什么礼物、多少钱，照这个说）："
+        lines.append("礼物单（有人问你有什么礼物、多少钱，照这个说；"
+                     "**名字只有这一个写法**）："
                      + "；".join("%s %d" % (t["name"], int(t["cost"])) for t in tiers) + "。")
+        # ⚠️ 2026-10-22 主人定：**别名 ≠ 礼物原名**，这两件事要在注入里分开写 ✓
+        #    真机事故：有人把礼物名打错一个字 ⇒ 她精确比对失败 ⇒ 当场"核对清单"
+        #    ⇒ 那句"你送的是 X，我念快了"**漏进正文** ✗
+        #    ⇒ 现在形近字/口误都认得出（`aliases`），她**不需要**再解释差异 ✓；
+        #       同时明写「正名只有一个、你自己只说正名」⇒ 不让她把错写当成正名 ✓
+        lines.append("（别人可能把礼物名打错、或者用别的写法 —— 那些**也算同一件礼物**，"
+                     "你照收、账上照**正名**记。但**你自己说话只写正名**，别跟着错写；"
+                     "认出来了就直接收，**不用跟人解释「你打错了」**。）")
     # ⚠️ **追加在最后**（不插在中间）—— 已上线那版尾巴的**前半段逐字不变** ⇒
     #    只有最后这一段需要重新计费，缓存损失面压到最小 ✓
     lines.append(MOOD_GATE_NOTE)
@@ -1803,11 +1812,58 @@ def resolve_tiers(config):
             cost = normalize_amount(item.get("cost"))
             name = str(item.get("name") or "").strip()
             if cost and name:
-                out.append({"cost": cost, "name": name,
-                            "note": str(item.get("note") or "").strip()})
+                # ⚠️ 2026-10-22 主人报的真问题：**同音/形近字的写法认不出来** ✗
+                #    真机：有人把礼物名打错一个字 ⇒ 精确比对失败 ⇒ 她当场去"核对清单"
+                #    ⇒ 那段"我在核对"的思考**漏进正文** ✗（主人："没法百分百阻止思考漏出去"）
+                # ⇒ 给每个档位加 **aliases（别名）**：只用来"认出来"，**永不替换正名** ✓
+                #    ⚠️ 别名 ≠ 正名：账本只记 `name`、注入也只印 `name`（主人特别叮嘱 ✓）
+                _al = item.get("aliases")
+                if isinstance(_al, str):
+                    _al = re.split(r"[,，、;；/|\s]+", _al)
+                elif not isinstance(_al, (list, tuple)):
+                    # ⚠️ 配置写蠢了（数字 / 字典 / null）⇒ 当没有别名，**绝不许炸** ✗
+                    #    （自检 R20「配置畸形不炸」就守着这条 ✓）
+                    _al = []
+                _aliases = []
+                for _a in _al:
+                    _a = str(_a or "").strip()
+                    if _a and _a != name:      # 别名不许等于正名 ✓（重复没意义）
+                        _aliases.append(_a)
+                _item = {"cost": cost, "name": name,
+                         "note": str(item.get("note") or "").strip()}
+                # ⚠️ **只在真有别名时才加这个键** ✓ —— 没别名的档位形状与老版**逐字一致** ✓
+                #    （自检 R20 断言的是「字典完全相等」⇒ 硬加 `aliases: []` 会把它打红 ✗）
+                if _aliases:
+                    _item["aliases"] = _aliases
+                out.append(_item)
     if not out and config is not None:
         out = [dict(tier) for tier in DEFAULT_GIFT_TIERS]
     return out
+
+
+def _tier_key(s):
+    """比对用的归一化：去空白 + 小写（纯 ASCII 大小写不敏感 ✓ 汉字不受影响 ✓）。"""
+    return re.sub(r"\s+", "", str(s or "")).lower()
+
+
+def match_tier(tiers, raw):
+    """按**正名**或**别名**找档位 ⇒ (tier 或 None, "name" / "alias" / None)。
+
+    ⚠️ 2026-10-22 主人定：**别名只用于"认出来"，永不替换正名** ✓
+       —— 账上记的、注入印的、她嘴里说的，**一律是 `name`** ✗ 不许变成别名 ✓
+    先匹正名、再匹别名（正名优先 ⇒ 不会有歧义 ✓）。
+    """
+    key = _tier_key(raw)
+    if not key:
+        return None, None
+    for item in tiers or []:
+        if _tier_key(item.get("name")) == key:
+            return item, "name"
+    for item in tiers or []:
+        for a in item.get("aliases") or []:
+            if _tier_key(a) == key:
+                return item, "alias"
+    return None, None
 
 
 def tier_by_cost(tiers, cost):
@@ -2247,13 +2303,15 @@ async def wish_gift(*args, **kwargs):
         #    结果被解释成"第 30 号档位"、静默收了别的东西 ✗（2026-10-13）
         return ("档位要写**名字**，别写数字 —— 礼物单上是这些：%s。"
                 "要是想送好几份，名字照写，另外把份数填在 count 里。" % listing)
-    tier = None
-    for item in tiers:
-        if item["name"] == raw:
-            tier = item
-            break
+    tier, _how = match_tier(tiers, raw)
     if tier is None:
         return "礼物单上是这些：%s —— 说一个名字。" % listing
+    # 认出来了但写的是**别名**（形近字/口误）：账上照正名记，并**点她一句** ✓
+    # ⚠️ 这一句是刻意加的：防止她把别名的写法当成"礼物原名" ✓（主人 2026-10-22 叮嘱）
+    _alias_note = ""
+    if _how == "alias":
+        _alias_note = ("（他写的是别的写法，账上照正名「%s」记 —— 你自己也说正名。）"
+                       % tier["name"])
     count = normalize_amount(kwargs.get("count")) or 1
     user_id = await _who_to_id(plugin, event, kwargs.get("who"), group_id)
     if not user_id:
@@ -2285,10 +2343,10 @@ async def wish_gift(*args, **kwargs):
                     % money_text(result.get("today", 0)))
         return "这笔礼物没记成（愿力中心报了个错），当没收到就行。"
     if int(count) > 1:
-        return ("收下了：他送的「%s」×%d，一共 %s，已经进你的账。"
-                % (tier["name"], int(count), money_text(total)))
-    return ("收下了：他送的「%s」%s，已经进你的账。"
-            % (tier["name"], money_text(total)))
+        return ("收下了：他送的「%s」×%d，一共 %s，已经进你的账。%s"
+                % (tier["name"], int(count), money_text(total), _alias_note))
+    return ("收下了：他送的「%s」%s，已经进你的账。%s"
+            % (tier["name"], money_text(total), _alias_note))
 
 
 @llm_tool(name="wish_grant")

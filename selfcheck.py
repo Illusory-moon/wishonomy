@@ -7,7 +7,7 @@
   * 拿**真库真事务**跑（临时目录），不是打桩模拟
 
 跑法（本机）：
-    D:\\smm-tempsparxie\\.venv\\Scripts\\python.exe D:\\sparxie\\wishonomy\\selfcheck.py
+    E:\\smm-tempsparxie\\.venv\\Scripts\\python.exe E:\\sparxie\\wishonomy\\selfcheck.py
 """
 import asyncio
 import ast
@@ -1403,6 +1403,85 @@ def t47_issued_net_of_deduct(mod, _plugin):
 _MARKS = "✓✗⚠️★✅❌❗①②③④⑤⑥⑦⑧⑨⑩→←↑↓•·"
 
 
+def t56_gift_alias_never_renames(mod, _plugin):
+    """⚠️ 2026-10-22 主人报的真问题：**礼物名打错一个字就认不出来** ✗
+
+    真机现象（群里她实际发出的那句）：
+      `…五个我收了…（你送的是 X，我念快了，别怪我）`
+    —— 送礼物的人把礼物名打错了一个字，而老代码是
+      `if item["name"] == raw:` **精确相等** ✗
+      ⇒ 认不出 ⇒ 她当场去"核对清单" ⇒ **那段核对过程漏进正文** ✗
+
+    ⇒ 修：每个档位加 `aliases`（形近字/口误/英文写法）✓
+    🔴 **但主人特别叮嘱**：「**不要让火花觉得形近字 = 礼物原名，这个要区分开**」✓
+       ⇒ 别名**只用于认出来**；账本、注入、她嘴里说的，**一律是正名** ✗ 不许变成别名 ✓
+    """
+    conf = {"gift_tiers": [
+        {"cost": 1, "name": "正名甲", "aliases": ["错写甲", "错 写 甲"]},
+        {"cost": 100, "name": "正名乙"},
+        {"cost": 1380, "name": "Emoji Gift", "aliases": "emoji, Emoji"},
+    ]}
+    tiers = mod.resolve_tiers(conf)
+    if len(tiers) != 3:
+        print("      ✗ 档位解析坏了:", len(tiers))
+        return False
+
+    # 1) 正名精确命中 ✓
+    t, how = mod.match_tier(tiers, "正名甲")
+    if not t or how != "name" or t["cost"] != 1:
+        print("      ✗ 正名没命中:", t, how)
+        return False
+
+    # 2) 别名命中 ⇒ **同一个档位**，但 `how` 必须标成 alias（区分开 ✓）
+    t2, how2 = mod.match_tier(tiers, "错写甲")
+    if not t2 or how2 != "alias" or t2["name"] != "正名甲":
+        print("      ✗ 别名没认出来:", t2, how2)
+        return False
+
+    # 3) 空格 / 大小写不敏感（口误里最常见）
+    if mod.match_tier(tiers, "错 写 甲")[1] != "alias":
+        print("      ✗ 带空格的别名没认出")
+        return False
+    if mod.match_tier(tiers, "EMOJI")[1] != "alias":
+        print("      ✗ 大小写没归一")
+        return False
+    # 字符串形式的 aliases 也要能解析（逗号/顿号分隔）
+    t3, how3 = mod.match_tier(tiers, "Emoji")
+    if not t3 or how3 != "alias" or t3["name"] != "Emoji Gift":
+        print("      ✗ 字符串 aliases 没解析:", t3, how3)
+        return False
+
+    # 4) 🔴 最关键：**别名不许出现在注入的礼物单里**（区分开 ✓）
+    tail = mod.inject_tail(tiers)
+    for bad in ("错写甲", "错 写 甲", "emoji"):
+        if bad in tail:
+            print("      ✗ 别名漏进注入了（会让她把错写当正名）:", bad)
+            return False
+    for good in ("正名甲", "正名乙", "Emoji Gift"):
+        if good not in tail:
+            print("      ✗ 正名没进注入:", good)
+            return False
+
+    # 5) 别名解析后**不许**把正名改掉（`name` 原样 ✓）
+    if [x["name"] for x in tiers] != ["正名甲", "正名乙", "Emoji Gift"]:
+        print("      ✗ 正名被别名覆盖了:", [x["name"] for x in tiers])
+        return False
+
+    # 6) 不误伤：认不出的词仍然认不出 ✓
+    if mod.match_tier(tiers, "完全无关的名字")[0] is not None:
+        print("      ✗ 误伤了无关词")
+        return False
+    if mod.match_tier(tiers, "")[0] is not None:
+        print("      ✗ 空串也算命中了")
+        return False
+    # 别名不许等于正名（配置写蠢了也不该把正名塞进别名表）
+    for x in tiers:
+        if x["name"] in (x.get("aliases") or []):
+            print("      ✗ 别名表里混进了正名:", x)
+            return False
+    return True
+
+
 def _visible_texts(mod):
     """她会读到的那几段文本（**注入出去的 + 工具说明**）—— 别处（内部 docstring / 注释）不算 ✓"""
     snap = {"exists": True, "balance": 7, "credit": 3}
@@ -1973,6 +2052,7 @@ TESTS = [
     ("R53 钥匙真轮换：写她的账本 + 写本机哈希（面板能验）", t53_gate_rotation_end_to_end),
     ("R54 心情标签 amount=0 按「无变化」放过（P1 重复消息的成因）", t54_mood_zero_is_accepted),
     ("R55 残缺标签形态也要扒干净（只剩闭合 / 截断 JSON）", t55_residual_tag_forms_are_stripped),
+    ("R56 礼物别名：认得出形近字/口误，但**永不改成正名**", t56_gift_alias_never_renames),
 ]
 
 

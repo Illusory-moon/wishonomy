@@ -5,7 +5,7 @@
 拿真库 + 真 HTTP 服务器跑（不是打桩）。
 
 跑法：
-    D:\\smm-tempsparxie\\.venv\\Scripts\\python.exe D:\\sparxie\\wishonomy\\panelcheck.py
+    E:\\smm-tempsparxie\\.venv\\Scripts\\python.exe E:\\sparxie\\wishonomy\\panelcheck.py
 """
 import importlib.util
 import json
