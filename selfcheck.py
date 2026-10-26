@@ -107,12 +107,19 @@ def load_plugin_module(tmpdir):
 class Ev:
     """最小的平台事件替身（只实现插件真的用到的那几个方法）。"""
 
-    def __init__(self, self_id=BOT, sender=ALICE, group=GROUP, name="", cron=False):
+    _SEQ = 0        # 2026-10-27：每条假事件一个**唯一 message_id**（幂等键要用 ✓）
+
+    def __init__(self, self_id=BOT, sender=ALICE, group=GROUP, name="", cron=False,
+                 message_id=None):
         self._self = self_id
         self._sender = sender
         self._group = group
         self._name = name
         self._extras = {"cron_job": True} if cron else {}
+        Ev._SEQ += 1
+        # ⚠️ 幂等键 = (kind, self_id, group, 收件人, 消息id) ⇒ 桩必须能表达"这是另一条消息" ✓
+        self.message_obj = type("Msg", (), {
+            "message_id": message_id or ("mid-%d" % Ev._SEQ)})()
 
     def get_self_id(self):
         return self._self
@@ -400,8 +407,11 @@ def t11_gift_flow(mod, plugin):
     now = int(time.time())
     raw_mood(mod, ALICE, 200, "gift-seed", now)
     before_bot = balance_of(mod, BOT)
-    out_ok = call(mod.wish_gift, plugin, ev, who="小甲", tier="乙档")
-    out_poor = call(mod.wish_gift, plugin, ev, who="小甲", tier="丙档")
+    # 2026-10-27：幂等键含 message_id ⇒ **每条消息一个事件** ✓（同一条消息重放才算同一笔）
+    out_ok = call(mod.wish_gift, plugin, Ev(sender=ALICE, name="小甲"),
+                  who="小甲", tier="乙档")
+    out_poor = call(mod.wish_gift, plugin, Ev(sender=ALICE, name="小甲"),
+                    who="小甲", tier="丙档")
     after_bot = balance_of(mod, BOT)
     return (after_bot == before_bot + 100
             and balance_of(mod, ALICE) == 100
@@ -1184,13 +1194,14 @@ def t41_gift_count(mod, plugin):
     tiers = mod.resolve_tiers(CONFIG)
     cheap = min(tiers, key=lambda t: t["cost"])
     # ① 数字当档位名 ⇒ 必须**拦下来**（不能静默收别的东西）
-    bad = call(mod.wish_gift, plugin, ev, who="小甲", tier="30")
+    bad = call(mod.wish_gift, plugin, Ev(sender=ALICE, name="小甲"), who="小甲", tier="30")
     if "别写数字" not in bad:
         print("      数字当档位名没被拦住:", bad)
         return False
     # ② 报名字 + count ⇒ 按份数收
     before = balance_of(mod, ALICE)
-    many = call(mod.wish_gift, plugin, ev, who="小甲", tier=cheap["name"], count=30)
+    many = call(mod.wish_gift, plugin, Ev(sender=ALICE, name="小甲"),
+                who="小甲", tier=cheap["name"], count=30)
     spent = before - balance_of(mod, ALICE)
     if spent != cheap["cost"] * 30:
         print("      count 没生效：扣了 %s（应为 %s）" % (spent, cheap["cost"] * 30))
@@ -1199,13 +1210,15 @@ def t41_gift_count(mod, plugin):
         print("      回话没说清份数:", many)
         return False
     # ③ 单份照旧
-    single = call(mod.wish_gift, plugin, ev, who="小甲", tier=cheap["name"])
+    single = call(mod.wish_gift, plugin, Ev(sender=ALICE, name="小甲"),
+                  who="小甲", tier=cheap["name"])
     if "收下了" not in single or "×" in single:
         print("      单份回话不对:", single)
         return False
     # ④ 份数把日上限撞了 ⇒ 直接拦下，不落账
     cap_now = balance_of(mod, ALICE)
-    over = call(mod.wish_gift, plugin, ev, who="小甲", tier=cheap["name"], count=99999)
+    over = call(mod.wish_gift, plugin, Ev(sender=ALICE, name="小甲"),
+                who="小甲", tier=cheap["name"], count=99999)
     if "超天" not in over or balance_of(mod, ALICE) != cap_now:
         print("      超上限没拦住:", over, balance_of(mod, ALICE))
         return False

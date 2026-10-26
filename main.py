@@ -1275,6 +1275,27 @@ def db_audit_totals(self_id, since, now, conn=None):
 
 # ── 写 ──
 
+def _idem_ref(kind, self_id, group_id, sender, event=None, now=None):
+    """**可推导的幂等键**（2026-10-27 · P2-3）。
+
+    事故：原来 `ref = "mood-%s-%s" % (now, uuid4().hex[:8])` ⇒ 每次调用都新生成 ✗
+    ⇒ README 说的「(kind, ref) 防重复入账」只在"同一次调用内部重放"时成立；
+      框架重试 / 工具调用被重放 / 模型同一轮调两次 ⇒ **真的记两笔** ✗
+    ⇒ 现在由「谁 + 哪个群 + 发给谁 + 触发它的那条消息」推导 ✓
+    ⚠️ 拿不到消息 id 时退到**分钟窗**：宁可少记一笔，也不要重复记两笔 ✗
+    """
+    mid = ""
+    try:
+        if event is not None:
+            mid = str(getattr(getattr(event, "message_obj", None),
+                          "message_id", "") or "")
+    except Exception:
+        mid = ""
+    if not mid:
+        mid = "m%d" % int((now or time.time()) // 60)     # 分钟窗兜底 ✓
+    return "%s-%s-%s-%s-%s" % (kind, self_id, group_id or "-", sender or "-", mid)
+
+
 def db_mood(conn, self_id, group_id, who, delta, reason, ref, now, daily_cap,
             name="", issue_cap=0):
     """收愿力 / 分愿力 —— 记进 who 的账。
@@ -2021,8 +2042,21 @@ class Main(star.Star):
                 request.prompt = (request.prompt or "") + "\n\n" + hint
             tail = inject_tail(_GIFT_TIERS if _GIFT_TIERS else resolve_tiers(self.config),
                                config=self.config)
-            if tail not in (request.system_prompt or ""):
-                request.system_prompt = (request.system_prompt or "") + "\n\n" + tail
+            # 2026-10-27 修（P2-4）：原来用「tail 是不是 system 的子串」判断要不要追加 ✗
+            #   tail 里含礼物档位（随配置变）⇒ 改了 gift_tiers 后新 tail ≠ 旧 tail ⇒ **再追加一份**
+            #   ⇒ system_prompt 里同时两份礼物单（探针确认过）+ 缓存前缀失效 + 给模型
+            #     **互相矛盾的价格表** ✗ ⇒ 改成固定锚点、**整段替换** ✓
+            _START, _END = "[wishonomy-tail]", "[/wishonomy-tail]"
+            _sp = request.system_prompt or ""
+            _seg = _START + chr(10) + tail + chr(10) + _END
+            if _START in _sp and _END in _sp:
+                _head, _, _rest = _sp.partition(_START)
+                _, _, _tailpart = _rest.partition(_END)
+                request.system_prompt = _head + _seg + _tailpart
+            elif tail not in _sp:
+                request.system_prompt = (_sp + (chr(10) + chr(10) if _sp else "")) + _seg
+            else:
+                request.system_prompt = _sp     # 老格式已在里面 ⇒ 本次不重复追加 ✓
             # ④ 触发词：「**愿力中心钥匙**」出现在**收到的消息**里、且是私聊 ⇒ 把「有人在问」
             #     摆到她眼前一次 ✓（主人裁定的触发词 ✓ 只提醒、**不替她回答、不自动给** ✓）
             if gate_asks(_message_text(event, request), self.config) and \
@@ -2281,7 +2315,7 @@ async def _mood_core(args, kwargs, source):
     if str(user_id) == str(sender):
         shown = str(event.get_sender_name() or "").strip()
     now = int(time.time())
-    ref = "%s%s-%s" % ("mood-", now, uuid.uuid4().hex[:8])
+    ref = _idem_ref("mood", bot, group_id, user_id, event=event, now=now)
     result = await run_db(with_conn, db_mood, bot, group_id, user_id, amount, reason,
                           ref, now, daily, shown, issue_cap)
     if not result.get("ok"):
@@ -2353,7 +2387,7 @@ async def wish_gift(*args, **kwargs):
     if int(count) > 1:
         note = ("%d 份" % int(count)) + (("：" + note) if note else "")
     now = int(time.time())
-    ref = "gift-%s-%s" % (now, uuid.uuid4().hex[:8])
+    ref = _idem_ref("gift", bot, group_id, user_id, event=event, now=now)
     result = await run_db(with_conn, db_gift, bot, group_id, user_id, total,
                           tier["name"], note, ref, now, cap)
     if result.get("duplicated"):
@@ -2428,7 +2462,7 @@ async def wish_grant(*args, **kwargs):
     floor = max(0, floor)
     now = int(time.time())
     due_ts = parse_due(kwargs.get("due"), now)
-    ref = "grant-%s-%s" % (now, uuid.uuid4().hex[:8])
+    ref = _idem_ref("grant", bot, group_id, user_id, event=event, now=now)
     result = await run_db(with_conn, db_iou_grant, bot, group_id, user_id, amount, item,
                           due_ts, ref, now, single, max_open, floor)
     if not result.get("ok"):
@@ -2720,7 +2754,8 @@ async def _deduct(plugin, bot, group_id, user_id, amount, reason, prefix, event)
     ⚠️ 2026-10-14：**传负数**（`db_mood` 现在按**符号**定方向，行也记负数 ✓）
     """
     now = int(time.time())
-    ref = "%s%s-%s" % (prefix, now, uuid.uuid4().hex[:8])
+    ref = _idem_ref(str(prefix or "deduct").rstrip("-"), bot, group_id, user_id,
+                    event=event, now=now)
     result = await run_db(with_conn, db_mood, bot, group_id, user_id, -int(amount), reason,
                           ref, now, 0)
     if not result.get("ok"):
