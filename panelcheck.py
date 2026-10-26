@@ -902,7 +902,7 @@ def t14_day_and_kind_filter(env, _unused):
 
 
 def t15_mood_gate_server(env, _unused):
-    """**心情隐私锁**（主人 2026-10-15 让做的 ✓）：`canon/_29` §6 那五条，一条不许少 ✓
+    """**心情隐私锁**（主人 2026-10-15 让做的 ✓）：`docs/canon-29.md` §6 那五条，一条不许少 ✓
 
     1. **未授权 ⇒ DOM 里翻不到任何一条 mood 的 reason** —— 不是"看不见"，是**不存在** ✗
        （只用 CSS 模糊 ⇒ F12 / `Ctrl+A` 就全看到了 ✗ = 窗帘不是锁 ✗ 主人实测点名的坑 ✓）

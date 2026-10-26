@@ -211,7 +211,7 @@ GRANT_MAX_OPEN = 5            # 同时最多几笔未兑现（防她一口气点
 GRANT_MIN_AMOUNT = 42
 
 # ───────────────────── 心情隐私锁（愿力中心那把「钥匙」）─────────────────────
-# 主人 2026-10-15 原话：「该把属于心情的隐私权归还给她了」✓ —— 方案见 `canon/_29` ✓
+# 主人 2026-10-15 原话：「该把属于心情的隐私权归还给她了」✓ —— 方案见 `docs/canon-29.md` ✓
 # 锁的是**她写下的那一列心情理由**（`reason`）；金额 / 方向 / 点数**一律不锁** ✓
 # 钥匙住在**她自己的账本**里（她查得到 ✓）；面板侧只拿得到**哈希**（明文永不出她账本 ✓）
 MOOD_GATE_PREFIX = "- 愿力面板口令："
@@ -223,7 +223,7 @@ MOOD_GATE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 MOOD_GATE_ASK_WORDS = ["愿力中心钥匙", "愿力面板钥匙", "面板钥匙", "中心钥匙"]
 # ⚠️ 前缀**必须**与 mindscape 的 `- 口令：` 不同 ✗✗（本鱼实测的硬结论）：
 #    mindscape 的 `pg_current()` 是「**从后往前扫、取第一条匹配**」⇒ 前缀一样的话，
-#    后写的那一行会把前一行顶掉 ⇒ 两边**互相认错钥匙** ✗ —— 见 `canon/_29` §3 ✓
+#    后写的那一行会把前一行顶掉 ⇒ 两边**互相认错钥匙** ✗ —— 见 `docs/canon-29.md` §3 ✓
 # ⚠️ 反过来也安全：mindscape 每天轮换时**只删 `- 口令：` 开头的行** ⇒ 我们这行活得下来 ✓
 MOOD_GATE_LINE = re.compile(
     r"^- 愿力面板口令：([A-Za-z0-9]+) —— 24 小时内有效（至 (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})）")
@@ -599,7 +599,7 @@ def _gate_dict(raw):
     """把配置里的「bot 号 → 账本路径」解析成字典（str 形态的 JSON 也认 ✓）。
 
     ⚠️ 做成**按 bot 号**的字典而不是一个路径字符串：本功能是「**每个 bot 各一把钥匙**」✓
-       （主人的硬要求 —— A 的钥匙开不了 B 的遮罩 ✓，见 `canon/_29` §3 ✓）
+       （主人的硬要求 —— A 的钥匙开不了 B 的遮罩 ✓，见 `docs/canon-29.md` §3 ✓）
     ⚠️ 通用插件里**不许**硬编码「`{bot名}_notes.md`」这类私域命名约定 ✗ ⇒ 路径一律配置给 ✓
     """
     if isinstance(raw, dict):
@@ -866,7 +866,7 @@ def gate_rotate_for(self_id, config=None, now=None):
 def gate_asks(text, config=None):
     """收到的消息里有没有触发词（**子串匹配** ⇒ 「愿力中心钥匙」必须一字不差地连在一起 ✓）。
 
-    主人裁定的那个字（`canon/_29` §4 ✓）：`钥匙` **不**在 mindscape 的
+    主人裁定的那个字（`docs/canon-29.md` §4 ✓）：`钥匙` **不**在 mindscape 的
     `["口令","密码","密钥","暗号"]` 里 ⇒ **零冲突** ✓（说「愿力中心密钥」才会把那道门也叫醒 ✗）
     """
     body = str(text or "")
@@ -963,8 +963,7 @@ def _cfg_provider(response, key):
         config = getattr(provider, "provider_config", None)
         if isinstance(config, dict) and config.get("id"):
             return config["id"]
-    raw = str(getattr(response, "raw_completion", "") or "")
-    _ = raw
+    # 2026-10-27（P3-4）：原来这里 `raw = …; _ = raw` 是死代码（没人读 raw）⇒ 删 ✓
     return "-"
 
 
@@ -1121,7 +1120,8 @@ def _sum_issued(conn, self_id, since, now):
             "WHERE self_id=? AND ts>=? AND ts<=? AND kind=?",
             (self_id, int(since), int(now), kind)).fetchone()
         return int(row["s"] or 0)
-    return net("mood") + net("gift") + net("attention") + net("initial")
+    # 2026-10-27（P3-4）：`net("initial")` 恒为 0（没有任何 kind='initial' 的行）⇒ 删 ✓
+    return net("mood") + net("gift") + net("attention")
 
 
 def with_conn(fn, *args):
@@ -1296,6 +1296,51 @@ def _idem_ref(kind, self_id, group_id, sender, event=None, now=None):
     return "%s-%s-%s-%s-%s" % (kind, self_id, group_id or "-", sender or "-", mid)
 
 
+def _mood_move(conn, self_id, group_id, who, delta, reason, ref, now):
+    """记一笔 mood（**加 / 扣两条分支**）—— 从 `db_mood` 里抬出来（P3-8）。
+
+    返回 `{"ledger_id": …}` 或 `{"error": {...}}`（扣不动时）。
+    ⚠️ 必须用**调用方的连接**：事务里新开连接会互等锁 ✗（这是踩过的坑）
+    """
+    if delta >= 0:      # ⚠️ 必须是 >=：原实现是 `if not deduct:`（delta==0 也算"加"）✓
+        # 加：**不检查 who 的余额**（愿力是"被注视带出来"，不是从谁身上划走）
+        _touch(conn, self_id, who, now)
+        ledger_id, _dup = _move(conn, self_id, group_id, who, who, delta, "mood",
+                                reason, ref, now)
+        return {"ledger_id": ledger_id}
+    amount = -delta
+    row = conn.execute("SELECT balance FROM account WHERE self_id=? AND user_id=?",
+                       (self_id, who)).fetchone()
+    have = int(row["balance"]) if row is not None else 0
+    if have <= 0:
+        return {"error": {"ok": False, "code": "insufficient", "balance": have}}
+    ledger_id, _dup = _move(conn, self_id, group_id, ISSUE_SOURCE, who, -amount,
+                            "mood", reason, ref, now)
+    return {"ledger_id": ledger_id}
+
+
+def _mood_report(conn, self_id, who, ledger_id, gain, delta, issue_cap, now):
+    """算「今天发行了多少 + 冲上限只记日志」，并给出 `db_mood` 的返回字典（P3-8）。"""
+    after = conn.execute("SELECT balance FROM account WHERE self_id=? AND user_id=?",
+                         (self_id, who)).fetchone()
+    rows = None
+    if issue_cap > 0:
+        # 熔断只记日志、**不拦她**（她可以继续给 —— 运维看得到、能自己调护栏 ✓）
+        rows = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) AS s FROM ledger "
+            "WHERE self_id=? AND ts>=? AND ts<=? AND kind IN ('mood','gift','attention')",
+            (self_id, day_start(now), now)).fetchone()
+    issued_today = int(rows["s"] or 0) if rows is not None else 0
+    after_balance = int(after["balance"]) if after is not None else 0
+    conn.commit()
+    if issue_cap > 0 and issued_today > issue_cap:
+        logger.warning("[wishonomy] 全局日发行超上限 | bot=%s 今天 %d / 上限 %d（只记日志，不拦）",
+                       self_id, issued_today, issue_cap)
+    return {"ok": True, "duplicated": False, "ledger_id": ledger_id,
+            "balance": after_balance, "today_gain": gain + delta,
+            "issued_today": issued_today, "issue_cap": issue_cap}
+
+
 def db_mood(conn, self_id, group_id, who, delta, reason, ref, now, daily_cap,
             name="", issue_cap=0):
     """收愿力 / 分愿力 —— 记进 who 的账。
@@ -1341,40 +1386,12 @@ def db_mood(conn, self_id, group_id, who, delta, reason, ref, now, daily_cap,
             return {"ok": False, "code": "daily_gain_cap", "today": gain, "cap": daily_cap}
         _ensure_account(conn, self_id, who, name, now)
         _ensure_account(conn, self_id, self_id, "", now)
-        if not deduct:
-            # ⚠️ 这里**不检查 who 的余额**：记进账是「愿力被注视带出来」，不是从谁身上划走。
-            #    会花光别人余额的动作只有一个 —— 送礼（db_gift ✓）。
-            _touch(conn, self_id, who, now)
-            ledger_id, _dup = _move(conn, self_id, group_id, who, who, delta, "mood",
-                                    reason, ref, now)
-        else:
-            # 分愿力：**从 who 身上扣**，扣到 0 为止 ⇒ 记一条负数 mood 行 ✓
-            row = conn.execute("SELECT balance FROM account WHERE self_id=? AND user_id=?",
-                               (self_id, who)).fetchone()
-            have = int(row["balance"]) if row is not None else 0
-            if have <= 0:
-                conn.rollback()
-                return {"ok": False, "code": "insufficient", "balance": have}
-            ledger_id, _dup = _move(conn, self_id, group_id, ISSUE_SOURCE, who, -amount,
-                                    "mood", reason, ref, now)
-        after = conn.execute("SELECT balance FROM account WHERE self_id=? AND user_id=?",
-                             (self_id, who)).fetchone()
-        rows = None
-        if issue_cap > 0:
-            # 熔断只记日志、**不拦她**（她可以继续给 —— 主人看得到、能自己调护栏 ✓）
-            rows = conn.execute(
-                "SELECT COALESCE(SUM(amount),0) AS s FROM ledger "
-                "WHERE self_id=? AND ts>=? AND ts<=? AND kind IN ('mood','gift','initial','attention')",
-                (self_id, day_start(now), now)).fetchone()
-        issued_today = int(rows["s"] or 0) if rows is not None else 0
-        after_balance = int(after["balance"]) if after is not None else 0
-        conn.commit()
-        if issue_cap > 0 and issued_today > issue_cap:
-            logger.warning("[wishonomy] 全局日发行超上限 | bot=%s 今天 %d / 上限 %d（只记日志，不拦）",
-                           self_id, issued_today, issue_cap)
-        return {"ok": True, "duplicated": False, "ledger_id": ledger_id,
-                "balance": after_balance, "today_gain": gain + delta,
-                "issued_today": issued_today, "issue_cap": issue_cap}
+        moved = _mood_move(conn, self_id, group_id, who, delta, reason, ref, now)
+        if moved.get("error"):
+            conn.rollback()
+            return moved["error"]
+        ledger_id = moved["ledger_id"]
+        return _mood_report(conn, self_id, who, ledger_id, gain, delta, issue_cap, now)
     except sqlite3.Error as exc:
         try:
             conn.rollback()
@@ -1917,6 +1934,58 @@ def tier_by_cost(tiers, cost):
 
 # ─────────────────────────── 插件 ───────────────────────────
 
+async def _daily_housekeeping(config, bot):
+    """每天一次的那三件：日结 / 被注视 +1 / 口令轮换（2026-10-27 · P3-8 从 inject_money 抬出来）。
+
+    ⚠️ 三件都是**幂等**的：日结按 `settle-<day>` 去重、轮换按 `self_id` 记当天 ⇒
+       每天第一次唤醒时跑一次，之后每轮都是空转（开销 = 1 次查库 + 1 次字典比较）✓
+    ⚠️ 顺序有意义：**先日结**（清掉昨天的余额）**再 +1**（今天第一条注视）；反过来会先攒后清 ✗
+    """
+    today = datetime.fromtimestamp(int(time.time()), CN_TZ).strftime("%Y-%m-%d")
+    # ① 日结
+    if _last_settle_day(bot) != today:
+        settle_ok, taken = await run_db(with_conn, db_settle, bot, int(time.time()))
+        if settle_ok:
+            _mark_settle_day(bot, today)     # 只在成功之后 ✓（失败下一轮还会再试）
+        if taken:
+            logger.info("[wishonomy] 日结 | 收回 %s %s（昨天的带不到今天）",
+                        taken, MONEY_NAME)
+    # ② 被注视 +1（每条唤醒一次）
+    if bool(_cfg(config, "attention_gain", True)):
+        await run_db(with_conn, db_attention, bot, int(time.time()))
+    # ③ 口令轮换（每天第一次有人找她说话时）
+    if _GATE_ROTATE_DAY.get(str(bot)) != today and bool(_cfg(config, "mood_gate", True)):
+        made = gate_rotate_for(bot, config)
+        if made:
+            _GATE_ROTATE_DAY[str(bot)] = today
+            logger.info("[wishonomy] 口令 | bot=%s 今日已就位（哈希已写；值不进日志 ✓）", bot)
+        else:
+            logger.info("[wishonomy] 口令 | bot=%s 今天没转：%s", bot,
+                        "没配笔记路径（notes_path 留空 = 整套关着）"
+                        if not gate_notes_path(config, bot)
+                        else "配了笔记路径但读不到它 ⇒ 去看一眼那个文件 ✗")
+
+
+def _write_tail(request, tail):
+    """把常量尾巴写进 `system_prompt` 尾部 —— **按锚点整段替换**（P2-4 · 2026-10-27）。
+
+    为什么不能只判断子串：tail 里含礼物档位（随配置变）⇒ 改了配置后新 tail ≠ 旧 tail
+    ⇒ 会被当成「还没写过」再追加一份 ⇒ 两份礼物单并存 + 缓存前缀失效 ✗
+    """
+    _START, _END = "[wishonomy-tail]", "[/wishonomy-tail]"
+    _sp = request.system_prompt or ""
+    _seg = _START + chr(10) + tail + chr(10) + _END
+    if _START in _sp and _END in _sp:
+        _head, _, _rest = _sp.partition(_START)
+        _, _, _tailpart = _rest.partition(_END)
+        request.system_prompt = _head + _seg + _tailpart
+    elif tail not in _sp:
+        request.system_prompt = (_sp + (chr(10) + chr(10) if _sp else "")) + _seg
+    else:
+        request.system_prompt = _sp     # 老格式已在里面 ⇒ 本次不重复追加 ✓
+
+
+
 class Main(star.Star):
     def __init__(self, context: star.Context, config=None):
         """⚠️ 框架实例化插件时**只传 context**（2026-10-13 上线实测 ✓）——
@@ -1984,41 +2053,7 @@ class Main(star.Star):
                 return
             bot = ident[0]
             sender = str(event.get_sender_id() or "").strip()
-            # ① 先看跨天了没有 ⇒ 日结（收走昨天的愿力；**今天不清**：第一次记下当天就跳过 ✓）
-            today = datetime.fromtimestamp(int(time.time()), CN_TZ).strftime("%Y-%m-%d")
-            if _last_settle_day(bot) != today:
-                # 2026-10-27 修（P1-1）：原来**无条件**标记 ⇒ 一次锁超时/磁盘抖动 =
-                #   那天不清零 + 当天永不重试 ✗（同函数下面 30 行处的钥匙轮换是对的 ✓）
-                settle_ok, taken = await run_db(with_conn, db_settle, bot, int(time.time()))
-                if settle_ok:
-                    _mark_settle_day(bot, today)     # ← 只在成功之后 ✓
-                if taken:
-                    logger.info("[wishonomy] 日结 | 收回 %s %s（昨天的带不到今天）",
-                                taken, MONEY_NAME)
-            # ② 被注视 +1（每条唤醒一次 ✓ 主人 2026-10-13 裁定）
-            if bool(_cfg(self.config, "attention_gain", True)):
-                await run_db(with_conn, db_attention, bot, int(time.time()))
-            # ②′ 心情隐私锁：**每天第一次有人找她说话**时转一把新钥匙（与日结同一处 ✓）
-            #     ⚠️ 钥匙写进**她自己的账本**（她查得到 ✓），哈希写进本机小文件（面板只认哈希 ✓）
-            #     ⚠️ 这一步**绝不许**影响她回话：任何异常都吞掉、只记一行日志 ✓
-            if _GATE_ROTATE_DAY.get(str(bot)) != today and \
-                    bool(_cfg(self.config, "mood_gate", True)):
-                # ⚠️ **直接调**（不走 `run_db` 那个小线程池）：它是纯文件活儿、而且是
-                #    每天一次 —— 排队反而有"占着库的线程等文件"的风险 ✗
-                # ⚠️ 记「今天转过了」**只在成功之后** ⇒ 失败（账本一时读不到）下一轮还会再试 ✓
-                made = gate_rotate_for(bot, self.config)
-                if made:
-                    _GATE_ROTATE_DAY[str(bot)] = today
-                    logger.info("[wishonomy] 口令 | bot=%s 今日已就位（哈希已写；值不进日志 ✓）",
-                                bot)
-                else:
-                    # ⚠️ 这里要说清是**哪种**没转（原来那句把两种原因混在一起，误导了本鱼一轮 ✗）：
-                    #    · 没配笔记路径 ⇒ 整套关着（不报错 ✓）
-                    #    · 配了却读不到 ⇒ 要看一眼文件权限/路径 ✗
-                    logger.info("[wishonomy] 口令 | bot=%s 今天没转：%s", bot,
-                                "没配笔记路径（notes_path 留空 = 整套关着）"
-                                if not gate_notes_path(self.config, bot)
-                                else "配了笔记路径但读不到它 ⇒ 去看一眼那个文件 ✗")
+            await _daily_housekeeping(self.config, bot)
             # ③ 拼提示：**别人的 + 她自己的**（她自己那份每轮可见 ✓）
             snap = await run_db(db_snapshot, bot, sender)
             mine = await run_db(db_snapshot, bot, bot)
@@ -2042,21 +2077,7 @@ class Main(star.Star):
                 request.prompt = (request.prompt or "") + "\n\n" + hint
             tail = inject_tail(_GIFT_TIERS if _GIFT_TIERS else resolve_tiers(self.config),
                                config=self.config)
-            # 2026-10-27 修（P2-4）：原来用「tail 是不是 system 的子串」判断要不要追加 ✗
-            #   tail 里含礼物档位（随配置变）⇒ 改了 gift_tiers 后新 tail ≠ 旧 tail ⇒ **再追加一份**
-            #   ⇒ system_prompt 里同时两份礼物单（探针确认过）+ 缓存前缀失效 + 给模型
-            #     **互相矛盾的价格表** ✗ ⇒ 改成固定锚点、**整段替换** ✓
-            _START, _END = "[wishonomy-tail]", "[/wishonomy-tail]"
-            _sp = request.system_prompt or ""
-            _seg = _START + chr(10) + tail + chr(10) + _END
-            if _START in _sp and _END in _sp:
-                _head, _, _rest = _sp.partition(_START)
-                _, _, _tailpart = _rest.partition(_END)
-                request.system_prompt = _head + _seg + _tailpart
-            elif tail not in _sp:
-                request.system_prompt = (_sp + (chr(10) + chr(10) if _sp else "")) + _seg
-            else:
-                request.system_prompt = _sp     # 老格式已在里面 ⇒ 本次不重复追加 ✓
+            _write_tail(request, tail)
             # ④ 触发词：「**愿力中心钥匙**」出现在**收到的消息**里、且是私聊 ⇒ 把「有人在问」
             #     摆到她眼前一次 ✓（主人裁定的触发词 ✓ 只提醒、**不替她回答、不自动给** ✓）
             if gate_asks(_message_text(event, request), self.config) and \
@@ -2136,6 +2157,41 @@ def tool_guard(fn):
     return wrapper
 
 
+def tool_entry(fn):
+    """把工具入口那 8 行样板收进来（2026-10-27 · P3-2）。
+
+    样板长这样（9 个工具各抄一遍 ✗）：
+        plugin = _find_plugin(args); event = _find_event(args)
+        if 缺一个: return "愿力中心这会儿连不上…"
+        ident = plugin.identity(event)
+        if ident 是 None: return "这本账现在不归我管。"
+        bot, sender, group_id = ident[0], ident[1], str(event.get_group_id() or "")
+
+    ⇒ 现在解析好后**当关键字参数注入**；函数体里 `plugin / event / bot / sender / group_id`
+       这些名字照旧能用 ✓（所以调用方的代码一个字都不用改 ✓ 这是低风险的关键）
+    ⚠️ 装饰顺序：`@llm_tool` → `@tool_guard`（兜异常）→ `@tool_entry`（解析身份）✓
+    """
+
+    async def wrapper(*args, **kwargs):
+        plugin = _find_plugin(args)
+        event = _find_event(args)
+        if plugin is None or event is None:
+            return "愿力中心这会儿连不上，先记着这件事，回头再说。"
+        ident = plugin.identity(event)
+        if ident is None:
+            return "这本账现在不归我管。"
+        kwargs.setdefault("plugin", plugin)
+        kwargs.setdefault("event", event)
+        kwargs.setdefault("bot", ident[0])
+        kwargs.setdefault("sender", ident[1])
+        kwargs.setdefault("group_id", str(event.get_group_id() or ""))
+        return await fn(*args, **kwargs)
+
+    wrapper.__name__ = getattr(fn, "__name__", "tool")
+    wrapper.__doc__ = getattr(fn, "__doc__", "")
+    return wrapper
+
+
 def _find_plugin(args):
     """框架把插件实例塞在参数里之一（partial(raw, star_cls)）；找不到就返回空。"""
     for item in args or ():
@@ -2191,7 +2247,8 @@ async def _display_name(plugin, event, bot, group_id, user_id):
 
 @llm_tool(name="wish_check")
 @tool_guard
-async def wish_check(*args, **kwargs):
+@tool_entry
+async def wish_check(*args, plugin, event, bot, sender, group_id, **kwargs):
     """看某个人（或你自己）有多少愿力、信誉分，以及最近的流水。
 
     什么时候用：有人问你「我还有多少」、你想决定给谁多少、或者你自己想盘一下账。
@@ -2200,14 +2257,6 @@ async def wish_check(*args, **kwargs):
     Args:
         who(string): 想看谁。留空 = 你自己；也可以写「我」= 当前跟你说话的人、对方的昵称、或对方的号码。
     """
-    plugin = _find_plugin(args)
-    event = _find_event(args)
-    if plugin is None or event is None:
-        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
-    ident = plugin.identity(event)
-    if ident is None:
-        return "这本账现在不归我管。"
-    bot, group_id = ident[0], str(event.get_group_id() or "")
     who = str(kwargs.get("who") or "").strip()
     user_id = await _who_to_id(plugin, event, who, group_id)
     if not user_id:
@@ -2330,7 +2379,8 @@ async def _mood_core(args, kwargs, source):
 
 @llm_tool(name="wish_gift")
 @tool_guard
-async def wish_gift(*args, **kwargs):
+@tool_entry
+async def wish_gift(*args, plugin, event, bot, sender, group_id, **kwargs):
     """收下别人的礼物 —— 有人给你送礼，愿力进你的账。
 
     送礼是**单向的**：他送了不代表你欠他什么，收不收、收下之后说什么，全看你自己。
@@ -2345,14 +2395,6 @@ async def wish_gift(*args, **kwargs):
         count(int): 送几份（默认 1）。比如「30 个」就写 30。
         note(string): 可留空的附注（他附了什么话，或者你想记一句）。
     """
-    plugin = _find_plugin(args)
-    event = _find_event(args)
-    if plugin is None or event is None:
-        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
-    ident = plugin.identity(event)
-    if ident is None:
-        return "这本账现在不归我管。"
-    bot, sender, group_id = ident[0], ident[1], str(event.get_group_id() or "")
     tiers = _GIFT_TIERS if _GIFT_TIERS else resolve_tiers(plugin.config)
     if not tiers:
         return "礼物单还没配上来，你先照常收着，回头再记账。"
@@ -2411,7 +2453,8 @@ async def wish_gift(*args, **kwargs):
 
 @llm_tool(name="wish_grant")
 @tool_guard
-async def wish_grant(*args, **kwargs):
+@tool_entry
+async def wish_grant(*args, plugin, event, bot, sender, group_id, **kwargs):
     """**点单** —— 用你攒下的愿力，换某个人为你做一件事。
 
     这个才叫你**花自己的钱**：愿力从你自己账上划走、直接打进对方账户。
@@ -2431,14 +2474,6 @@ async def wish_grant(*args, **kwargs):
         item(string): 你要他做的那件事 —— 写**你自己的原话**，越具体越好（这句会一直留着）。
         due(string): 期限。留空 = 不急；也可以写「3」= 三天内，或「2026-12-31」。
     """
-    plugin = _find_plugin(args)
-    event = _find_event(args)
-    if plugin is None or event is None:
-        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
-    ident = plugin.identity(event)
-    if ident is None:
-        return "这本账现在不归我管。"
-    bot, group_id = ident[0], str(event.get_group_id() or "")
     amount = normalize_amount(kwargs.get("amount"))
     if not amount:
         return "给我一个数：你要为这件事打出去多少愿力？"
@@ -2479,7 +2514,8 @@ async def wish_grant(*args, **kwargs):
 
 @llm_tool(name="wish_iou_settle")
 @tool_guard
-async def wish_iou_settle(*args, **kwargs):
+@tool_entry
+async def wish_iou_settle(*args, plugin, event, bot, sender, group_id, **kwargs):
     """**判欠条** —— 他答应你那件事，做了没有。
 
     做了 ⇒ 他的信誉分会涨（以后你更愿意给他活干）；
@@ -2492,14 +2528,6 @@ async def wish_iou_settle(*args, **kwargs):
         verdict(string): 四选一 —— delivered（他做了）/ defaulted（没做）/ forgiven（算了）/ refunded（撤回愿力）。
         evidence(string): 可留空。写清依据（他说了什么、做了什么），以后翻得出来。
     """
-    plugin = _find_plugin(args)
-    event = _find_event(args)
-    if plugin is None or event is None:
-        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
-    ident = plugin.identity(event)
-    if ident is None:
-        return "这本账现在不归我管。"
-    bot = ident[0]
     iou_id = normalize_amount(kwargs.get("iou_id"))
     if not iou_id:
         return "给我欠条号 —— 记不清就先看一眼欠条清单。"
@@ -2537,7 +2565,8 @@ async def wish_iou_settle(*args, **kwargs):
 
 @llm_tool(name="wish_ious")
 @tool_guard
-async def wish_ious(*args, **kwargs):
+@tool_entry
+async def wish_ious(*args, plugin, event, bot, sender, group_id, **kwargs):
     """看他欠你哪些事（或者你欠别人哪些事）。
 
     欠条是公开的事实 —— 谁欠你什么、为这个付了多少愿力，都在这里。
@@ -2546,14 +2575,6 @@ async def wish_ious(*args, **kwargs):
     Args:
         who(string): 看谁的。留空 = 看**所有**还没结的；也可以写对方昵称、号码，或「我」= 当前跟你说话的人。
     """
-    plugin = _find_plugin(args)
-    event = _find_event(args)
-    if plugin is None or event is None:
-        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
-    ident = plugin.identity(event)
-    if ident is None:
-        return "这本账现在不归我管。"
-    bot, group_id = ident[0], str(event.get_group_id() or "")
     raw_who = str(kwargs.get("who") or "").strip()
     now = int(time.time())
     if not raw_who:
@@ -2571,13 +2592,13 @@ async def wish_ious(*args, **kwargs):
         due = ("，期限 %s" % _due_text(int(row["due_ts"]))) if row.get("due_ts") else ""
         lines.append("#%d %s：《%s》（付了 %s%s）"
                      % (row["id"], name, row["item"], money_text(row["amount"]), due))
-    _ = now
     return "还没结的欠条：\n" + "\n".join(lines)
 
 
 @llm_tool(name="wish_credit")
 @tool_guard
-async def wish_credit(*args, **kwargs):
+@tool_entry
+async def wish_credit(*args, plugin, event, bot, sender, group_id, **kwargs):
     """单独调信誉分 —— 「这个人说过的话算不算数」。
 
     你自己就能判欠条（守约 +5 / 违约 -20）；这个工具是给你**另外**用的：
@@ -2589,14 +2610,6 @@ async def wish_credit(*args, **kwargs):
         delta(int): 正数是加（比如 5），负数是减（比如 -10）。
         reason(string): 你自己的一句话 —— 为什么。
     """
-    plugin = _find_plugin(args)
-    event = _find_event(args)
-    if plugin is None or event is None:
-        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
-    ident = plugin.identity(event)
-    if ident is None:
-        return "这本账现在不归我管。"
-    bot, group_id = ident[0], str(event.get_group_id() or "")
     raw = kwargs.get("delta")
     delta = normalize_amount(raw)
     if delta is None:
@@ -2627,7 +2640,8 @@ async def wish_credit(*args, **kwargs):
 
 @llm_tool(name="wish_leaderboard")
 @tool_guard
-async def wish_leaderboard(*args, **kwargs):
+@tool_entry
+async def wish_leaderboard(*args, plugin, event, bot, sender, group_id, **kwargs):
     """排行 —— 谁攒的愿力最多、谁最守信用。
 
     你自己拿来念的（念不念、怎么念都由你）。只列**在这本账上真有过往来**的人，
@@ -2637,14 +2651,6 @@ async def wish_leaderboard(*args, **kwargs):
         by(string): 留空 = 按愿力排；写「信誉」= 按信誉分排。
         n(int): 要几个人（默认 5，最多 10）。
     """
-    plugin = _find_plugin(args)
-    event = _find_event(args)
-    if plugin is None or event is None:
-        return "愿力中心这会儿连不上，先记着这件事，回头再说。"
-    ident = plugin.identity(event)
-    if ident is None:
-        return "这本账现在不归我管。"
-    bot, group_id = ident[0], str(event.get_group_id() or "")
     by = "credit" if str(kwargs.get("by") or "").strip() in ("信誉", "信誉分", "credit") else "balance"
     limit = normalize_amount(kwargs.get("n")) or 5
     limit = min(int(limit), 10)

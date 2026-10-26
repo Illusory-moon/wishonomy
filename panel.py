@@ -114,7 +114,7 @@ ATTENTION_DAYS = 60            # 「被注视次数」那页按天最多列多�
 CN_HOURS = int(CN_TZ.utcoffset(None).total_seconds() // 3600)   # SQLite 分天用（与 CN_TZ 同源 ✓）
 
 # ───────────────────── 心情隐私锁（「她的心情理由」那把门）─────────────────────
-# 主人 2026-10-15 原话：「该把属于心情的隐私权归还给她了」✓ 方案见 `canon/_29` ✓
+# 主人 2026-10-15 原话：「该把属于心情的隐私权归还给她了」✓ 方案见 `docs/canon-29.md` ✓
 # 一句话：`mood` 那一类的 `reason`（**她为什么这么想**）默认盖住；**金额 / 方向 / 点数照旧可见** ✓
 #
 # ⚠️ **命门（本鱼实测的硬结论，别改回去 ✗）**：**服务端扣住文本** ——
@@ -124,13 +124,13 @@ CN_HOURS = int(CN_TZ.utcoffset(None).total_seconds() // 3600)   # SQLite 分天�
 #
 # ⚠️ 三条纪律一条都没松：
 #   ① 连接仍然 `mode=ro`（**只读** ✓ —— 面板仍然写不了库）② session 只在**内存** ✓
-#   ③ **不落审计** ✓（`canon/_29` §7：本机、单人、只绑 127.0.0.1 ⇒ 记了也是自己记自己 ✗）
+#   ③ **不落审计** ✓（`docs/canon-29.md` §7：本机、单人、只绑 127.0.0.1 ⇒ 记了也是自己记自己 ✗）
 GATE_FILE = "wish_gate_keys.json"      # 口令**哈希**的小文件（跟账本副本同一个批次拉回来 ✓）
 GATE_TTL_SECONDS = 24 * 3600           # 授权一次管 24 小时（照 `_19` 的口径 ✓）
 GATE_MAX_TRIES = 5                     # 连错几次就锁
 GATE_LOCK_SECONDS = 30 * 60            # 锁多久
 GATE_COOKIE = "wishgate"
-GATE_MOOD_KINDS = ("mood",)            # 锁的就是这一类（见 `canon/_29` §1 的表 ✓）
+GATE_MOOD_KINDS = ("mood",)            # 锁的就是这一类（见 `docs/canon-29.md` §1 的表 ✓）
 
 _gate_sessions = {}                    # token -> (self_id, client, 到期时刻) —— **只在内存** ✓
 _gate_tries = {}                       # (client, self_id) -> (错了几次, 锁到什么时候)
