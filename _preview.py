@@ -2,7 +2,7 @@
 """面板预览：把自检那套种子数据渲染成三张可离线打开的页面（临时用）。
 
 跑法：
-    D:\\smm-tempsparxie\\.venv\\Scripts\\python.exe D:\\sparxie\\wishonomy\\_preview.py
+    python _preview.py            # 用你自己的解释器（装了依赖那个）
 
 产物在 `%TEMP%\\wishonomy-panel-preview\\`（含一张演示库，看完整目录删掉即可）。
 只读 `panel.py` / `panelcheck.py` 的公开口径，**不碰仓库里任何文件** ✓

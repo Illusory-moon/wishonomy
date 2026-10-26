@@ -5,7 +5,7 @@
 拿真库 + 真 HTTP 服务器跑（不是打桩）。
 
 跑法：
-    E:\\smm-tempsparxie\\.venv\\Scripts\\python.exe E:\\sparxie\\wishonomy\\panelcheck.py
+    python panelcheck.py          # 用你自己的解释器（装了依赖那个）
 """
 import importlib.util
 SKIPPED = []   # 2026-10-27：跳过 ≠ 通过（P1-4）

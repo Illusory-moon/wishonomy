@@ -1703,6 +1703,8 @@ def serve(db_path, host="127.0.0.1", port=8765, quiet=True, refresh=False,
     Handler.refresh = bool(refresh)
     Handler.refresh_fn = refresh_fn
     Handler.mood_gate = bool(mood_gate)
+    # 2026-10-27（P3-7）：子线程设成 daemon ⇒ Ctrl+C 不必等它们跑完 ✓
+    ThreadingHTTPServer.daemon_threads = True
     httpd = ThreadingHTTPServer((host, port), Handler)
     return httpd
 

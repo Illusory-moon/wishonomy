@@ -7,7 +7,7 @@
   * 拿**真库真事务**跑（临时目录），不是打桩模拟
 
 跑法（本机）：
-    E:\\smm-tempsparxie\\.venv\\Scripts\\python.exe E:\\sparxie\\wishonomy\\selfcheck.py
+    python selfcheck.py           # 用你自己的解释器（装了依赖那个）
 """
 import asyncio
 import ast
