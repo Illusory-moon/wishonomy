@@ -8,6 +8,7 @@
     E:\\smm-tempsparxie\\.venv\\Scripts\\python.exe E:\\sparxie\\wishonomy\\panelcheck.py
 """
 import importlib.util
+SKIPPED = []   # 2026-10-27：跳过 ≠ 通过（P1-4）
 import json
 import os
 import re
@@ -582,7 +583,10 @@ def t13_browser_no_jump(env, _unused):
           （Playwright 的 click 会先把元素滚进视口 ⇒ 自己就把 scrollY 改了 ✗）
     """
     if os.environ.get("PANEL_E2E") == "0":
+        # 2026-10-27 修（P1-4）：跳过要**记成跳过**，不能记 OK ✗
+        #   （README 承诺"不会假装跑过"，但汇总表/退出码上假装了 ✓）
         print("      （按 PANEL_E2E=0 显式跳过浏览器验收）")
+        SKIPPED.append("PANEL_E2E=0：浏览器验收没跑")
         return True
     try:
         from playwright.sync_api import sync_playwright
@@ -1113,7 +1117,10 @@ def t16_gate_browser(env, _unused):
     ⚠️ 主人 2026-10-15 当场指出的那条（**一路一个框** ✗）就由这里的 `n_pw == 1` 守着 ✓
     """
     if os.environ.get("PANEL_E2E") == "0":
+        # 2026-10-27 修（P1-4）：跳过要**记成跳过**，不能记 OK ✗
+        #   （README 承诺"不会假装跑过"，但汇总表/退出码上假装了 ✓）
         print("      （按 PANEL_E2E=0 显式跳过浏览器验收）")
+        SKIPPED.append("PANEL_E2E=0：浏览器验收没跑")
         return True
     try:
         from playwright.sync_api import sync_playwright

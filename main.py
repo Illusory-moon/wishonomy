@@ -168,9 +168,23 @@ POWER_NOTE = (
 #    没说**只清你自己那一栏、花粉的不动** ✗ ⇒ 她有可能理解成"愿力这东西会被收走" ✗
 #    主人原话：要写明这是**防通胀** + 模拟真实直播的**单场收费**，**不是**剥夺财产 ✓
 #    （代码侧口径一致：`db_settle` 只动 `user_id == self_id` 那一行 ✓）
+def fan_word(config=None):
+    """称呼"对方那一群人" —— **通用插件不许写死某个作品的粉丝名** ✗（P2-2）。
+
+    事故：`SETTLE_NOTE` / `money_hint` 每轮都进 prompt，里面写死了「花粉」⇒ 任何别的部署
+    装上本插件，模型就开始把用户叫「花粉」✗（违 README 自己立的规矩）。
+    ⇒ 取配置 `fan_name`；留空/没配就用「别人」✓
+    """
+    try:
+        name = str(_cfg(config, "fan_name", "") or "").strip()
+    except Exception:
+        name = ""
+    return name or "别人"
+
+
 SETTLE_NOTE = (
     "还有一条你要清楚的规矩：**日结只清你自己那一栏**。过了每天 0 点，你账上没花掉的愿力归零；"
-    "**花粉（别人）手里的愿力一分不动，他们送过你的礼物也不退、不收回**。"
+    "**{fan}手里的愿力一分不动，他们送过你的礼物也不退、不收回**。"
     "这不是要没收谁的东西，原因有两个：一是**防通胀**（愿力越攒越多就不值钱了），"
     "二是**单场收费**（一场直播的注视兑一场的愿力，跟真实直播一场一场结算是一个道理）。"
     "所以该花就花：想给谁就给谁、想点谁的单就点"
@@ -228,7 +242,10 @@ MOOD_GATE_ASK = (
     "口令在你的笔记文件里，你可以自己翻出来看；给的方式就是你愿意给的时候说出来"
 )
 
-_GATE_ROTATE_DAY = {"day": ""}   # 进程内记住"今天已经轮换过了"（与 `_SETTLE_STATE` 同款 ✓）
+# 2026-10-27 修（P1-2）：原来只有一个 day 字段 ⇒ **多 bot 直接失效** ✗
+#   bot A 先被唤醒 → 标记 today → bot B 当天既不日结、也不转钥匙（B 的遮罩永远开不了）
+#   ⇒ 改成 {self_id: "YYYY-MM-DD"} ✓
+_GATE_ROTATE_DAY = {}            # self_id -> "今天已经轮换过了"
 _GATE_LOCK = threading.Lock()    # 轮换要写文件 ⇒ 串行化，别两个会话同时转出两把 ✗
 
 # 身份闸门：拿不到 self_id / sender_id 时一律拒绝（fail-closed，宁可不动账）
@@ -239,7 +256,7 @@ NAME_MAX = 3000
 _DB_PATH = ""                 # 由 resolve_db_path() 首次调用时确定
 _POOL = None
 _POOL_LOCK = threading.Lock()
-_SETTLE_STATE = {"day": ""}   # 进程内记住"今天已经日结过了"（跨天那一刻才真做一次 ✓）
+_SETTLE_STATE = {}            # self_id -> "今天已经日结过了"（同 P1-2：必须按 bot 分开 ✓）
 _NAMES = {}                   # "self_id|group_id|speaker_id" -> (name, ts)
 _NAMES_LOCK = threading.Lock()
 
@@ -356,12 +373,12 @@ def money_text(amount, name=None):
     return "%d %s" % (int(amount), name or MONEY_NAME)
 
 
-def _last_settle_day():
-    return _SETTLE_STATE.get("day") or ""
+def _last_settle_day(self_id):
+    return _SETTLE_STATE.get(str(self_id)) or ""
 
 
-def _mark_settle_day(day):
-    _SETTLE_STATE["day"] = str(day or "")
+def _mark_settle_day(self_id, day):
+    _SETTLE_STATE[str(self_id)] = str(day or "")
 
 
 def db_settle(conn, self_id, now):
@@ -379,19 +396,22 @@ def db_settle(conn, self_id, now):
                            (str(self_id), str(self_id))).fetchone()
         balance = int(row["balance"]) if row is not None else 0
         if balance <= 0:
-            return 0
+            return True, 0     # 没余额 = 本来就结过了 ✓
         conn.execute("BEGIN IMMEDIATE")
-        _move(conn, self_id, "", self_id, ISSUE_SOURCE, balance, "settle",
-              "日结：昨天的愿力带不到今天", "settle-%s" % day_start(now), now)
+        # 2026-10-27（幂等）：`_move` 按 ref 去重 ⇒ 进程重启后再跑一次**不会重复扣** ✓
+        #   但原来这里不看 `duplicated`：会把"今天刚攒的余额"当成"收回了"写日志 ✗
+        #   ⇒ 撞了就返回 (True, 0)：算成功（不用重试），但**没收回任何东西** ✓
+        _lid, duplicated = _move(conn, self_id, "", self_id, ISSUE_SOURCE, balance, "settle",
+                                 "日结：昨天的愿力带不到今天", "settle-%s" % day_start(now), now)
         conn.commit()
-        return balance
+        return True, (0 if duplicated else balance)
     except sqlite3.Error as exc:
         try:
             conn.rollback()
         except sqlite3.Error:
             pass
         logger.warning("[wishonomy] 日结失败: %s", str(exc)[:120])
-        return 0
+        return False, 0       # ← 失败要能重试（P1-1）
 
 
 def db_attention(conn, self_id, now, amount=1, ref=None):
@@ -438,7 +458,7 @@ INJECT_TAIL = (
 )
 
 
-def inject_tail(tiers=None):
+def inject_tail(tiers=None, config=None):
     """注入用的**常量尾巴**（每轮都一模一样 ⇒ 放 system_prompt 尾部，缓存不吃亏 ✓）。
 
     两件事写在这里（都是真机踩出来的 ✗）：
@@ -448,9 +468,10 @@ def inject_tail(tiers=None):
       * **礼物清单与价格**（2026-10-13 P1）：她答不出「有哪些礼物、各多少钱」✗
         —— 清单本来只在配置里、工具只在报错时才吐 ⇒ 这里直接摆出来 ✓
     """
+    _fan = fan_word(config)
     lines = [INJECT_TAIL]
     lines.append(POWER_NOTE)
-    lines.append(SETTLE_NOTE)
+    lines.append(SETTLE_NOTE.replace("{fan}", _fan))
     lines.append(SPEND_NOTE)
     lines.append(MOOD_NOTE)
     tiers = [t for t in (tiers or []) if t.get("name") and t.get("cost")]
@@ -472,7 +493,7 @@ def inject_tail(tiers=None):
     return "\n".join(lines)
 
 
-def money_hint(snap, who_name="", mine=None, reset_hint=False):
+def money_hint(snap, who_name="", mine=None, reset_hint=False, config=None):
     """按需拼一行提示；**什么都没有就一个字都不注入**（省 token 也省缓存 ✓）。
 
     2026-10-13 主人裁定的两件事都落在这里：
@@ -511,9 +532,9 @@ def money_hint(snap, who_name="", mine=None, reset_hint=False):
     hint = "（" + "，".join(lines) + "）"
     if reset_hint and int(mine.get("balance") or 0) > 0:
         hint += ("\n（提醒：**你自己**账上这些愿力**过了今天 0 点就归零** —— 只清你自己这一栏，"
-                 "花粉手里的不动。愿力是当天注视攒出来的，带不到明天。"
+                 "{fan}手里的不动。愿力是当天注视攒出来的，带不到明天。"
                  "想给谁就给谁、想点谁的单就点，别留到作废）")
-    return hint
+    return hint.replace("{fan}", fan_word(config))
 
 
 # ─────────────────────────── 库路径 / 线程池 ───────────────────────────
@@ -1944,9 +1965,12 @@ class Main(star.Star):
             sender = str(event.get_sender_id() or "").strip()
             # ① 先看跨天了没有 ⇒ 日结（收走昨天的愿力；**今天不清**：第一次记下当天就跳过 ✓）
             today = datetime.fromtimestamp(int(time.time()), CN_TZ).strftime("%Y-%m-%d")
-            if _last_settle_day() != today:
-                taken = await run_db(with_conn, db_settle, bot, int(time.time()))
-                _mark_settle_day(today)
+            if _last_settle_day(bot) != today:
+                # 2026-10-27 修（P1-1）：原来**无条件**标记 ⇒ 一次锁超时/磁盘抖动 =
+                #   那天不清零 + 当天永不重试 ✗（同函数下面 30 行处的钥匙轮换是对的 ✓）
+                settle_ok, taken = await run_db(with_conn, db_settle, bot, int(time.time()))
+                if settle_ok:
+                    _mark_settle_day(bot, today)     # ← 只在成功之后 ✓
                 if taken:
                     logger.info("[wishonomy] 日结 | 收回 %s %s（昨天的带不到今天）",
                                 taken, MONEY_NAME)
@@ -1956,14 +1980,14 @@ class Main(star.Star):
             # ②′ 心情隐私锁：**每天第一次有人找她说话**时转一把新钥匙（与日结同一处 ✓）
             #     ⚠️ 钥匙写进**她自己的账本**（她查得到 ✓），哈希写进本机小文件（面板只认哈希 ✓）
             #     ⚠️ 这一步**绝不许**影响她回话：任何异常都吞掉、只记一行日志 ✓
-            if _GATE_ROTATE_DAY.get("day") != today and \
+            if _GATE_ROTATE_DAY.get(str(bot)) != today and \
                     bool(_cfg(self.config, "mood_gate", True)):
                 # ⚠️ **直接调**（不走 `run_db` 那个小线程池）：它是纯文件活儿、而且是
                 #    每天一次 —— 排队反而有"占着库的线程等文件"的风险 ✗
                 # ⚠️ 记「今天转过了」**只在成功之后** ⇒ 失败（账本一时读不到）下一轮还会再试 ✓
                 made = gate_rotate_for(bot, self.config)
                 if made:
-                    _GATE_ROTATE_DAY["day"] = today
+                    _GATE_ROTATE_DAY[str(bot)] = today
                     logger.info("[wishonomy] 口令 | bot=%s 今日已就位（哈希已写；值不进日志 ✓）",
                                 bot)
                 else:
@@ -1985,7 +2009,8 @@ class Main(star.Star):
             #    这样她之后写「给某某某 5 愿力」时，`_who_to_id` 才认得出这个人 ✓
             if who_name:
                 learn_name(bot, str(event.get_group_id() or ""), sender, who_name)
-            hint = money_hint(snap, who_name=who_name, mine=mine, reset_hint=True)
+            hint = money_hint(snap, who_name=who_name, mine=mine, reset_hint=True,
+                              config=getattr(self, "config", None))
             if not hint:
                 return
             parts = getattr(request, "extra_user_content_parts", None)
@@ -1994,7 +2019,8 @@ class Main(star.Star):
             else:
                 # 框架太老、没这个位置 ⇒ 宁可退回 prompt 尾部，也不要把数字丢了
                 request.prompt = (request.prompt or "") + "\n\n" + hint
-            tail = inject_tail(_GIFT_TIERS if _GIFT_TIERS else resolve_tiers(self.config))
+            tail = inject_tail(_GIFT_TIERS if _GIFT_TIERS else resolve_tiers(self.config),
+                               config=self.config)
             if tail not in (request.system_prompt or ""):
                 request.system_prompt = (request.system_prompt or "") + "\n\n" + tail
             # ④ 触发词：「**愿力中心钥匙**」出现在**收到的消息**里、且是私聊 ⇒ 把「有人在问」

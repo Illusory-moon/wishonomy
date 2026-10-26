@@ -1507,6 +1507,13 @@ class Handler(BaseHTTPRequestHandler):
         return info if isinstance(info, dict) else {"ok": False, "error": str(info)}
 
     def do_GET(self):                                   # noqa: N802 —— http.server 的约定
+        # 2026-10-27 修（P2-1）：`_same_origin()` 原来**只有 POST/refresh/unlock 调** ✗
+        #   ⇒ 绑 127.0.0.1 挡不住 DNS rebinding：攻击者域名解析到回环、浏览器视为同源，
+        #     整页 GET 就把**余额/钱包/流水/欠条**读走（心情理由仍被锁挡住 ✓）
+        #   ⇒ GET 开头也过一遍 ✓
+        if not self._same_origin():
+            self.send_error(403, "cross-site GET refused")
+            return
         target = self._path_text()
         path, _sep, query = target.partition("?")
         # 两个页面：`/` = 流水那一页 · `/attention` = 被注视次数那一页（主人 2026-10-14 要的 ✓）

@@ -1281,7 +1281,11 @@ def t44_settle_only_her(mod, _plugin):
         return False
     conn = mod._connect()
     try:
-        taken = mod.db_settle(conn, BOT, now)
+        # 2026-10-27：契约改成 (ok, taken)（P1-1：失败要能重试 ✓）
+        _ok, taken = mod.db_settle(conn, BOT, now)
+        if not _ok:
+            print("      日结返回失败 ✗")
+            return False
         rows = conn.execute("SELECT kind, from_id, to_id, amount FROM ledger "
                             "WHERE self_id=? AND kind='settle'", (BOT,)).fetchall()
     finally:
@@ -1296,15 +1300,15 @@ def t44_settle_only_her(mod, _plugin):
         print("      日结流水的方向不对（应当 from=她自己）:", dict(rows[0]))
         return False
     if balance_of(mod, ALICE) != 30:
-        print("      花粉的钱被清了 ✗:", balance_of(mod, ALICE))
+        print("      别人的钱被清了 ✗:", balance_of(mod, ALICE))
         return False
     # 再结一次 ⇒ 不该重复扣（余额已经是 0 ✓）
     conn = mod._connect()
     try:
-        again = mod.db_settle(conn, BOT, now)
+        _ok2, again = mod.db_settle(conn, BOT, now)
     finally:
         conn.close()
-    return again == 0 and balance_of(mod, BOT) == 0
+    return _ok2 and again == 0 and balance_of(mod, BOT) == 0
 
 
 def t45_attention_gain(mod, plugin):
@@ -1581,17 +1585,28 @@ def t49_settle_scope_wording(mod, _plugin):
       2. 这是**防通胀**
       3. 这是模拟真实直播的**单场收费**，**不是**剥夺财产
     """
+    # 2026-10-27（P2-2）：注入文本里**不许**写死私域粉丝名（「花粉」）✗
+    #   ⇒ 断言改成通用词「别人」；再加一条**反向**断言：私域名一个字都不许出现 ✓
     tail = mod.inject_tail([{"name": "甲档", "cost": 1, "note": "备注"}])
-    need = ["只清你自己", "花粉", "防通胀", "单场收费", "没收"]
+    need = ["只清你自己", "别人", "防通胀", "单场收费", "没收"]
     missing = [word for word in need if word not in tail]
+    for banned in ("花粉", "火花", "花奈咪", "水梦"):
+        if banned in tail:
+            print("      注入文本里出现了私域名 ✗:", banned)
+            return False
     if missing:
         print("      注入的常量尾巴里缺口径关键词:", missing)
         return False
     hint = mod.money_hint({"exists": True, "balance": 7}, mine={"exists": True, "balance": 5},
                           reset_hint=True)
-    for word in ("只清你自己", "花粉"):
+    # 2026-10-27（P2-2）：这里同样改成通用词，并加反向断言（私域名不许出现）✓
+    for word in ("只清你自己", "别人"):
         if word not in hint:
             print("      每轮那句日结提醒没写清是谁的账:", word, "→", hint)
+            return False
+    for banned in ("花粉", "火花", "花奈咪", "水梦"):
+        if banned in hint:
+            print("      money_hint 里出现了私域名 ✗:", banned)
             return False
     if "只清你自己" in mod.money_hint({"exists": True, "balance": 7},
                                      mine={"exists": True, "balance": 0}, reset_hint=True):
@@ -1742,8 +1757,10 @@ def t52_gate_key(mod, _plugin):
         else:
             break
     if not mind_src:
-        print("      （没找到那份「记忆闸门」的源码 —— 设 `MINDSCAPE_DIR` 可指路；"
-              "这一半**显式跳过**，不算通过 ✓）")
+        # 2026-10-27 修（P1-3）：原来这里只**打印**一句"跳过"，下面照样跑断言 ⇒
+        #   `re.escape("")` 让正则退化成 ([A-Za-z0-9]+) ⇒ hits != [mind_code] ⇒ **必红** ✗
+        #   （干净 clone 第一眼就是红的，直接摧毁对自检的信任）
+        return skip("没找到 mindscape 那份源码（设 MINDSCAPE_DIR 可指路）⇒ 这一项未验证")
     if mind_src:
         # 它源码里有**三条**带这个字样的字面量：正则 `PG_LINE` · 成品行模板 · 光秃秃的前缀 ✗
         # ⇒ 专挑**光秃秃那个前缀**（最短的那条，以 `- ` 开头、以全角冒号收尾 ✓）——
@@ -2068,6 +2085,18 @@ def reset_state(mod):
 
 
 
+# 2026-10-27（P1-3）：自检要有**第三种状态** —— 跳过既不是通过、也不是失败 ✓
+#   原来「缺外部源码 ⇒ 显式跳过」那条路后面照样跑断言 ⇒ 干净 clone 必红 ✗
+SKIPPED = []
+
+
+def skip(reason):
+    """本项**跳过**（没验证）—— 记进 SKIPPED，别并进通过 ✓"""
+    print("      （跳过：%s）" % reason)
+    SKIPPED.append(reason)
+    return True
+
+
 def main():
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     passed, failed = [], []
@@ -2089,7 +2118,9 @@ def main():
             (passed if ok else failed).append(name)
             print("  [%s] %s" % ("OK  " if ok else "FAIL", name))
         print("-" * 66)
-        print("通过 %d 项 / 失败 %d 项" % (len(passed), len(failed)))
+        if SKIPPED:
+            print("跳过 %d 项（**没验证**，别当成通过 ✓）：%s" % (len(SKIPPED), SKIPPED[:3]))
+        print("通过 %d 项 / 跳过 %d 项 / 失败 %d 项" % (len(passed), len(SKIPPED), len(failed)))
         if failed:
             print("失败项:", "; ".join(failed))
             return 1
